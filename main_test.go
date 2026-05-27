@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ---- generateCert ----
@@ -107,6 +108,33 @@ func TestGenerateCert_UniqueSerials(t *testing.T) {
 	}
 	if x1.SerialNumber.Cmp(x2.SerialNumber) == 0 {
 		t.Error("two distinct leaf certs share the same serial number")
+	}
+}
+
+func TestGenerateCert_TTLExpiry(t *testing.T) {
+	const host = "ttl-test.test.local"
+	saved := certTTL
+	certTTL = 50 * time.Millisecond
+	defer func() { certTTL = saved }()
+
+	certMu.Lock()
+	delete(certCache, host)
+	certMu.Unlock()
+
+	c1, err := generateCert(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond) // let the TTL expire
+
+	// Force eviction by calling generateCert again (expired entries are replaced inline).
+	c2, err := generateCert(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c1 == c2 {
+		t.Error("expected a new cert after TTL expiry, got the same pointer")
 	}
 }
 

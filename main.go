@@ -29,14 +29,21 @@ import (
 	"time"
 )
 
+// certEntry wraps a TLS certificate with an expiry time for cache TTL enforcement.
+type certEntry struct {
+	cert      *tls.Certificate
+	expiresAt time.Time
+}
+
 var (
 	requestCounter int
 	counterMu      sync.Mutex
 	proxyPort      string
 	caCert         *x509.Certificate
 	caKey          *rsa.PrivateKey
-	certCache      = make(map[string]*tls.Certificate)
+	certCache      = make(map[string]*certEntry)
 	certMu         sync.Mutex
+	certTTL        = time.Hour // overridden by --cert-ttl flag
 	upstreamClient *http.Client
 
 	// set by flags
@@ -106,12 +113,13 @@ func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 
 // generateCert returns a cached or newly-created leaf cert for host.
 // The mutex is held for the entire check-generate-store cycle to prevent TOCTOU races.
+// Expired cache entries are replaced transparently.
 func generateCert(host string) (*tls.Certificate, error) {
 	certMu.Lock()
 	defer certMu.Unlock()
 
-	if cert, ok := certCache[host]; ok {
-		return cert, nil
+	if e, ok := certCache[host]; ok && time.Now().Before(e.expiresAt) {
+		return e.cert, nil
 	}
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -142,8 +150,26 @@ func generateCert(host string) (*tls.Certificate, error) {
 		PrivateKey:  key,
 	}
 
-	certCache[host] = cert
+	certCache[host] = &certEntry{cert: cert, expiresAt: time.Now().Add(certTTL)}
 	return cert, nil
+}
+
+// startCertJanitor evicts expired cert cache entries every sweepInterval.
+func startCertJanitor(sweepInterval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(sweepInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			certMu.Lock()
+			for host, e := range certCache {
+				if now.After(e.expiresAt) {
+					delete(certCache, host)
+				}
+			}
+			certMu.Unlock()
+		}
+	}()
 }
 
 func nextReqID() int {
@@ -563,6 +589,7 @@ func main() {
 	portFlag := flag.String("port", "8080", "proxy listen port; use 0 to pick a random free port")
 	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
 	formatFlag := flag.String("format", "text", "output format: text | json")
+	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
 		fmt.Fprintln(os.Stderr, "")
@@ -579,6 +606,15 @@ func main() {
 
 	filterPattern = *filterFlag
 	jsonMode = *formatFlag == "json"
+	certTTL = *certTTLFlag
+	if certTTL > 0 {
+		// Sweep expired entries at 1/6 of the TTL interval, minimum every minute.
+		sweep := certTTL / 6
+		if sweep < time.Minute {
+			sweep = time.Minute
+		}
+		startCertJanitor(sweep)
+	}
 
 	cmdArgs := flag.Args()
 	if len(cmdArgs) < 1 {
