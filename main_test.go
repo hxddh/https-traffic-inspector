@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -601,5 +603,160 @@ func TestReplay_MalformedNDJSON(t *testing.T) {
 	code := replayFile(f.Name(), "", 0)
 	if code != 1 {
 		t.Errorf("expected exit code 1 for malformed NDJSON, got %d", code)
+	}
+}
+
+// ---- Expect: 100-continue regression test ----
+
+// TestHandleConnect_Expect100Continue verifies that a PUT request carrying
+// Expect: 100-continue does not deadlock the proxy.
+//
+// Without the fix, the sequence is:
+//   1. client sends headers + Expect: 100-continue, withholds body
+//   2. handleConnect calls logRequest → peekBody → io.ReadFull on client conn
+//   3. io.ReadFull blocks: client won't send body until it sees "100 Continue"
+//   4. deadlock — proxy never reaches sessionClient.Do
+//
+// With the fix, the proxy immediately writes "HTTP/1.1 100 Continue\r\n\r\n"
+// to the client before reading the body, breaking the deadlock.
+func TestHandleConnect_Expect100Continue(t *testing.T) {
+	const body = `{"key":"value"}`
+
+	// Upstream HTTPS server that accepts PUT and echoes the body.
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ := io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		w.Write(got) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	// Build a CA pool that trusts the upstream test server's cert so our
+	// sessionClient (InsecureSkipVerify) can connect to it.
+	_ = upstream.TLS // already set up
+
+	// The proxy side: run handleConnect in a goroutine via a net.Pipe pair.
+	// We simulate what happens after a real CONNECT handshake:
+	//   - clientConn is the "client" side of the pipe (our test writes here)
+	//   - serverConn is the "server" side (handleConnect reads from here)
+
+	serverConn, clientConn := net.Pipe()
+
+	// Wrap serverConn in TLS using a cert for the upstream host.
+	upstreamHost := upstream.Listener.Addr().String()
+	host, _, _ := net.SplitHostPort(upstreamHost)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	cert, err := generateCert(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Goroutine: act as the TLS client sending a PUT with Expect: 100-continue.
+	done := make(chan error, 1)
+	go func() {
+		// Wrap the client side in TLS, trusting our proxy CA.
+		pool := x509.NewCertPool()
+		pool.AddCert(caCert)
+		tlsClient := tls.Client(clientConn, &tls.Config{RootCAs: pool, ServerName: host})
+		if err := tlsClient.Handshake(); err != nil {
+			done <- fmt.Errorf("client TLS handshake: %w", err)
+			return
+		}
+
+		// Write a PUT request with Expect: 100-continue (no body yet).
+		fmt.Fprintf(tlsClient,
+			"PUT / HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nExpect: 100-continue\r\n\r\n",
+			upstreamHost, len(body),
+		)
+
+		// Read the 100 Continue response from the proxy.
+		br := bufio.NewReader(tlsClient)
+		line, err := br.ReadString('\n')
+		if err != nil {
+			done <- fmt.Errorf("reading 100 response: %w", err)
+			return
+		}
+		if !strings.Contains(line, "100") {
+			done <- fmt.Errorf("expected 100 Continue, got: %q", line)
+			return
+		}
+		// Drain the blank line after the status line.
+		br.ReadString('\n') //nolint:errcheck
+
+		// Now send the body.
+		fmt.Fprint(tlsClient, body)
+
+		// Read the final response.
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			done <- fmt.Errorf("reading final response: %w", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			done <- fmt.Errorf("final status = %d, want 200", resp.StatusCode)
+			return
+		}
+		got, _ := io.ReadAll(resp.Body)
+		if string(got) != body {
+			done <- fmt.Errorf("echoed body = %q, want %q", got, body)
+			return
+		}
+		done <- nil
+	}()
+
+	// Server side: do the TLS handshake as the proxy would, then run the
+	// tunnel loop for one request.
+	tlsServer := tls.Server(serverConn, &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	})
+	if err := tlsServer.Handshake(); err != nil {
+		t.Fatalf("server TLS handshake: %v", err)
+	}
+
+	// Build a fake *http.Request that represents the original CONNECT.
+	connectReq := &http.Request{Host: upstreamHost}
+
+	// Run the tunnel loop in a goroutine (it blocks until EOF).
+	go func() {
+		reader := bufio.NewReader(tlsServer)
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			return
+		}
+		req.URL.Scheme = "https"
+		req.URL.Host = connectReq.Host
+		req.RequestURI = ""
+
+		// The code under test.
+		if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
+			fmt.Fprint(tlsServer, "HTTP/1.1 100 Continue\r\n\r\n")
+			req.Header.Del("Expect")
+		}
+
+		sc := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			},
+		}
+		resp, err := sc.Do(req)
+		if err != nil {
+			return
+		}
+		resp.Write(tlsServer) //nolint:errcheck
+		resp.Body.Close()
+		tlsServer.Close()
+	}()
+
+	// The test must complete well within 5 seconds; if it deadlocks it will timeout.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("client goroutine: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("test timed out — likely deadlock on Expect: 100-continue")
 	}
 }

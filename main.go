@@ -612,6 +612,19 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		req.URL.Host = r.Host
 		req.RequestURI = ""
 
+		// Handle Expect: 100-continue.
+		// http.ReadRequest does not perform the 100-continue handshake automatically
+		// (unlike net/http.Server). If we try to log or forward the request body
+		// without first sending 100 Continue, the client will never send the body,
+		// causing a deadlock that manifests as an unexpected EOF or timeout.
+		// Fix: send 100 Continue to the client immediately, then strip the header
+		// so http.Transport does not attempt a second 100-continue round-trip to
+		// the upstream.
+		if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
+			fmt.Fprint(tlsConn, "HTTP/1.1 100 Continue\r\n\r\n")
+			req.Header.Del("Expect")
+		}
+
 		shouldLog := matchesFilter(req)
 		var reqID int
 		if shouldLog {
