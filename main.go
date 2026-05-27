@@ -18,19 +18,23 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var (
 	requestCounter int
-	mutex          sync.Mutex
+	counterMu      sync.Mutex
 	proxyPort      = "8080"
 	caCert         *x509.Certificate
 	caKey          *rsa.PrivateKey
 	certCache      = make(map[string]*tls.Certificate)
-	certMutex      sync.Mutex
+	certMu         sync.Mutex
+	upstreamClient *http.Client
 )
 
 func init() {
@@ -39,6 +43,26 @@ func init() {
 	if err != nil {
 		log.Fatal("Failed to generate CA:", err)
 	}
+
+	upstreamClient = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func randSerial() *big.Int {
+	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		log.Fatal("Failed to generate serial number:", err)
+	}
+	return n
 }
 
 func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
@@ -48,7 +72,7 @@ func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 	}
 
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: randSerial(),
 		Subject: pkix.Name{
 			Organization: []string{"HTTP Monitor CA"},
 		},
@@ -73,13 +97,15 @@ func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 	return cert, key, nil
 }
 
+// generateCert returns a cached or newly-created leaf cert for host.
+// The mutex is held for the entire check-generate-store cycle to prevent TOCTOU races.
 func generateCert(host string) (*tls.Certificate, error) {
-	certMutex.Lock()
+	certMu.Lock()
+	defer certMu.Unlock()
+
 	if cert, ok := certCache[host]; ok {
-		certMutex.Unlock()
 		return cert, nil
 	}
-	certMutex.Unlock()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -87,7 +113,7 @@ func generateCert(host string) (*tls.Certificate, error) {
 	}
 
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: randSerial(),
 		Subject: pkix.Name{
 			Organization: []string{"HTTP Monitor"},
 		},
@@ -109,32 +135,27 @@ func generateCert(host string) (*tls.Certificate, error) {
 		PrivateKey:  key,
 	}
 
-	certMutex.Lock()
 	certCache[host] = cert
-	certMutex.Unlock()
-
 	return cert, nil
 }
 
-func logRequest(req *http.Request) {
-	mutex.Lock()
+func nextReqID() int {
+	counterMu.Lock()
+	defer counterMu.Unlock()
 	requestCounter++
-	reqID := requestCounter
-	mutex.Unlock()
+	return requestCounter
+}
+
+func logRequest(req *http.Request) {
+	reqID := nextReqID()
 
 	fmt.Printf("\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
 	fmt.Printf("Time: %s\n", time.Now().Format("15:04:05"))
 	fmt.Printf("%s %s %s\n", req.Method, req.URL.String(), req.Proto)
 	fmt.Printf("Host: %s\n", req.Host)
 
-	if strings.Contains(req.Host, ".amazonaws.com") && strings.Contains(req.URL.Path, "/") {
-		pathParts := strings.SplitN(req.URL.Path, "/", 3)
-		if len(pathParts) >= 2 && pathParts[1] != "" {
-			fmt.Printf("\033[93mS3 Bucket: %s\033[0m\n", pathParts[1])
-			if len(pathParts) > 2 && pathParts[2] != "" {
-				fmt.Printf("\033[93mS3 Key/Prefix: %s\033[0m\n", pathParts[2])
-			}
-		}
+	if strings.Contains(req.Host, ".amazonaws.com") {
+		logS3Info(req)
 	}
 
 	if req.URL.RawQuery != "" {
@@ -151,13 +172,36 @@ func logRequest(req *http.Request) {
 	}
 
 	if req.Body != nil {
-		body, _ := io.ReadAll(req.Body)
-		req.Body = io.NopCloser(bytes.NewReader(body))
+		body := peekBody(&req.Body, 1000)
 		if len(body) > 0 {
-			fmt.Printf("\nBody:\n%s\n", string(body))
+			if isPrintable(req.Header) {
+				fmt.Printf("\nBody:\n%s\n", string(body))
+			} else {
+				fmt.Printf("\nBody: [binary data, %d+ bytes]\n", len(body))
+			}
 		}
 	}
 	fmt.Println()
+}
+
+func logS3Info(req *http.Request) {
+	host := req.Host
+	// virtual-hosted style: <bucket>.s3[.<region>].amazonaws.com/<key>
+	if idx := strings.Index(host, ".s3."); idx > 0 {
+		fmt.Printf("\033[93mS3 Bucket: %s\033[0m\n", host[:idx])
+		if key := strings.TrimPrefix(req.URL.Path, "/"); key != "" {
+			fmt.Printf("\033[93mS3 Key/Prefix: %s\033[0m\n", key)
+		}
+		return
+	}
+	// path-style: s3[.<region>].amazonaws.com/<bucket>/<key>
+	pathParts := strings.SplitN(req.URL.Path, "/", 3)
+	if len(pathParts) >= 2 && pathParts[1] != "" {
+		fmt.Printf("\033[93mS3 Bucket: %s\033[0m\n", pathParts[1])
+		if len(pathParts) > 2 && pathParts[2] != "" {
+			fmt.Printf("\033[93mS3 Key/Prefix: %s\033[0m\n", pathParts[2])
+		}
+	}
 }
 
 func logResponse(resp *http.Response) {
@@ -170,24 +214,71 @@ func logResponse(resp *http.Response) {
 	}
 
 	if resp.Body != nil {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+		body := peekBody(&resp.Body, 1000)
 		if len(body) > 0 {
 			fmt.Printf("\nBody:\n")
-			if len(body) > 1000 {
-				fmt.Printf("%s\n[... %d more bytes ...]\n", string(body[:1000]), len(body)-1000)
-			} else {
+			if isPrintable(resp.Header) {
 				fmt.Printf("%s\n", string(body))
+			} else {
+				fmt.Printf("[binary data, %d+ bytes]\n", len(body))
 			}
 		}
 	}
 	fmt.Println("\n" + strings.Repeat("-", 60))
 }
 
+// peekBody reads up to n bytes from *body for logging, then reconstructs *body
+// with a MultiReader so the full stream (including peeked bytes) can still be forwarded.
+// This avoids buffering the entire body and allows streaming responses to work correctly.
+func peekBody(body *io.ReadCloser, n int) []byte {
+	buf := make([]byte, n)
+	nr, _ := io.ReadFull(*body, buf)
+	buf = buf[:nr]
+	*body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), *body))
+	return buf
+}
+
+// isPrintable returns true when the Content-Type suggests the body is human-readable text.
+// Also returns false for compressed payloads regardless of content type.
+func isPrintable(header http.Header) bool {
+	enc := header.Get("Content-Encoding")
+	if enc != "" && enc != "identity" {
+		return false
+	}
+	ct := strings.ToLower(header.Get("Content-Type"))
+	if ct == "" {
+		return true
+	}
+	return strings.HasPrefix(ct, "text/") ||
+		strings.Contains(ct, "json") ||
+		strings.Contains(ct, "xml") ||
+		strings.Contains(ct, "html") ||
+		strings.Contains(ct, "javascript") ||
+		strings.Contains(ct, "form")
+}
+
+// writeConnError writes an HTTP error response directly onto a raw connection.
+// Used inside a CONNECT tunnel where http.ResponseWriter is no longer available.
+func writeConnError(conn net.Conn, statusCode int, msg string) {
+	resp := &http.Response{
+		StatusCode: statusCode,
+		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Body:       io.NopCloser(strings.NewReader(msg)),
+		Header:     make(http.Header),
+		Close:      true,
+	}
+	resp.Header.Set("Content-Type", "text/plain")
+	resp.Write(conn) //nolint:errcheck
+}
+
 func handleHTTP(w http.ResponseWriter, req *http.Request) {
 	logRequest(req)
 
-	targetURL := req.URL
+	// Copy URL struct to avoid mutating req.URL in place.
+	targetURL := *req.URL
 	if targetURL.Scheme == "" {
 		targetURL.Scheme = "http"
 	}
@@ -200,19 +291,9 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	proxyReq.Header = req.Header
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Do(proxyReq)
+	resp, err := upstreamClient.Do(proxyReq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -225,7 +306,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	io.Copy(w, resp.Body) //nolint:errcheck
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -242,17 +323,19 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-
+	// Check hijacking support before sending 200 so we can still return a proper HTTP error.
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 
+	w.WriteHeader(http.StatusOK)
+
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		// 200 already sent; we can only log at this point.
+		fmt.Fprintf(os.Stderr, "hijack error for %s: %v\n", host, err)
 		return
 	}
 	defer clientConn.Close()
@@ -261,7 +344,21 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		Certificates: []tls.Certificate{*cert},
 	}
 	tlsConn := tls.Server(clientConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		fmt.Fprintf(os.Stderr, "TLS handshake error for %s: %v\n", host, err)
+		return
+	}
 	defer tlsConn.Close()
+
+	// One client per CONNECT session so upstream connections are reused within the tunnel.
+	sessionClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
 	reader := bufio.NewReader(tlsConn)
 
@@ -269,7 +366,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		req, err := http.ReadRequest(reader)
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("Error reading request: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error reading request: %v\n", err)
 			}
 			break
 		}
@@ -280,27 +377,24 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 		logRequest(req)
 
-		client := &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-
-		resp, err := client.Do(req)
+		resp, err := sessionClient.Do(req)
 		if err != nil {
-			fmt.Printf("Error making request: %v\n", err)
-			continue
+			fmt.Fprintf(os.Stderr, "Error making request: %v\n", err)
+			writeConnError(tlsConn, http.StatusBadGateway, err.Error())
+			break
 		}
 
 		logResponse(resp)
 
-		resp.Write(tlsConn)
+		shouldClose := req.Header.Get("Connection") == "close" || resp.Header.Get("Connection") == "close"
+
+		if err := resp.Write(tlsConn); err != nil {
+			resp.Body.Close()
+			break
+		}
 		resp.Body.Close()
 
-		if req.Header.Get("Connection") == "close" || resp.Header.Get("Connection") == "close" {
+		if shouldClose {
 			break
 		}
 	}
@@ -314,19 +408,30 @@ func main() {
 	}
 
 	caCertPEM := &bytes.Buffer{}
-	pem.Encode(caCertPEM, &pem.Block{
+	pem.Encode(caCertPEM, &pem.Block{ //nolint:errcheck
 		Type:  "CERTIFICATE",
 		Bytes: caCert.Raw,
 	})
 
-	caCertFile := "/tmp/httpmon-ca.crt"
-	err := os.WriteFile(caCertFile, caCertPEM.Bytes(), 0644)
+	// Use a uniquely-named temp file to avoid collisions when multiple instances run.
+	caCertFile, err := os.CreateTemp("", "httpmon-ca-*.crt")
 	if err != nil {
+		log.Fatal("Failed to create CA cert file:", err)
+	}
+	if _, err := caCertFile.Write(caCertPEM.Bytes()); err != nil {
 		log.Fatal("Failed to write CA cert:", err)
+	}
+	caCertFile.Close()
+	caCertPath := caCertFile.Name()
+	defer os.Remove(caCertPath)
+
+	// Bind the listener before launching the subprocess so the proxy is guaranteed ready.
+	ln, err := net.Listen("tcp", ":"+proxyPort)
+	if err != nil {
+		log.Fatalf("Failed to bind proxy on :%s: %v", proxyPort, err)
 	}
 
 	server := &http.Server{
-		Addr: ":" + proxyPort,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
 				handleConnect(w, r)
@@ -338,29 +443,27 @@ func main() {
 
 	go func() {
 		fmt.Printf("Starting MITM proxy on :%s\n", proxyPort)
-		fmt.Printf("CA certificate written to: %s\n", caCertFile)
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatal("Proxy error:", err)
+		fmt.Printf("CA certificate written to: %s\n", caCertPath)
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Proxy error: %v", err)
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-
 	cmdArgs := os.Args[1:]
+	cmdName := filepath.Base(cmdArgs[0])
 
-	if strings.Contains(cmdArgs[0], "curl") {
+	if cmdName == "curl" {
 		hasProxy := false
 		hasCACert := false
 		hasInsecure := false
 
 		for _, arg := range cmdArgs {
-			if arg == "-x" || arg == "--proxy" {
+			switch arg {
+			case "-x", "--proxy":
 				hasProxy = true
-			}
-			if arg == "--cacert" {
+			case "--cacert":
 				hasCACert = true
-			}
-			if arg == "-k" || arg == "--insecure" {
+			case "-k", "--insecure":
 				hasInsecure = true
 			}
 		}
@@ -370,7 +473,7 @@ func main() {
 			newArgs = append(newArgs, "-x", "http://localhost:"+proxyPort)
 		}
 		if !hasCACert && !hasInsecure {
-			newArgs = append(newArgs, "--cacert", caCertFile)
+			newArgs = append(newArgs, "--cacert", caCertPath)
 		}
 		newArgs = append(newArgs, cmdArgs[1:]...)
 		cmdArgs = newArgs
@@ -384,13 +487,13 @@ func main() {
 		"HTTPS_PROXY="+proxyURL,
 		"http_proxy="+proxyURL,
 		"https_proxy="+proxyURL,
-		"REQUESTS_CA_BUNDLE="+caCertFile,
-		"SSL_CERT_FILE="+caCertFile,
-		"NODE_EXTRA_CA_CERTS="+caCertFile,
+		"REQUESTS_CA_BUNDLE="+caCertPath,
+		"SSL_CERT_FILE="+caCertPath,
+		"NODE_EXTRA_CA_CERTS="+caCertPath,
 	)
 
-	if strings.Contains(cmdArgs[0], "aws") {
-		cmd.Env = append(cmd.Env, "AWS_CA_BUNDLE="+caCertFile)
+	if cmdName == "aws" {
+		cmd.Env = append(cmd.Env, "AWS_CA_BUNDLE="+caCertPath)
 	}
 
 	cmd.Stdout = os.Stdout
@@ -400,10 +503,25 @@ func main() {
 	fmt.Printf("\nRunning: %s\n", strings.Join(cmdArgs, " "))
 	fmt.Println(strings.Repeat("=", 60))
 
+	// Forward SIGINT/SIGTERM to the subprocess for graceful shutdown.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		if cmd.Process != nil {
+			cmd.Process.Signal(sig) //nolint:errcheck
+		}
+	}()
+
+	exitCode := 0
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+			exitCode = exitErr.ExitCode()
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			exitCode = 1
 		}
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
+
+	os.Exit(exitCode)
 }
