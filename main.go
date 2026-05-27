@@ -49,6 +49,11 @@ var (
 	// set by flags
 	filterPattern string
 	jsonMode      bool
+	tuiMode       bool
+
+	// per-request start times for duration tracking (used in TUI and text mode)
+	reqStartTimes = make(map[int]time.Time)
+	reqStartMu    sync.Mutex
 )
 
 func init() {
@@ -228,6 +233,10 @@ func flattenHeaders(h http.Header) map[string]string {
 func logRequest(req *http.Request) int {
 	reqID := nextReqID()
 
+	reqStartMu.Lock()
+	reqStartTimes[reqID] = time.Now()
+	reqStartMu.Unlock()
+
 	var bodyStr string
 	if req.Body != nil {
 		body := peekBody(&req.Body, 1000)
@@ -236,6 +245,25 @@ func logRequest(req *http.Request) int {
 		} else if len(body) > 0 {
 			bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
 		}
+	}
+
+	if tuiMode {
+		entry := &tuiEntry{
+			id:         reqID,
+			startTime:  reqStartTimes[reqID],
+			method:     req.Method,
+			host:       req.Host,
+			path:       req.URL.Path,
+			rawURL:     req.URL.String(),
+			reqHeaders: flattenHeaders(req.Header),
+			reqBody:    bodyStr,
+			pending:    true,
+		}
+		select {
+		case tuiCh <- tuiReqMsg{entry}:
+		default:
+		}
+		return reqID
 	}
 
 	if jsonMode {
@@ -302,6 +330,12 @@ func logS3Info(req *http.Request) {
 }
 
 func logResponse(resp *http.Response, reqID int) {
+	reqStartMu.Lock()
+	start := reqStartTimes[reqID]
+	delete(reqStartTimes, reqID)
+	reqStartMu.Unlock()
+	dur := time.Since(start)
+
 	var bodyStr string
 	if resp.Body != nil {
 		body := peekBody(&resp.Body, 1000)
@@ -310,6 +344,21 @@ func logResponse(resp *http.Response, reqID int) {
 		} else if len(body) > 0 {
 			bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
 		}
+	}
+
+	if tuiMode {
+		select {
+		case tuiCh <- tuiRespMsg{
+			reqID:      reqID,
+			status:     resp.StatusCode,
+			statusText: resp.Status,
+			headers:    flattenHeaders(resp.Header),
+			body:       bodyStr,
+			duration:   dur,
+		}:
+		default:
+		}
+		return
 	}
 
 	if jsonMode {
@@ -590,6 +639,7 @@ func main() {
 	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
 	formatFlag := flag.String("format", "text", "output format: text | json")
 	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
+	uiFlag := flag.Bool("ui", false, "launch interactive terminal UI (TUI)")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
 		fmt.Fprintln(os.Stderr, "")
@@ -601,11 +651,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  httpmon --port 9090 aws s3 ls")
 		fmt.Fprintln(os.Stderr, "  httpmon --filter /api curl https://example.com/api/v1/users")
 		fmt.Fprintln(os.Stderr, "  httpmon --format json curl https://api.github.com | jq .")
+		fmt.Fprintln(os.Stderr, "  httpmon --ui curl https://api.github.com")
 	}
 	flag.Parse()
 
 	filterPattern = *filterFlag
 	jsonMode = *formatFlag == "json"
+	tuiMode = *uiFlag
 	certTTL = *certTTLFlag
 	if certTTL > 0 {
 		// Sweep expired entries at 1/6 of the TTL interval, minimum every minute.
@@ -710,6 +762,45 @@ func main() {
 
 	if cmdName == "aws" {
 		cmd.Env = append(cmd.Env, "AWS_CA_BUNDLE="+caCertPath)
+	}
+
+	if tuiMode {
+		// In TUI mode the subprocess output is captured and shown after the UI exits.
+		var subOut bytes.Buffer
+		cmd.Stdout = &subOut
+		cmd.Stderr = &subOut
+		cmd.Stdin = os.Stdin
+
+		exitCh := make(chan int, 1)
+		go func() {
+			code := 0
+			if err := cmd.Run(); err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					code = exitErr.ExitCode()
+				} else {
+					code = 1
+				}
+			}
+			select {
+			case tuiCh <- tuiDoneMsg{code}:
+			default:
+			}
+			exitCh <- code
+		}()
+
+		runTUI()
+
+		// Kill subprocess if user quit the TUI before it finished.
+		if cmd.Process != nil {
+			cmd.Process.Kill() //nolint:errcheck
+		}
+		code := <-exitCh
+
+		if out := subOut.String(); out != "" {
+			fmt.Fprintln(os.Stderr, "\n── Command Output ─────────────────────────────────────")
+			fmt.Fprint(os.Stderr, out)
+		}
+		os.Exit(code)
 	}
 
 	cmd.Stdout = os.Stdout
