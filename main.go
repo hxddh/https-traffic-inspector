@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,7 +31,7 @@ import (
 var (
 	requestCounter int
 	counterMu      sync.Mutex
-	proxyPort      = "8080"
+	proxyPort      string
 	caCert         *x509.Certificate
 	caKey          *rsa.PrivateKey
 	certCache      = make(map[string]*tls.Certificate)
@@ -229,7 +231,6 @@ func logResponse(resp *http.Response) {
 
 // peekBody reads up to n bytes from *body for logging, then reconstructs *body
 // with a MultiReader so the full stream (including peeked bytes) can still be forwarded.
-// This avoids buffering the entire body and allows streaming responses to work correctly.
 func peekBody(body *io.ReadCloser, n int) []byte {
 	buf := make([]byte, n)
 	nr, _ := io.ReadFull(*body, buf)
@@ -272,6 +273,47 @@ func writeConnError(conn net.Conn, statusCode int, msg string) {
 	}
 	resp.Header.Set("Content-Type", "text/plain")
 	resp.Write(conn) //nolint:errcheck
+}
+
+// systemCABundle returns the path of the OS trusted CA bundle, or "" if not found.
+// Checked in order of prevalence across common Linux distros and macOS.
+var systemCAPaths = []string{
+	"/etc/ssl/certs/ca-certificates.crt",      // Debian / Ubuntu / Alpine
+	"/etc/pki/tls/certs/ca-bundle.crt",        // RHEL / CentOS / Fedora
+	"/etc/ssl/cert.pem",                        // macOS / OpenBSD
+	"/usr/local/share/certs/ca-root-nss.crt",  // FreeBSD
+	"/etc/ssl/ca-bundle.pem",                   // openSUSE
+}
+
+func systemCABundle() string {
+	for _, p := range systemCAPaths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// buildCABundle writes a PEM file that contains the system CAs (if found) followed
+// by the proxy CA. This lets the subprocess verify both proxied and direct TLS connections.
+func buildCABundle(proxyCAPEM []byte) (string, error) {
+	f, err := os.CreateTemp("", "httpmon-ca-*.crt")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	if sysCA := systemCABundle(); sysCA != "" {
+		data, err := os.ReadFile(sysCA)
+		if err == nil {
+			f.Write(data) //nolint:errcheck
+		}
+	}
+
+	if _, err := f.Write(proxyCAPEM); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 func handleHTTP(w http.ResponseWriter, req *http.Request) {
@@ -401,35 +443,47 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: httpmon <command> [args...]")
-		fmt.Println("Example: httpmon curl https://api.github.com")
+	portFlag := flag.String("port", "8080", "proxy listen port; use 0 to pick a random free port")
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Options:")
+		flag.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Examples:")
+		fmt.Fprintln(os.Stderr, "  httpmon curl https://api.github.com")
+		fmt.Fprintln(os.Stderr, "  httpmon --port 9090 aws s3 ls")
+		fmt.Fprintln(os.Stderr, "  httpmon --port 0 curl https://example.com   # random port")
+	}
+	flag.Parse()
+
+	cmdArgs := flag.Args()
+	if len(cmdArgs) < 1 {
+		flag.Usage()
 		os.Exit(1)
 	}
 
-	caCertPEM := &bytes.Buffer{}
-	pem.Encode(caCertPEM, &pem.Block{ //nolint:errcheck
+	proxyCAPEM := &bytes.Buffer{}
+	pem.Encode(proxyCAPEM, &pem.Block{ //nolint:errcheck
 		Type:  "CERTIFICATE",
 		Bytes: caCert.Raw,
 	})
 
-	// Use a uniquely-named temp file to avoid collisions when multiple instances run.
-	caCertFile, err := os.CreateTemp("", "httpmon-ca-*.crt")
+	// Build a CA bundle that includes both system CAs and the proxy CA so the subprocess
+	// can verify direct (non-proxied) TLS connections as well as proxied ones.
+	caCertPath, err := buildCABundle(proxyCAPEM.Bytes())
 	if err != nil {
-		log.Fatal("Failed to create CA cert file:", err)
+		log.Fatal("Failed to build CA bundle:", err)
 	}
-	if _, err := caCertFile.Write(caCertPEM.Bytes()); err != nil {
-		log.Fatal("Failed to write CA cert:", err)
-	}
-	caCertFile.Close()
-	caCertPath := caCertFile.Name()
 	defer os.Remove(caCertPath)
 
-	// Bind the listener before launching the subprocess so the proxy is guaranteed ready.
-	ln, err := net.Listen("tcp", ":"+proxyPort)
+	// Bind listener before launching the subprocess; this guarantees the proxy is ready.
+	ln, err := net.Listen("tcp", ":"+*portFlag)
 	if err != nil {
-		log.Fatalf("Failed to bind proxy on :%s: %v", proxyPort, err)
+		log.Fatalf("Failed to bind proxy on :%s: %v", *portFlag, err)
 	}
+	// Resolve the actual port (important when --port 0 is used).
+	proxyPort = strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -443,13 +497,15 @@ func main() {
 
 	go func() {
 		fmt.Printf("Starting MITM proxy on :%s\n", proxyPort)
-		fmt.Printf("CA certificate written to: %s\n", caCertPath)
+		fmt.Printf("CA bundle written to: %s\n", caCertPath)
+		if sysCA := systemCABundle(); sysCA != "" {
+			fmt.Printf("System CA bundle merged from: %s\n", sysCA)
+		}
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Proxy error: %v", err)
 		}
 	}()
 
-	cmdArgs := os.Args[1:]
 	cmdName := filepath.Base(cmdArgs[0])
 
 	if cmdName == "curl" {
