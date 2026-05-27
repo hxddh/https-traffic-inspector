@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -37,6 +38,10 @@ var (
 	certCache      = make(map[string]*tls.Certificate)
 	certMu         sync.Mutex
 	upstreamClient *http.Client
+
+	// set by flags
+	filterPattern string
+	jsonMode      bool
 )
 
 func init() {
@@ -148,8 +153,78 @@ func nextReqID() int {
 	return requestCounter
 }
 
-func logRequest(req *http.Request) {
+// matchesFilter reports whether the request URL or host contains filterPattern.
+// When filterPattern is empty every request matches.
+func matchesFilter(req *http.Request) bool {
+	if filterPattern == "" {
+		return true
+	}
+	p := strings.ToLower(filterPattern)
+	return strings.Contains(strings.ToLower(req.URL.String()), p) ||
+		strings.Contains(strings.ToLower(req.Host), p) ||
+		strings.Contains(strings.ToLower(req.URL.Path), p)
+}
+
+// ---- JSON output types ----
+
+type jsonRequest struct {
+	ID      int               `json:"id"`
+	Time    string            `json:"time"`
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Proto   string            `json:"proto"`
+	Host    string            `json:"host"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body,omitempty"`
+}
+
+type jsonResponse struct {
+	ReqID   int               `json:"req_id"`
+	Status  int               `json:"status"`
+	Proto   string            `json:"proto"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body,omitempty"`
+}
+
+var jsonEnc = json.NewEncoder(os.Stdout)
+
+func flattenHeaders(h http.Header) map[string]string {
+	m := make(map[string]string, len(h))
+	for k, v := range h {
+		m[k] = strings.Join(v, ", ")
+	}
+	return m
+}
+
+// ---- logging ----
+
+// logRequest logs the request and returns the assigned request ID.
+func logRequest(req *http.Request) int {
 	reqID := nextReqID()
+
+	var bodyStr string
+	if req.Body != nil {
+		body := peekBody(&req.Body, 1000)
+		if len(body) > 0 && isPrintable(req.Header) {
+			bodyStr = string(body)
+		} else if len(body) > 0 {
+			bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+		}
+	}
+
+	if jsonMode {
+		jsonEnc.Encode(jsonRequest{ //nolint:errcheck
+			ID:      reqID,
+			Time:    time.Now().Format(time.RFC3339),
+			Method:  req.Method,
+			URL:     req.URL.String(),
+			Proto:   req.Proto,
+			Host:    req.Host,
+			Headers: flattenHeaders(req.Header),
+			Body:    bodyStr,
+		})
+		return reqID
+	}
 
 	fmt.Printf("\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
 	fmt.Printf("Time: %s\n", time.Now().Format("15:04:05"))
@@ -173,17 +248,11 @@ func logRequest(req *http.Request) {
 		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
 	}
 
-	if req.Body != nil {
-		body := peekBody(&req.Body, 1000)
-		if len(body) > 0 {
-			if isPrintable(req.Header) {
-				fmt.Printf("\nBody:\n%s\n", string(body))
-			} else {
-				fmt.Printf("\nBody: [binary data, %d+ bytes]\n", len(body))
-			}
-		}
+	if bodyStr != "" {
+		fmt.Printf("\nBody:\n%s\n", bodyStr)
 	}
 	fmt.Println()
+	return reqID
 }
 
 func logS3Info(req *http.Request) {
@@ -206,7 +275,28 @@ func logS3Info(req *http.Request) {
 	}
 }
 
-func logResponse(resp *http.Response) {
+func logResponse(resp *http.Response, reqID int) {
+	var bodyStr string
+	if resp.Body != nil {
+		body := peekBody(&resp.Body, 1000)
+		if len(body) > 0 && isPrintable(resp.Header) {
+			bodyStr = string(body)
+		} else if len(body) > 0 {
+			bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+		}
+	}
+
+	if jsonMode {
+		jsonEnc.Encode(jsonResponse{ //nolint:errcheck
+			ReqID:   reqID,
+			Status:  resp.StatusCode,
+			Proto:   resp.Proto,
+			Headers: flattenHeaders(resp.Header),
+			Body:    bodyStr,
+		})
+		return
+	}
+
 	fmt.Printf("\n\033[32m=== RESPONSE ===\033[0m\n")
 	fmt.Printf("%s %s\n", resp.Proto, resp.Status)
 
@@ -215,16 +305,8 @@ func logResponse(resp *http.Response) {
 		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
 	}
 
-	if resp.Body != nil {
-		body := peekBody(&resp.Body, 1000)
-		if len(body) > 0 {
-			fmt.Printf("\nBody:\n")
-			if isPrintable(resp.Header) {
-				fmt.Printf("%s\n", string(body))
-			} else {
-				fmt.Printf("[binary data, %d+ bytes]\n", len(body))
-			}
-		}
+	if bodyStr != "" {
+		fmt.Printf("\nBody:\n%s\n", bodyStr)
 	}
 	fmt.Println("\n" + strings.Repeat("-", 60))
 }
@@ -276,13 +358,12 @@ func writeConnError(conn net.Conn, statusCode int, msg string) {
 }
 
 // systemCABundle returns the path of the OS trusted CA bundle, or "" if not found.
-// Checked in order of prevalence across common Linux distros and macOS.
 var systemCAPaths = []string{
-	"/etc/ssl/certs/ca-certificates.crt",      // Debian / Ubuntu / Alpine
-	"/etc/pki/tls/certs/ca-bundle.crt",        // RHEL / CentOS / Fedora
-	"/etc/ssl/cert.pem",                        // macOS / OpenBSD
-	"/usr/local/share/certs/ca-root-nss.crt",  // FreeBSD
-	"/etc/ssl/ca-bundle.pem",                   // openSUSE
+	"/etc/ssl/certs/ca-certificates.crt",     // Debian / Ubuntu / Alpine
+	"/etc/pki/tls/certs/ca-bundle.crt",       // RHEL / CentOS / Fedora
+	"/etc/ssl/cert.pem",                       // macOS / OpenBSD
+	"/usr/local/share/certs/ca-root-nss.crt", // FreeBSD
+	"/etc/ssl/ca-bundle.pem",                  // openSUSE
 }
 
 func systemCABundle() string {
@@ -295,7 +376,7 @@ func systemCABundle() string {
 }
 
 // buildCABundle writes a PEM file that contains the system CAs (if found) followed
-// by the proxy CA. This lets the subprocess verify both proxied and direct TLS connections.
+// by the proxy CA, so the subprocess can verify both proxied and direct TLS connections.
 func buildCABundle(proxyCAPEM []byte) (string, error) {
 	f, err := os.CreateTemp("", "httpmon-ca-*.crt")
 	if err != nil {
@@ -317,7 +398,36 @@ func buildCABundle(proxyCAPEM []byte) (string, error) {
 }
 
 func handleHTTP(w http.ResponseWriter, req *http.Request) {
-	logRequest(req)
+	if !matchesFilter(req) {
+		// Proxy transparently without logging.
+		targetURL := *req.URL
+		if targetURL.Scheme == "" {
+			targetURL.Scheme = "http"
+		}
+		if targetURL.Host == "" {
+			targetURL.Host = req.Host
+		}
+		proxyReq, err := http.NewRequest(req.Method, targetURL.String(), req.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		proxyReq.Header = req.Header
+		resp, err := upstreamClient.Do(proxyReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body) //nolint:errcheck
+		return
+	}
+
+	reqID := logRequest(req)
 
 	// Copy URL struct to avoid mutating req.URL in place.
 	targetURL := *req.URL
@@ -342,7 +452,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	logResponse(resp)
+	logResponse(resp, reqID)
 
 	for k, v := range resp.Header {
 		w.Header()[k] = v
@@ -352,7 +462,9 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host)
+	if !jsonMode {
+		fmt.Printf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host)
+	}
 
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -376,7 +488,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		// 200 already sent; we can only log at this point.
 		fmt.Fprintf(os.Stderr, "hijack error for %s: %v\n", host, err)
 		return
 	}
@@ -417,7 +528,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		req.URL.Host = r.Host
 		req.RequestURI = ""
 
-		logRequest(req)
+		shouldLog := matchesFilter(req)
+		var reqID int
+		if shouldLog {
+			reqID = logRequest(req)
+		}
 
 		resp, err := sessionClient.Do(req)
 		if err != nil {
@@ -426,7 +541,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		logResponse(resp)
+		if shouldLog {
+			logResponse(resp, reqID)
+		}
 
 		shouldClose := req.Header.Get("Connection") == "close" || resp.Header.Get("Connection") == "close"
 
@@ -444,6 +561,8 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	portFlag := flag.String("port", "8080", "proxy listen port; use 0 to pick a random free port")
+	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
+	formatFlag := flag.String("format", "text", "output format: text | json")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
 		fmt.Fprintln(os.Stderr, "")
@@ -453,9 +572,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Examples:")
 		fmt.Fprintln(os.Stderr, "  httpmon curl https://api.github.com")
 		fmt.Fprintln(os.Stderr, "  httpmon --port 9090 aws s3 ls")
-		fmt.Fprintln(os.Stderr, "  httpmon --port 0 curl https://example.com   # random port")
+		fmt.Fprintln(os.Stderr, "  httpmon --filter /api curl https://example.com/api/v1/users")
+		fmt.Fprintln(os.Stderr, "  httpmon --format json curl https://api.github.com | jq .")
 	}
 	flag.Parse()
+
+	filterPattern = *filterFlag
+	jsonMode = *formatFlag == "json"
 
 	cmdArgs := flag.Args()
 	if len(cmdArgs) < 1 {
@@ -469,20 +592,16 @@ func main() {
 		Bytes: caCert.Raw,
 	})
 
-	// Build a CA bundle that includes both system CAs and the proxy CA so the subprocess
-	// can verify direct (non-proxied) TLS connections as well as proxied ones.
 	caCertPath, err := buildCABundle(proxyCAPEM.Bytes())
 	if err != nil {
 		log.Fatal("Failed to build CA bundle:", err)
 	}
 	defer os.Remove(caCertPath)
 
-	// Bind listener before launching the subprocess; this guarantees the proxy is ready.
 	ln, err := net.Listen("tcp", ":"+*portFlag)
 	if err != nil {
 		log.Fatalf("Failed to bind proxy on :%s: %v", *portFlag, err)
 	}
-	// Resolve the actual port (important when --port 0 is used).
 	proxyPort = strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 
 	server := &http.Server{
@@ -496,10 +615,15 @@ func main() {
 	}
 
 	go func() {
-		fmt.Printf("Starting MITM proxy on :%s\n", proxyPort)
-		fmt.Printf("CA bundle written to: %s\n", caCertPath)
-		if sysCA := systemCABundle(); sysCA != "" {
-			fmt.Printf("System CA bundle merged from: %s\n", sysCA)
+		if !jsonMode {
+			fmt.Printf("Starting MITM proxy on :%s\n", proxyPort)
+			fmt.Printf("CA bundle written to: %s\n", caCertPath)
+			if sysCA := systemCABundle(); sysCA != "" {
+				fmt.Printf("System CA bundle merged from: %s\n", sysCA)
+			}
+			if filterPattern != "" {
+				fmt.Printf("Filter: %q\n", filterPattern)
+			}
 		}
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Proxy error: %v", err)
@@ -556,10 +680,11 @@ func main() {
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 
-	fmt.Printf("\nRunning: %s\n", strings.Join(cmdArgs, " "))
-	fmt.Println(strings.Repeat("=", 60))
+	if !jsonMode {
+		fmt.Printf("\nRunning: %s\n", strings.Join(cmdArgs, " "))
+		fmt.Println(strings.Repeat("=", 60))
+	}
 
-	// Forward SIGINT/SIGTERM to the subprocess for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
