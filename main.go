@@ -50,6 +50,7 @@ var (
 	filterPattern string
 	jsonMode      bool
 	tuiMode       bool
+	recordMode    bool
 
 	// per-request start times for duration tracking (used in TUI and text mode)
 	reqStartTimes = make(map[int]time.Time)
@@ -247,6 +248,10 @@ func logRequest(req *http.Request) int {
 		}
 	}
 
+	if recordMode {
+		recordRequest(reqID, req, bodyStr)
+	}
+
 	if tuiMode {
 		entry := &tuiEntry{
 			id:         reqID,
@@ -344,6 +349,10 @@ func logResponse(resp *http.Response, reqID int) {
 		} else if len(body) > 0 {
 			bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
 		}
+	}
+
+	if recordMode {
+		recordResponse(reqID, resp, bodyStr, dur)
 	}
 
 	if tuiMode {
@@ -640,8 +649,13 @@ func main() {
 	formatFlag := flag.String("format", "text", "output format: text | json")
 	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
 	uiFlag := flag.Bool("ui", false, "launch interactive terminal UI (TUI)")
+	recordFlag := flag.String("record", "", "path to write recorded traffic as NDJSON (appends if file exists)")
+	replayFlag := flag.String("replay", "", "path of a recorded NDJSON file to replay (skips proxy, no <command> needed)")
+	replayTargetFlag := flag.String("replay-target", "", "override base URL for replay (e.g. https://staging.example.com)")
+	replayDelayFlag := flag.Duration("replay-delay", 0, "pause between replayed requests")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
+		fmt.Fprintln(os.Stderr, "       httpmon --replay <file> [--replay-target <url>]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Options:")
 		flag.PrintDefaults()
@@ -652,13 +666,28 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  httpmon --filter /api curl https://example.com/api/v1/users")
 		fmt.Fprintln(os.Stderr, "  httpmon --format json curl https://api.github.com | jq .")
 		fmt.Fprintln(os.Stderr, "  httpmon --ui curl https://api.github.com")
+		fmt.Fprintln(os.Stderr, "  httpmon --record traffic.ndjson curl https://api.github.com")
+		fmt.Fprintln(os.Stderr, "  httpmon --replay traffic.ndjson --replay-target https://staging.example.com")
 	}
 	flag.Parse()
+
+	// ── Replay mode: no proxy, no subprocess ─────────────────────────────────
+	if *replayFlag != "" {
+		os.Exit(replayFile(*replayFlag, *replayTargetFlag, *replayDelayFlag))
+	}
 
 	filterPattern = *filterFlag
 	jsonMode = *formatFlag == "json"
 	tuiMode = *uiFlag
+	recordMode = *recordFlag != ""
 	certTTL = *certTTLFlag
+
+	if recordMode {
+		if err := openRecordFile(*recordFlag); err != nil {
+			log.Fatalf("Cannot open record file %s: %v", *recordFlag, err)
+		}
+		defer recordFile.Close()
+	}
 	if certTTL > 0 {
 		// Sweep expired entries at 1/6 of the TTL interval, minimum every minute.
 		sweep := certTTL / 6

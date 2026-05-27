@@ -476,3 +476,130 @@ func TestBuildCABundle_UniqueFiles(t *testing.T) {
 		t.Error("two buildCABundle calls returned the same file path; should be unique")
 	}
 }
+
+// ---- record / replay ----
+
+func TestRecord_WriteAndRead(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"hello":"world"}`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	// Open a temp record file.
+	f, err := os.CreateTemp("", "httpmon-test-rec-*.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recPath := f.Name()
+	f.Close()
+	defer os.Remove(recPath)
+
+	// Enable record mode.
+	savedRM := recordMode
+	recordMode = true
+	if err := openRecordFile(recPath); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		recordFile.Close()
+		recordFile = nil
+		recordEncoder = nil
+		recordMode = savedRM
+	}()
+
+	// Issue a request through handleHTTP.
+	req, _ := http.NewRequest("GET", upstream.URL+"/hello", nil)
+	rr := httptest.NewRecorder()
+	handleHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	// Flush and read back the NDJSON.
+	recordFile.Sync() //nolint:errcheck
+	data, err := os.ReadFile(recPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var ex recordedExchange
+	if err := json.Unmarshal(bytes.TrimSpace(data), &ex); err != nil {
+		t.Fatalf("invalid NDJSON: %v\nraw: %s", err, data)
+	}
+	if ex.Status != http.StatusOK {
+		t.Errorf("recorded status = %d, want 200", ex.Status)
+	}
+	if !strings.Contains(ex.RespBody, "hello") {
+		t.Errorf("recorded body %q missing expected content", ex.RespBody)
+	}
+	if ex.DurationMs < 0 {
+		t.Errorf("recorded duration_ms = %d, want >= 0", ex.DurationMs)
+	}
+}
+
+func TestReplay_StatusAndBodyDiff(t *testing.T) {
+	// Target server that returns a different body than the recorded one.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"hello":"changed"}`)) //nolint:errcheck
+	}))
+	defer target.Close()
+
+	// Write a minimal recording file.
+	ex := recordedExchange{
+		ID:         1,
+		Time:       time.Now().Format(time.RFC3339),
+		Method:     "GET",
+		URL:        target.URL + "/hello",
+		ReqHeaders: map[string]string{"Accept": "*/*"},
+		Status:     200,
+		StatusText: "200 OK",
+		RespHeaders: map[string]string{"Content-Type": "application/json"},
+		RespBody:   `{"hello":"world"}`,
+		DurationMs: 10,
+	}
+	f, err := os.CreateTemp("", "httpmon-test-replay-*.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayPath := f.Name()
+	defer os.Remove(replayPath)
+	json.NewEncoder(f).Encode(ex) //nolint:errcheck
+	f.Close()
+
+	// Replay with target override.
+	code := replayFile(replayPath, target.URL, 0)
+	// We don't assert code == 0 because the body diff causes no error exit,
+	// and status matched so code should be 0.
+	if code != 0 {
+		t.Errorf("replayFile returned %d, want 0", code)
+	}
+}
+
+func TestReplay_MissingFile(t *testing.T) {
+	code := replayFile("/nonexistent/path.ndjson", "", 0)
+	if code == 0 {
+		t.Error("expected non-zero exit for missing file")
+	}
+}
+
+func TestReplay_MalformedNDJSON(t *testing.T) {
+	f, err := os.CreateTemp("", "httpmon-test-bad-*.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.WriteString("not valid json\n") //nolint:errcheck
+	f.Close()
+
+	// Should not panic; malformed lines are skipped with an error count.
+	// Returns 1 because errs > 0.
+	code := replayFile(f.Name(), "", 0)
+	if code != 1 {
+		t.Errorf("expected exit code 1 for malformed NDJSON, got %d", code)
+	}
+}
