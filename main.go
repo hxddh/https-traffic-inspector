@@ -723,6 +723,26 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			reqID = logRequest(req) // logs original headers
 		}
 
+		// WebSocket upgrades require a raw bidirectional tunnel; bypass the
+		// normal hop-by-hop stripping and http.Client round-trip.
+		if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+			upConn, dialErr := tls.Dial("tcp", r.Host, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+			if dialErr != nil {
+				if shouldLog {
+					discardReqID(reqID)
+				}
+				writeConnError(bw, http.StatusBadGateway, dialErr.Error())
+				bw.Flush() //nolint:errcheck
+				break
+			}
+			spliceWebSocket(upConn, req, tlsConn, bw, reader)
+			upConn.Close()
+			if shouldLog {
+				discardReqID(reqID)
+			}
+			break
+		}
+
 		removeHopByHopHeaders(req.Header) // strip before forwarding upstream
 
 		resp, err := upstreamClient.Do(req)
