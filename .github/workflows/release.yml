@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v1.0.0)"
+        description: "Release tag (e.g. v1.0.1)"
         required: true
-        default: "v1.0.0"
+        default: "v1.0.1"
 
 jobs:
   build:
@@ -19,18 +19,23 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            os_name: linux
             suffix: ""
           - goos: linux
             goarch: arm64
+            os_name: linux
             suffix: ""
           - goos: darwin
             goarch: amd64
+            os_name: macos
             suffix: ""
           - goos: darwin
             goarch: arm64
+            os_name: macos
             suffix: ""
           - goos: windows
             goarch: amd64
+            os_name: windows
             suffix: ".exe"
 
     steps:
@@ -42,6 +47,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Set version
+        id: ver
+        run: echo "tag=${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -49,12 +58,12 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           go build -trimpath -ldflags="-s -w" \
-            -o httpmon-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} .
+            -o httpmon-${{ steps.ver.outputs.tag }}-${{ matrix.os_name }}-${{ matrix.goarch }}${{ matrix.suffix }} .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: httpmon-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: httpmon-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          name: httpmon-${{ matrix.os_name }}-${{ matrix.goarch }}
+          path: httpmon-${{ steps.ver.outputs.tag }}-${{ matrix.os_name }}-${{ matrix.goarch }}${{ matrix.suffix }}
 
   release:
     needs: build

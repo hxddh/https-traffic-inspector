@@ -60,15 +60,16 @@ Download the latest binary for your platform from the [Releases](https://github.
 
 | Platform | File |
 |----------|------|
-| macOS arm64 | `httpmon-darwin-arm64` |
-| macOS amd64 | `httpmon-darwin-amd64` |
-| Linux amd64 | `httpmon-linux-amd64` |
-| Linux arm64 | `httpmon-linux-arm64` |
-| Windows amd64 | `httpmon-windows-amd64.exe` |
+| macOS Apple Silicon (M1/M2/M3) | `httpmon-<version>-macos-arm64` |
+| macOS Intel | `httpmon-<version>-macos-amd64` |
+| Linux x86-64 | `httpmon-<version>-linux-amd64` |
+| Linux arm64 (Graviton, Pi) | `httpmon-<version>-linux-arm64` |
+| Windows x86-64 | `httpmon-<version>-windows-amd64.exe` |
 
 ```bash
-chmod +x httpmon-darwin-arm64
-sudo mv httpmon-darwin-arm64 /usr/local/bin/httpmon
+# macOS / Linux — replace <version> with the release tag, e.g. v1.0.1
+chmod +x httpmon-v1.0.1-macos-arm64
+sudo mv httpmon-v1.0.1-macos-arm64 /usr/local/bin/httpmon
 ```
 
 ### From source (requires Go 1.24+)
