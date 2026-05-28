@@ -860,6 +860,103 @@ func TestRecord_LargeBodyFullyStored(t *testing.T) {
 	}
 }
 
+// ---- WebSocket splice ----
+
+func TestSpliceWebSocket(t *testing.T) {
+	// proxyUpConn ↔ upstreamConn: proxy → upstream raw connection.
+	// proxyClientConn ↔ clientConn: client → proxy (post-TLS) connection.
+	proxyUpConn, upstreamConn := net.Pipe()
+	proxyClientConn, clientConn := net.Pipe()
+	defer upstreamConn.Close()
+	defer clientConn.Close()
+
+	bw := bufio.NewWriterSize(proxyClientConn, 4096)
+	br := bufio.NewReader(proxyClientConn)
+
+	req, _ := http.NewRequest("GET", "/ws", nil)
+	req.Host = "example.com"
+	req.RequestURI = "/ws"
+	req.Header = http.Header{
+		"Upgrade":               {"websocket"},
+		"Connection":            {"Upgrade"},
+		"Sec-Websocket-Key":     {"dGhlIHNhbXBsZSBub25jZQ=="},
+		"Sec-Websocket-Version": {"13"},
+	}
+
+	// Goroutine: act as the upstream WebSocket server.
+	upDone := make(chan error, 1)
+	go func() {
+		defer upstreamConn.Close()
+		ubuf := bufio.NewReader(upstreamConn)
+		if _, err := http.ReadRequest(ubuf); err != nil {
+			upDone <- fmt.Errorf("upstream read upgrade: %w", err)
+			return
+		}
+		fmt.Fprint(upstreamConn,
+			"HTTP/1.1 101 Switching Protocols\r\n"+
+				"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		upstreamConn.Write([]byte("ping")) //nolint:errcheck
+		pong := make([]byte, 4)
+		if _, err := io.ReadFull(upstreamConn, pong); err != nil {
+			upDone <- fmt.Errorf("upstream read pong: %w", err)
+			return
+		}
+		if string(pong) != "pong" {
+			upDone <- fmt.Errorf("got %q, want pong", pong)
+			return
+		}
+		upDone <- nil
+	}()
+
+	// Run splice on the proxy side (proxyClientConn = underlying conn bypassing bw).
+	spliceDone := make(chan struct{})
+	go func() {
+		defer close(spliceDone)
+		spliceWebSocket(proxyUpConn, req, proxyClientConn, bw, br)
+	}()
+
+	// Client side: read the forwarded 101.
+	cbuf := bufio.NewReader(clientConn)
+	resp, err := http.ReadResponse(cbuf, nil)
+	if err != nil {
+		t.Fatalf("client read 101: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+
+	// Client reads "ping" forwarded from upstream.
+	ping := make([]byte, 4)
+	if _, err := io.ReadFull(cbuf, ping); err != nil {
+		t.Fatalf("client read ping: %v", err)
+	}
+	if string(ping) != "ping" {
+		t.Errorf("ping = %q, want ping", ping)
+	}
+
+	// Client sends "pong" back.
+	clientConn.Write([]byte("pong")) //nolint:errcheck
+
+	select {
+	case err := <-upDone:
+		if err != nil {
+			t.Errorf("upstream: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream goroutine timed out")
+	}
+
+	// Close client connection to unblock the client→upstream copy goroutine.
+	clientConn.Close()
+
+	select {
+	case <-spliceDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("splice goroutine timed out")
+	}
+}
+
 // ---- HAR capture ----
 
 func TestHAR_BasicCapture(t *testing.T) {
