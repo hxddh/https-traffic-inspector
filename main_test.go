@@ -860,6 +860,130 @@ func TestRecord_LargeBodyFullyStored(t *testing.T) {
 	}
 }
 
+// ---- HAR capture ----
+
+func TestHAR_BasicCapture(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	harEntriesMu.Lock()
+	harEntries = nil
+	harEntriesMu.Unlock()
+	pendingHARMu.Lock()
+	for k := range pendingHAR {
+		delete(pendingHAR, k)
+	}
+	pendingHARMu.Unlock()
+
+	savedHM := harMode
+	harMode = true
+	defer func() { harMode = savedHM }()
+
+	req, _ := http.NewRequest("GET", upstream.URL+"/data?foo=bar", nil)
+	rr := httptest.NewRecorder()
+	handleHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+
+	harEntriesMu.Lock()
+	entries := make([]harEntry, len(harEntries))
+	copy(entries, harEntries)
+	harEntriesMu.Unlock()
+
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 HAR entry, got %d", len(entries))
+	}
+	e := entries[0]
+	if e.Request.Method != "GET" {
+		t.Errorf("method = %q, want GET", e.Request.Method)
+	}
+	if !strings.Contains(e.Request.URL, "/data") {
+		t.Errorf("URL %q missing path", e.Request.URL)
+	}
+	if len(e.Request.QueryString) == 0 {
+		t.Error("expected query string entries")
+	}
+	if e.Response.Status != http.StatusOK {
+		t.Errorf("status = %d, want 200", e.Response.Status)
+	}
+	if !strings.Contains(e.Response.Content.Text, "ok") {
+		t.Errorf("response body %q missing expected content", e.Response.Content.Text)
+	}
+	if e.Time <= 0 {
+		t.Errorf("entry time = %f, want > 0", e.Time)
+	}
+}
+
+func TestHAR_WriteFile(t *testing.T) {
+	harEntriesMu.Lock()
+	harEntries = []harEntry{
+		{
+			StartedDateTime: time.Now().UTC().Format(time.RFC3339Nano),
+			Time:            42.0,
+			Request: harRequest{
+				Method:      "GET",
+				URL:         "https://example.com/",
+				HTTPVersion: "HTTP/1.1",
+				Headers:     []harNameValue{},
+				QueryString: []harNameValue{},
+				Cookies:     []harNameValue{},
+				HeadersSize: -1,
+				BodySize:    -1,
+			},
+			Response: harResponse{
+				Status:      200,
+				StatusText:  "OK",
+				HTTPVersion: "HTTP/1.1",
+				Headers:     []harNameValue{},
+				Cookies:     []harNameValue{},
+				Content:     harContent{Size: 2, MimeType: "text/plain", Text: "hi"},
+				RedirectURL: "",
+				HeadersSize: -1,
+				BodySize:    2,
+			},
+			Timings: harTimings{Wait: 42.0},
+		},
+	}
+	harEntriesMu.Unlock()
+
+	f, err := os.CreateTemp("", "httpmon-test-har-*.har")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	if err := writeHARFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out harFile
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if out.Log.Version != "1.2" {
+		t.Errorf("version = %q, want 1.2", out.Log.Version)
+	}
+	if len(out.Log.Entries) != 1 {
+		t.Fatalf("entries count = %d, want 1", len(out.Log.Entries))
+	}
+	if out.Log.Entries[0].Response.Content.Text != "hi" {
+		t.Errorf("content text = %q, want hi", out.Log.Entries[0].Response.Content.Text)
+	}
+}
+
 // ---- generateCert parallel keygen ----
 
 // TestGenerateCert_ParallelDifferentHosts verifies that concurrent requests for

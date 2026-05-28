@@ -51,6 +51,8 @@ var (
 	jsonMode      bool
 	tuiMode       bool
 	recordMode    bool
+	harMode       bool
+	harPath       string
 
 	// per-request start times for duration tracking (used in TUI and text mode)
 	reqStartTimes = make(map[int]time.Time)
@@ -211,6 +213,11 @@ func discardReqID(reqID int) {
 		delete(pendingRecords, reqID)
 		pendingRecordsMu.Unlock()
 	}
+	if harMode {
+		pendingHARMu.Lock()
+		delete(pendingHAR, reqID)
+		pendingHARMu.Unlock()
+	}
 }
 
 // matchesFilter reports whether the request URL or host contains filterPattern.
@@ -292,8 +299,8 @@ func logRequest(req *http.Request) int {
 	var bodyStr string
 	if req.Body != nil {
 		peekN := 1000
-		if recordMode {
-			peekN = 1 << 20 // 1 MB: store faithful body in record file
+		if recordMode || harMode {
+			peekN = 1 << 20 // 1 MB: store faithful body in record/HAR file
 		}
 		body := peekBody(&req.Body, peekN)
 		if len(body) > 0 && isPrintable(req.Header) {
@@ -305,6 +312,9 @@ func logRequest(req *http.Request) int {
 
 	if recordMode {
 		recordRequest(reqID, req, bodyStr) // bodyStr may be up to 1 MB
+	}
+	if harMode {
+		addHARRequest(reqID, req, bodyStr, startTime)
 	}
 
 	// Cap to 1 KB for display output (TUI / JSON / text).
@@ -406,7 +416,7 @@ func logResponse(resp *http.Response, reqID int) {
 	var bodyStr string
 	if resp.Body != nil {
 		peekN := 1000
-		if recordMode {
+		if recordMode || harMode {
 			peekN = 1 << 20
 		}
 		body := peekBody(&resp.Body, peekN)
@@ -419,6 +429,9 @@ func logResponse(resp *http.Response, reqID int) {
 
 	if recordMode {
 		recordResponse(reqID, resp, bodyStr, dur)
+	}
+	if harMode {
+		addHARResponse(reqID, resp, bodyStr, dur)
 	}
 
 	if len(bodyStr) > 1000 {
@@ -498,7 +511,7 @@ func isPrintable(header http.Header) bool {
 
 // writeConnError writes an HTTP error response directly onto a raw connection.
 // Used inside a CONNECT tunnel where http.ResponseWriter is no longer available.
-func writeConnError(conn net.Conn, statusCode int, msg string) {
+func writeConnError(w io.Writer, statusCode int, msg string) {
 	resp := &http.Response{
 		StatusCode: statusCode,
 		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
@@ -510,7 +523,7 @@ func writeConnError(conn net.Conn, statusCode int, msg string) {
 		Close:      true,
 	}
 	resp.Header.Set("Content-Type", "text/plain")
-	resp.Write(conn) //nolint:errcheck
+	resp.Write(w) //nolint:errcheck
 }
 
 // systemCABundle returns the path of the OS trusted CA bundle, or "" if not found.
@@ -667,16 +680,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tlsConn.Close()
 
-	// One client per CONNECT session so upstream connections are reused within the tunnel.
-	sessionClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
+	bw := bufio.NewWriterSize(tlsConn, 32*1024)
 	reader := bufio.NewReader(tlsConn)
 
 	for {
@@ -701,7 +705,10 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		// so http.Transport does not attempt a second 100-continue round-trip to
 		// the upstream.
 		if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
-			if _, err := fmt.Fprint(tlsConn, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
+			if _, err := fmt.Fprint(bw, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
+				break
+			}
+			if err := bw.Flush(); err != nil {
 				break
 			}
 			req.Header.Del("Expect")
@@ -718,13 +725,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 		removeHopByHopHeaders(req.Header) // strip before forwarding upstream
 
-		resp, err := sessionClient.Do(req)
+		resp, err := upstreamClient.Do(req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error making request: %v\n", err)
 			if shouldLog {
 				discardReqID(reqID)
 			}
-			writeConnError(tlsConn, http.StatusBadGateway, err.Error())
+			writeConnError(bw, http.StatusBadGateway, err.Error())
+			bw.Flush() //nolint:errcheck
 			break
 		}
 
@@ -737,7 +745,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 		removeHopByHopHeaders(resp.Header) // strip before forwarding downstream
 
-		if err := resp.Write(tlsConn); err != nil {
+		if err := resp.Write(bw); err != nil {
+			resp.Body.Close()
+			break
+		}
+		if err := bw.Flush(); err != nil {
 			resp.Body.Close()
 			break
 		}
@@ -756,6 +768,7 @@ func main() {
 	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
 	uiFlag := flag.Bool("ui", false, "launch interactive terminal UI (TUI)")
 	recordFlag := flag.String("record", "", "path to write recorded traffic as NDJSON (appends if file exists)")
+	harFlag := flag.String("har", "", "write captured traffic as HAR 1.2 JSON on exit")
 	replayFlag := flag.String("replay", "", "path of a recorded NDJSON file to replay (skips proxy, no <command> needed)")
 	replayTargetFlag := flag.String("replay-target", "", "override base URL for replay (e.g. https://staging.example.com)")
 	replayDelayFlag := flag.Duration("replay-delay", 0, "pause between replayed requests")
@@ -773,6 +786,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  httpmon --format json curl https://api.github.com | jq .")
 		fmt.Fprintln(os.Stderr, "  httpmon --ui curl https://api.github.com")
 		fmt.Fprintln(os.Stderr, "  httpmon --record traffic.ndjson curl https://api.github.com")
+		fmt.Fprintln(os.Stderr, "  httpmon --har traffic.har curl https://api.github.com")
 		fmt.Fprintln(os.Stderr, "  httpmon --replay traffic.ndjson --replay-target https://staging.example.com")
 	}
 	flag.Parse()
@@ -786,6 +800,8 @@ func main() {
 	jsonMode = *formatFlag == "json"
 	tuiMode = *uiFlag
 	recordMode = *recordFlag != ""
+	harMode = *harFlag != ""
+	harPath = *harFlag
 	certTTL = *certTTLFlag
 
 	if recordMode {
@@ -935,6 +951,9 @@ func main() {
 			fmt.Fprintln(os.Stderr, "\n── Command Output ─────────────────────────────────────")
 			fmt.Fprint(os.Stderr, out)
 		}
+		if harMode {
+			writeHARFile(harPath) //nolint:errcheck
+		}
 		os.Exit(code)
 	}
 
@@ -966,5 +985,8 @@ func main() {
 		}
 	}
 
+	if harMode {
+		writeHARFile(harPath) //nolint:errcheck
+	}
 	os.Exit(exitCode)
 }
