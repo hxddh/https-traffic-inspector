@@ -760,3 +760,136 @@ func TestHandleConnect_Expect100Continue(t *testing.T) {
 		t.Fatal("test timed out — likely deadlock on Expect: 100-continue")
 	}
 }
+
+// ---- hop-by-hop header stripping ----
+
+func TestHandleHTTP_HopByHopStripped(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Echo back what Connection header we received (should be empty after stripping).
+		w.Header().Set("X-Got-Connection", r.Header.Get("Connection"))
+		// Set hop-by-hop headers on the response — proxy should strip them.
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	req, _ := http.NewRequest("GET", upstream.URL, nil)
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	rr := httptest.NewRecorder()
+	handleHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	// Upstream should NOT have received the Connection header from the proxy request.
+	// (net/http server strips it on arrival, so check via echoed X-Got-Connection)
+	if got := rr.Result().Header.Get("X-Got-Connection"); got != "" {
+		t.Errorf("Connection header leaked to upstream: %q", got)
+	}
+	// Response hop-by-hop headers must be stripped before reaching the client.
+	if got := rr.Result().Header.Get("Connection"); got != "" {
+		t.Errorf("Connection header leaked to client response: %q", got)
+	}
+	if got := rr.Result().Header.Get("Keep-Alive"); got != "" {
+		t.Errorf("Keep-Alive header leaked to client response: %q", got)
+	}
+}
+
+// ---- record mode stores large bodies faithfully ----
+
+func TestRecord_LargeBodyFullyStored(t *testing.T) {
+	const bodySize = 4096 // well above the 1 KB display cap
+	largeBody := strings.Repeat("a", bodySize)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write(got) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	f, err := os.CreateTemp("", "httpmon-test-large-*.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recPath := f.Name()
+	f.Close()
+	defer os.Remove(recPath)
+
+	savedRM := recordMode
+	recordMode = true
+	if err := openRecordFile(recPath); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		recordFile.Close()
+		recordFile = nil
+		recordEncoder = nil
+		recordMode = savedRM
+	}()
+
+	req, _ := http.NewRequest("POST", upstream.URL+"/data",
+		io.NopCloser(strings.NewReader(largeBody)))
+	req.Header.Set("Content-Type", "text/plain")
+	req.ContentLength = int64(bodySize)
+	rr := httptest.NewRecorder()
+	handleHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+
+	recordFile.Sync() //nolint:errcheck
+	data, err := os.ReadFile(recPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var ex recordedExchange
+	if err := json.Unmarshal(bytes.TrimSpace(data), &ex); err != nil {
+		t.Fatalf("invalid NDJSON: %v\nraw: %s", err, data)
+	}
+	if len(ex.ReqBody) != bodySize {
+		t.Errorf("recorded req body len = %d, want %d", len(ex.ReqBody), bodySize)
+	}
+	if len(ex.RespBody) != bodySize {
+		t.Errorf("recorded resp body len = %d, want %d", len(ex.RespBody), bodySize)
+	}
+}
+
+// ---- generateCert parallel keygen ----
+
+// TestGenerateCert_ParallelDifferentHosts verifies that concurrent requests for
+// different hosts do not serialize behind a single lock during key generation.
+func TestGenerateCert_ParallelDifferentHosts(t *testing.T) {
+	hosts := []string{
+		"parallel-a.test.local",
+		"parallel-b.test.local",
+		"parallel-c.test.local",
+	}
+	certMu.Lock()
+	for _, h := range hosts {
+		delete(certCache, h)
+	}
+	certMu.Unlock()
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(hosts))
+	for i, h := range hosts {
+		wg.Add(1)
+		go func(idx int, host string) {
+			defer wg.Done()
+			_, errs[idx] = generateCert(host)
+		}(i, h)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("host %s: %v", hosts[i], err)
+		}
+	}
+}

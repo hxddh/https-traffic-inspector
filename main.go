@@ -118,16 +118,21 @@ func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 }
 
 // generateCert returns a cached or newly-created leaf cert for host.
-// The mutex is held for the entire check-generate-store cycle to prevent TOCTOU races.
-// Expired cache entries are replaced transparently.
+// The expensive RSA key generation runs outside the mutex so concurrent
+// requests for different hosts proceed in parallel. A double-checked store
+// ensures only one cert per host ends up in the cache even if two goroutines
+// race on the same host.
 func generateCert(host string) (*tls.Certificate, error) {
+	// Fast path: return cached cert without generating.
 	certMu.Lock()
-	defer certMu.Unlock()
-
 	if e, ok := certCache[host]; ok && time.Now().Before(e.expiresAt) {
-		return e.cert, nil
+		cert := e.cert
+		certMu.Unlock()
+		return cert, nil
 	}
+	certMu.Unlock()
 
+	// Slow path: generate outside the lock so other hosts are not blocked.
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
@@ -157,8 +162,16 @@ func generateCert(host string) (*tls.Certificate, error) {
 	}
 
 	if certTTL > 0 {
-		certCache[host] = &certEntry{cert: cert, expiresAt: time.Now().Add(certTTL)}
+		certMu.Lock()
+		// Re-check: another goroutine may have stored a cert while we were generating.
+		if e, ok := certCache[host]; ok && time.Now().Before(e.expiresAt) {
+			cert = e.cert
+		} else {
+			certCache[host] = &certEntry{cert: cert, expiresAt: time.Now().Add(certTTL)}
+		}
+		certMu.Unlock()
 	}
+
 	return cert, nil
 }
 
@@ -246,6 +259,25 @@ func flattenHeaders(h http.Header) map[string]string {
 	return m
 }
 
+// hopByHopHeaders lists the standard hop-by-hop headers defined in RFC 7230 §6.1.
+var hopByHopHeaders = []string{
+	"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+	"TE", "Trailer", "Transfer-Encoding", "Upgrade",
+}
+
+// removeHopByHopHeaders strips hop-by-hop headers from h per RFC 7230 §6.1.
+// It also removes any headers named in the Connection header value.
+func removeHopByHopHeaders(h http.Header) {
+	for _, v := range h["Connection"] {
+		for _, f := range strings.Split(v, ",") {
+			h.Del(strings.TrimSpace(f))
+		}
+	}
+	for _, hdr := range hopByHopHeaders {
+		h.Del(hdr)
+	}
+}
+
 // ---- logging ----
 
 // logRequest logs the request and returns the assigned request ID.
@@ -259,7 +291,11 @@ func logRequest(req *http.Request) int {
 
 	var bodyStr string
 	if req.Body != nil {
-		body := peekBody(&req.Body, 1000)
+		peekN := 1000
+		if recordMode {
+			peekN = 1 << 20 // 1 MB: store faithful body in record file
+		}
+		body := peekBody(&req.Body, peekN)
 		if len(body) > 0 && isPrintable(req.Header) {
 			bodyStr = string(body)
 		} else if len(body) > 0 {
@@ -268,7 +304,12 @@ func logRequest(req *http.Request) int {
 	}
 
 	if recordMode {
-		recordRequest(reqID, req, bodyStr)
+		recordRequest(reqID, req, bodyStr) // bodyStr may be up to 1 MB
+	}
+
+	// Cap to 1 KB for display output (TUI / JSON / text).
+	if len(bodyStr) > 1000 {
+		bodyStr = bodyStr[:1000]
 	}
 
 	if tuiMode {
@@ -364,7 +405,11 @@ func logResponse(resp *http.Response, reqID int) {
 
 	var bodyStr string
 	if resp.Body != nil {
-		body := peekBody(&resp.Body, 1000)
+		peekN := 1000
+		if recordMode {
+			peekN = 1 << 20
+		}
+		body := peekBody(&resp.Body, peekN)
 		if len(body) > 0 && isPrintable(resp.Header) {
 			bodyStr = string(body)
 		} else if len(body) > 0 {
@@ -374,6 +419,10 @@ func logResponse(resp *http.Response, reqID int) {
 
 	if recordMode {
 		recordResponse(reqID, resp, bodyStr, dur)
+	}
+
+	if len(bodyStr) > 1000 {
+		bodyStr = bodyStr[:1000]
 	}
 
 	if tuiMode {
@@ -519,8 +568,9 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		proxyReq.Header = req.Header
+		proxyReq.Header = req.Header.Clone()
 		proxyReq.ContentLength = req.ContentLength
+		removeHopByHopHeaders(proxyReq.Header)
 		resp, err := upstreamClient.Do(proxyReq)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -530,6 +580,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 		for k, v := range resp.Header {
 			w.Header()[k] = v
 		}
+		removeHopByHopHeaders(w.Header())
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body) //nolint:errcheck
 		return
@@ -552,8 +603,9 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	proxyReq.Header = req.Header
+	proxyReq.Header = req.Header.Clone()
 	proxyReq.ContentLength = req.ContentLength
+	removeHopByHopHeaders(proxyReq.Header)
 
 	resp, err := upstreamClient.Do(proxyReq)
 	if err != nil {
@@ -568,6 +620,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
+	removeHopByHopHeaders(w.Header())
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body) //nolint:errcheck
 }
@@ -654,11 +707,16 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			req.Header.Del("Expect")
 		}
 
+		// Save before stripping so shouldClose can inspect the original value.
+		reqConnHdr := req.Header.Get("Connection")
+
 		shouldLog := matchesFilter(req)
 		var reqID int
 		if shouldLog {
-			reqID = logRequest(req)
+			reqID = logRequest(req) // logs original headers
 		}
+
+		removeHopByHopHeaders(req.Header) // strip before forwarding upstream
 
 		resp, err := sessionClient.Do(req)
 		if err != nil {
@@ -671,11 +729,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if shouldLog {
-			logResponse(resp, reqID)
+			logResponse(resp, reqID) // logs original response headers
 		}
 
-		shouldClose := strings.EqualFold(req.Header.Get("Connection"), "close") ||
+		shouldClose := strings.EqualFold(reqConnHdr, "close") ||
 			strings.EqualFold(resp.Header.Get("Connection"), "close")
+
+		removeHopByHopHeaders(resp.Header) // strip before forwarding downstream
 
 		if err := resp.Write(tlsConn); err != nil {
 			resp.Body.Close()
