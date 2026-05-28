@@ -156,7 +156,9 @@ func generateCert(host string) (*tls.Certificate, error) {
 		PrivateKey:  key,
 	}
 
-	certCache[host] = &certEntry{cert: cert, expiresAt: time.Now().Add(certTTL)}
+	if certTTL > 0 {
+		certCache[host] = &certEntry{cert: cert, expiresAt: time.Now().Add(certTTL)}
+	}
 	return cert, nil
 }
 
@@ -183,6 +185,19 @@ func nextReqID() int {
 	defer counterMu.Unlock()
 	requestCounter++
 	return requestCounter
+}
+
+// discardReqID cleans up reqStartTimes and pendingRecords when a request
+// cannot be completed and logResponse will never be called for this ID.
+func discardReqID(reqID int) {
+	reqStartMu.Lock()
+	delete(reqStartTimes, reqID)
+	reqStartMu.Unlock()
+	if recordMode {
+		pendingRecordsMu.Lock()
+		delete(pendingRecords, reqID)
+		pendingRecordsMu.Unlock()
+	}
 }
 
 // matchesFilter reports whether the request URL or host contains filterPattern.
@@ -218,7 +233,10 @@ type jsonResponse struct {
 	Body    string            `json:"body,omitempty"`
 }
 
-var jsonEnc = json.NewEncoder(os.Stdout)
+var (
+	jsonEnc   = json.NewEncoder(os.Stdout)
+	jsonEncMu sync.Mutex
+)
 
 func flattenHeaders(h http.Header) map[string]string {
 	m := make(map[string]string, len(h))
@@ -234,8 +252,9 @@ func flattenHeaders(h http.Header) map[string]string {
 func logRequest(req *http.Request) int {
 	reqID := nextReqID()
 
+	startTime := time.Now()
 	reqStartMu.Lock()
-	reqStartTimes[reqID] = time.Now()
+	reqStartTimes[reqID] = startTime
 	reqStartMu.Unlock()
 
 	var bodyStr string
@@ -255,7 +274,7 @@ func logRequest(req *http.Request) int {
 	if tuiMode {
 		entry := &tuiEntry{
 			id:         reqID,
-			startTime:  reqStartTimes[reqID],
+			startTime:  startTime,
 			method:     req.Method,
 			host:       req.Host,
 			path:       req.URL.Path,
@@ -272,6 +291,7 @@ func logRequest(req *http.Request) int {
 	}
 
 	if jsonMode {
+		jsonEncMu.Lock()
 		jsonEnc.Encode(jsonRequest{ //nolint:errcheck
 			ID:      reqID,
 			Time:    time.Now().Format(time.RFC3339),
@@ -282,6 +302,7 @@ func logRequest(req *http.Request) int {
 			Headers: flattenHeaders(req.Header),
 			Body:    bodyStr,
 		})
+		jsonEncMu.Unlock()
 		return reqID
 	}
 
@@ -371,6 +392,7 @@ func logResponse(resp *http.Response, reqID int) {
 	}
 
 	if jsonMode {
+		jsonEncMu.Lock()
 		jsonEnc.Encode(jsonResponse{ //nolint:errcheck
 			ReqID:   reqID,
 			Status:  resp.StatusCode,
@@ -378,6 +400,7 @@ func logResponse(resp *http.Response, reqID int) {
 			Headers: flattenHeaders(resp.Header),
 			Body:    bodyStr,
 		})
+		jsonEncMu.Unlock()
 		return
 	}
 
@@ -497,6 +520,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		proxyReq.Header = req.Header
+		proxyReq.ContentLength = req.ContentLength
 		resp, err := upstreamClient.Do(proxyReq)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -524,13 +548,16 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 
 	proxyReq, err := http.NewRequest(req.Method, targetURL.String(), req.Body)
 	if err != nil {
+		discardReqID(reqID)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	proxyReq.Header = req.Header
+	proxyReq.ContentLength = req.ContentLength
 
 	resp, err := upstreamClient.Do(proxyReq)
 	if err != nil {
+		discardReqID(reqID)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -546,7 +573,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
-	if !jsonMode {
+	if !jsonMode && !tuiMode {
 		fmt.Printf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host)
 	}
 
@@ -621,7 +648,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		// so http.Transport does not attempt a second 100-continue round-trip to
 		// the upstream.
 		if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
-			fmt.Fprint(tlsConn, "HTTP/1.1 100 Continue\r\n\r\n")
+			if _, err := fmt.Fprint(tlsConn, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
+				break
+			}
 			req.Header.Del("Expect")
 		}
 
@@ -634,6 +663,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		resp, err := sessionClient.Do(req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error making request: %v\n", err)
+			if shouldLog {
+				discardReqID(reqID)
+			}
 			writeConnError(tlsConn, http.StatusBadGateway, err.Error())
 			break
 		}
@@ -642,7 +674,8 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			logResponse(resp, reqID)
 		}
 
-		shouldClose := req.Header.Get("Connection") == "close" || resp.Header.Get("Connection") == "close"
+		shouldClose := strings.EqualFold(req.Header.Get("Connection"), "close") ||
+			strings.EqualFold(resp.Header.Get("Connection"), "close")
 
 		if err := resp.Write(tlsConn); err != nil {
 			resp.Body.Close()
