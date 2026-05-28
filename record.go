@@ -146,12 +146,15 @@ func replayFile(path, targetBase string, delayBetween time.Duration) int {
 func replayOne(client *http.Client, ex *recordedExchange, targetBase string) {
 	replayURL := ex.URL
 	if targetBase != "" {
-		// Replace scheme+host in the original URL with targetBase.
+		// Replace scheme+host in the original URL with targetBase,
+		// preserving path, query string, and fragment.
 		rest := ex.URL
 		if i := strings.Index(rest, "://"); i >= 0 {
 			rest = rest[i+3:]
-			if j := strings.Index(rest, "/"); j >= 0 {
-				rest = rest[j:]
+			// Find the first '/' or '?' to split off the host.
+			cut := strings.IndexAny(rest, "/?#")
+			if cut >= 0 {
+				rest = rest[cut:]
 			} else {
 				rest = "/"
 			}

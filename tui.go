@@ -189,7 +189,7 @@ func (m *tuiModel) applySize() {
 }
 
 func (m *tuiModel) refreshDetail() {
-	if !m.ready || len(m.entries) == 0 {
+	if !m.ready || len(m.entries) == 0 || m.cursor >= len(m.entries) {
 		return
 	}
 	m.vp.SetContent(renderEntryDetail(m.entries[m.cursor]))

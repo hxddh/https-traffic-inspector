@@ -51,6 +51,7 @@ func spliceWebSocket(upConn net.Conn, req *http.Request, clientConn net.Conn, cl
 	}()
 	go func() {
 		io.Copy(clientConn, upReader) //nolint:errcheck
+		clientConn.Close()            // signal client EOF; unblocks goroutine 1
 		errc <- struct{}{}
 	}()
 	<-errc

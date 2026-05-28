@@ -150,7 +150,7 @@ func generateCert(host string) (*tls.Certificate, error) {
 		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:    []string{host, "*." + host},
-		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, caCert, &key.PublicKey, caKey)
@@ -421,7 +421,10 @@ func logResponse(resp *http.Response, reqID int) {
 	start := reqStartTimes[reqID]
 	delete(reqStartTimes, reqID)
 	reqStartMu.Unlock()
-	dur := time.Since(start)
+	var dur time.Duration
+	if !start.IsZero() {
+		dur = time.Since(start)
+	}
 
 	var bodyStr string
 	if resp.Body != nil {

@@ -168,6 +168,7 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		statusText = statusText[4:] // strip "NNN "
 	}
 
+	bodySize := int64(len(body))
 	ms := float64(dur) / float64(time.Millisecond)
 	e.Time = ms
 	e.Response = harResponse{
@@ -177,13 +178,13 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		Headers:     harHeaders(resp.Header),
 		Cookies:     []harNameValue{},
 		Content: harContent{
-			Size:     resp.ContentLength,
+			Size:     bodySize,
 			MimeType: mt,
 			Text:     body,
 		},
 		RedirectURL: resp.Header.Get("Location"),
 		HeadersSize: -1,
-		BodySize:    resp.ContentLength,
+		BodySize:    bodySize,
 	}
 	e.Timings = harTimings{Wait: ms}
 
