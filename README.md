@@ -18,7 +18,7 @@ Headers:
   Accept: */*
 
 === RESPONSE ===
-HTTP/2.0 200 OK
+HTTP/1.1 200 OK
 
 Headers:
   Content-Type: application/json; charset=utf-8
@@ -38,13 +38,40 @@ No system configuration is changed. Everything is cleaned up when the command ex
 
 - **HTTP** — forwarded and logged transparently
 - **HTTPS** — intercepted via TLS termination with a per-host certificate signed by the ephemeral CA
-- **Streaming** — only the first 1 KB of each body is logged; the full stream is forwarded unmodified
+- **WebSocket (`wss://`)** — upgrade handshake is proxied and frames are spliced bidirectionally
+- **Body display** — compressed responses (gzip, deflate) are decompressed automatically; only the first 1 KB is shown, the full stream is forwarded unmodified
+- **HAR export** — all captured traffic can be written to an HTTP Archive (`.har`) file on exit
 
 ---
 
 ## Installation
 
-**From source** (requires Go 1.21+):
+### Homebrew (macOS / Linux)
+
+```bash
+# After the first release is published:
+brew tap hxddh/tap
+brew install httpmon
+```
+
+### Pre-built binaries
+
+Download the latest binary for your platform from the [Releases](https://github.com/hxddh/https-traffic-inspector/releases) page:
+
+| Platform | File |
+|----------|------|
+| macOS arm64 | `httpmon-darwin-arm64` |
+| macOS amd64 | `httpmon-darwin-amd64` |
+| Linux amd64 | `httpmon-linux-amd64` |
+| Linux arm64 | `httpmon-linux-arm64` |
+| Windows amd64 | `httpmon-windows-amd64.exe` |
+
+```bash
+chmod +x httpmon-darwin-arm64
+sudo mv httpmon-darwin-arm64 /usr/local/bin/httpmon
+```
+
+### From source (requires Go 1.24+)
 
 ```bash
 git clone https://github.com/hxddh/https-traffic-inspector
@@ -72,6 +99,7 @@ httpmon --replay <file> [--replay-target <url>]
 | `--cert-ttl` | `1h` | How long per-host TLS certificates are cached. `0` disables caching. |
 | `--ui` | `false` | Launch the interactive terminal UI. |
 | `--record` | _(none)_ | Append recorded traffic to an NDJSON file. |
+| `--har` | _(none)_ | Write captured traffic as HAR 1.2 JSON on exit. |
 | `--replay` | _(none)_ | Replay a recorded file (no proxy or command needed). |
 | `--replay-target` | _(none)_ | Override the base URL when replaying (e.g. `https://staging.example.com`). |
 | `--replay-delay` | `0` | Pause between replayed requests. |
@@ -167,6 +195,37 @@ Subprocess stdout/stderr is captured during the TUI session and printed to stder
 
 ---
 
+### Body decompression
+
+httpmon automatically decompresses `gzip` and `deflate` encoded response bodies before display. Most HTTPS APIs compress their responses; you see the decoded JSON or HTML rather than `[binary data, N bytes]`.
+
+```
+=== RESPONSE ===
+HTTP/1.1 200 OK
+
+Headers:
+  Content-Encoding: gzip
+  Content-Type: application/json
+
+Body:
+{"login":"octocat","id":583231,...}   ← decoded automatically
+```
+
+The full compressed stream is still forwarded to the subprocess unmodified.
+
+---
+
+### WebSocket support
+
+`wss://` connections established via CONNECT tunnels are handled transparently. The upgrade handshake is proxied and logged; after the 101 response, frames are spliced bidirectionally between client and upstream without buffering.
+
+```bash
+httpmon node ws-client.js          # wss:// connections work automatically
+httpmon --ui node ws-client.js     # upgrade handshake visible in TUI
+```
+
+---
+
 ### Recording — `--record`
 
 Save all intercepted traffic to an NDJSON file for later replay or analysis.
@@ -236,6 +295,22 @@ Replaying: POST https://staging.example.com/repos
 
 ---
 
+### HAR export — `--har`
+
+Write all captured traffic to an [HTTP Archive](https://en.wikipedia.org/wiki/HAR_(file_format)) file (HAR 1.2) on exit. HAR files can be imported into Chrome DevTools, Charles Proxy, Postman, and other analysis tools.
+
+```bash
+# Capture to HAR
+httpmon --har session.har curl https://api.github.com
+
+# Combine with filter and TUI
+httpmon --ui --har api.har --filter /api python3 app.py
+```
+
+Open `session.har` in Chrome DevTools → Network tab → Import, or drag it into the [HAR Analyzer](https://toolbox.googleapps.com/apps/har_analyzer/).
+
+---
+
 ## Examples
 
 ```bash
@@ -255,8 +330,11 @@ httpmon --format json node app.js >> traffic.log
 httpmon --record prod.ndjson curl https://api.prod.example.com/health
 httpmon --replay prod.ndjson --replay-target https://api.staging.example.com
 
-# Full session: TUI + recording + filter
-httpmon --ui --record session.ndjson --filter /api python3 app.py
+# Save a HAR file for sharing or import into DevTools
+httpmon --har trace.har curl https://api.github.com
+
+# Full session: TUI + HAR + filter
+httpmon --ui --har session.har --filter /api python3 app.py
 
 # Use a random port to avoid conflicts (useful in CI)
 httpmon --port 0 curl https://api.example.com
