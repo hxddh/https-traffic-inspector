@@ -168,7 +168,8 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		statusText = statusText[4:] // strip "NNN "
 	}
 
-	e.Time = float64(dur.Milliseconds())
+	ms := float64(dur) / float64(time.Millisecond)
+	e.Time = ms
 	e.Response = harResponse{
 		Status:      resp.StatusCode,
 		StatusText:  fmt.Sprintf("%s", statusText),
@@ -184,7 +185,7 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		HeadersSize: -1,
 		BodySize:    resp.ContentLength,
 	}
-	e.Timings = harTimings{Wait: float64(dur.Milliseconds())}
+	e.Timings = harTimings{Wait: ms}
 
 	harEntriesMu.Lock()
 	harEntries = append(harEntries, *e)

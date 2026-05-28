@@ -298,15 +298,25 @@ func logRequest(req *http.Request) int {
 
 	var bodyStr string
 	if req.Body != nil {
+		enc := req.Header.Get("Content-Encoding")
+		compressed := enc != "" && enc != "identity"
 		peekN := 1000
-		if recordMode || harMode {
-			peekN = 1 << 20 // 1 MB: store faithful body in record/HAR file
+		if recordMode || harMode || compressed {
+			peekN = 1 << 20 // 1 MB for record/HAR/decompression
 		}
 		body := peekBody(&req.Body, peekN)
-		if len(body) > 0 && isPrintable(req.Header) {
-			bodyStr = string(body)
-		} else if len(body) > 0 {
-			bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+		if len(body) > 0 {
+			if isPrintable(req.Header) {
+				bodyStr = string(body)
+			} else if compressed {
+				if dec, err := decompressBody(enc, body); err == nil && isPrintableContentType(req.Header.Get("Content-Type")) {
+					bodyStr = string(dec)
+				} else {
+					bodyStr = fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))
+				}
+			} else {
+				bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+			}
 		}
 	}
 
@@ -415,15 +425,25 @@ func logResponse(resp *http.Response, reqID int) {
 
 	var bodyStr string
 	if resp.Body != nil {
+		enc := resp.Header.Get("Content-Encoding")
+		compressed := enc != "" && enc != "identity"
 		peekN := 1000
-		if recordMode || harMode {
+		if recordMode || harMode || compressed {
 			peekN = 1 << 20
 		}
 		body := peekBody(&resp.Body, peekN)
-		if len(body) > 0 && isPrintable(resp.Header) {
-			bodyStr = string(body)
-		} else if len(body) > 0 {
-			bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+		if len(body) > 0 {
+			if isPrintable(resp.Header) {
+				bodyStr = string(body)
+			} else if compressed {
+				if dec, err := decompressBody(enc, body); err == nil && isPrintableContentType(resp.Header.Get("Content-Type")) {
+					bodyStr = string(dec)
+				} else {
+					bodyStr = fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))
+				}
+			} else {
+				bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+			}
 		}
 	}
 
@@ -490,14 +510,9 @@ func peekBody(body *io.ReadCloser, n int) []byte {
 	return buf
 }
 
-// isPrintable returns true when the Content-Type suggests the body is human-readable text.
-// Also returns false for compressed payloads regardless of content type.
-func isPrintable(header http.Header) bool {
-	enc := header.Get("Content-Encoding")
-	if enc != "" && enc != "identity" {
-		return false
-	}
-	ct := strings.ToLower(header.Get("Content-Type"))
+// isPrintableContentType returns true when the MIME type suggests human-readable text.
+func isPrintableContentType(ct string) bool {
+	ct = strings.ToLower(ct)
 	if ct == "" {
 		return true
 	}
@@ -507,6 +522,16 @@ func isPrintable(header http.Header) bool {
 		strings.Contains(ct, "html") ||
 		strings.Contains(ct, "javascript") ||
 		strings.Contains(ct, "form")
+}
+
+// isPrintable returns true when the Content-Type suggests human-readable text
+// AND the Content-Encoding is not a compression scheme.
+func isPrintable(header http.Header) bool {
+	enc := header.Get("Content-Encoding")
+	if enc != "" && enc != "identity" {
+		return false
+	}
+	return isPrintableContentType(header.Get("Content-Type"))
 }
 
 // writeConnError writes an HTTP error response directly onto a raw connection.

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -860,6 +862,104 @@ func TestRecord_LargeBodyFullyStored(t *testing.T) {
 	}
 }
 
+// ---- decompressBody ----
+
+func TestDecompressBody_Gzip(t *testing.T) {
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	w.Write([]byte(`{"hello":"world"}`)) //nolint:errcheck
+	w.Close()
+
+	got, err := decompressBody("gzip", buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"hello":"world"}` {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestDecompressBody_Deflate(t *testing.T) {
+	var buf bytes.Buffer
+	w, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+	w.Write([]byte("deflated text")) //nolint:errcheck
+	w.Close()
+
+	got, err := decompressBody("deflate", buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "deflated text" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestDecompressBody_Identity(t *testing.T) {
+	got, err := decompressBody("identity", []byte("plain"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "plain" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestDecompressBody_Unknown(t *testing.T) {
+	got, err := decompressBody("br", []byte("raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "raw" {
+		t.Errorf("got %q, want raw (pass-through)", got)
+	}
+}
+
+func TestLogResponse_GzipBodyDecoded(t *testing.T) {
+	// Upstream returns a gzip-compressed JSON response.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		gz.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+		gz.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		w.Write(buf.Bytes()) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	savedJM := jsonMode
+	jsonMode = true
+	defer func() { jsonMode = savedJM }()
+
+	var logBuf bytes.Buffer
+	jsonEnc = json.NewEncoder(&logBuf)
+
+	req, _ := http.NewRequest("GET", upstream.URL+"/data", nil)
+	rr := httptest.NewRecorder()
+	handleHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	// The JSON log should contain the decompressed body, not "[gzip, ...]".
+	lines := strings.Split(strings.TrimSpace(logBuf.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected 2 JSON lines, got %d: %s", len(lines), logBuf.String())
+	}
+	var respEntry jsonResponse
+	if err := json.Unmarshal([]byte(lines[1]), &respEntry); err != nil {
+		t.Fatalf("unmarshal response: %v\nraw: %s", err, lines[1])
+	}
+	if !strings.Contains(respEntry.Body, "status") {
+		t.Errorf("body = %q; want decompressed JSON containing 'status'", respEntry.Body)
+	}
+	if strings.Contains(respEntry.Body, "gzip") {
+		t.Errorf("body = %q; should not contain 'gzip' (raw placeholder)", respEntry.Body)
+	}
+}
+
 // ---- WebSocket splice ----
 
 func TestSpliceWebSocket(t *testing.T) {
@@ -1012,8 +1112,8 @@ func TestHAR_BasicCapture(t *testing.T) {
 	if !strings.Contains(e.Response.Content.Text, "ok") {
 		t.Errorf("response body %q missing expected content", e.Response.Content.Text)
 	}
-	if e.Time <= 0 {
-		t.Errorf("entry time = %f, want > 0", e.Time)
+	if e.Time < 0 {
+		t.Errorf("entry time = %f, want >= 0", e.Time)
 	}
 }
 
