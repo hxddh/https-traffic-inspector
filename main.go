@@ -3,8 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -40,7 +41,7 @@ var (
 	counterMu      sync.Mutex
 	proxyPort      string
 	caCert         *x509.Certificate
-	caKey          *rsa.PrivateKey
+	caKey          *ecdsa.PrivateKey
 	certCache      = make(map[string]*certEntry)
 	certMu         sync.Mutex
 	certTTL        = time.Hour // overridden by --cert-ttl flag
@@ -87,8 +88,8 @@ func randSerial() *big.Int {
 	return n
 }
 
-func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+func generateCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -100,8 +101,7 @@ func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().AddDate(10, 0, 0),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
@@ -120,10 +120,9 @@ func generateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 }
 
 // generateCert returns a cached or newly-created leaf cert for host.
-// The expensive RSA key generation runs outside the mutex so concurrent
-// requests for different hosts proceed in parallel. A double-checked store
-// ensures only one cert per host ends up in the cache even if two goroutines
-// race on the same host.
+// Key generation runs outside the mutex so concurrent requests for different
+// hosts proceed in parallel. A double-checked store ensures only one cert per
+// host ends up in the cache even if two goroutines race on the same host.
 func generateCert(host string) (*tls.Certificate, error) {
 	// Fast path: return cached cert without generating.
 	certMu.Lock()
@@ -135,7 +134,7 @@ func generateCert(host string) (*tls.Certificate, error) {
 	certMu.Unlock()
 
 	// Slow path: generate outside the lock so other hosts are not blocked.
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +146,7 @@ func generateCert(host string) (*tls.Certificate, error) {
 		},
 		NotBefore:   time.Now(),
 		NotAfter:    time.Now().AddDate(1, 0, 0),
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:    []string{host, "*." + host},
 		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
