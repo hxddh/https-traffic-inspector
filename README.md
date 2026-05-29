@@ -46,12 +46,10 @@ No system configuration is changed. Everything is cleaned up when the command ex
 
 ## Installation
 
-### Homebrew (macOS / Linux)
+### go install (requires Go 1.24+)
 
 ```bash
-# After the first release is published:
-brew tap hxddh/tap
-brew install httpmon
+go install github.com/hxddh/https-traffic-inspector@latest
 ```
 
 ### Pre-built binaries
@@ -72,7 +70,7 @@ chmod +x httpmon-v1.0.1-macos-arm64
 sudo mv httpmon-v1.0.1-macos-arm64 /usr/local/bin/httpmon
 ```
 
-### From source (requires Go 1.24+)
+### From source
 
 ```bash
 git clone https://github.com/hxddh/https-traffic-inspector
