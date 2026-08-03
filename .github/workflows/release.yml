@@ -41,7 +41,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+
+      # A re-dispatch for an already-released tag must rebuild from that tag,
+      # not from whatever main has moved on to.
+      - name: Prefer the release tag when it already exists
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          tag="${{ inputs.tag_name }}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "Building from existing tag $tag"
+            git checkout --detach "refs/tags/$tag"
+          else
+            echo "Tag $tag does not exist yet; building from main"
+          fi
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -71,13 +86,45 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      # Auto-generated notes only summarise merged PRs, so a release whose work
+      # landed outside a PR ends up with notes that omit everything — including
+      # breaking changes. Prefer the hand-written CHANGELOG section.
+      - name: Build release notes from CHANGELOG
+        id: notes
+        run: |
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}"
+          version="${tag#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/        { exit }
+            found                    { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+
+          if [ -s RELEASE_NOTES.md ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Using the CHANGELOG section for $version:"
+            cat RELEASE_NOTES.md
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No CHANGELOG section for $version; falling back to generated notes."
+            printf 'See [CHANGELOG.md](https://github.com/%s/blob/main/CHANGELOG.md).\n' \
+              "$GITHUB_REPOSITORY" > RELEASE_NOTES.md
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
           files: dist/*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          # Only append the PR summary when there is no CHANGELOG section to use.
+          generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
