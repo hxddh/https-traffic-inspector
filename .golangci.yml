@@ -1,0 +1,47 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+    - gosec
+
+  settings:
+    errcheck:
+      # Close on a reader or connection has no error worth acting on. Writers
+      # whose close can lose data (the HAR file) are checked explicitly.
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (net.Conn).Close
+        - (*crypto/tls.Conn).Close
+        - (*compress/gzip.Reader).Close
+        - (*os.File).Close
+
+    gosec:
+      excludes:
+        # G104 duplicates errcheck.
+        - G104
+        # G402: TLS interception is the point of this tool. Upstream
+        # verification is on by default and only waived by --insecure-upstream.
+        - G402
+        # G304: the record and CA-bundle paths come from the user's own flags.
+        - G304
+        # G204: wrapping a user-supplied command is the tool's entire purpose.
+        - G204
+
+  exclusions:
+    rules:
+      # Output-formatting errors in tests are not worth checking.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofmt

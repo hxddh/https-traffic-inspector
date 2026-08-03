@@ -34,12 +34,12 @@ Body:
 ## How it works
 
 httpmon starts a local MITM proxy, generates a self-signed CA on the fly, and injects the proxy address and CA certificate into the wrapped command's environment.  
-No system configuration is changed. Everything is cleaned up when the command exits.
+No system configuration is changed, and the temporary CA bundle is removed when the command exits.
 
 - **HTTP** — forwarded and logged transparently
 - **HTTPS** — intercepted via TLS termination with a per-host certificate signed by the ephemeral CA
 - **WebSocket (`wss://`)** — upgrade handshake is proxied and frames are spliced bidirectionally
-- **Body display** — compressed responses (gzip, deflate) are decompressed automatically; only the first 1 KB is shown, the full stream is forwarded unmodified
+- **Body display** — compressed responses (gzip, deflate, brotli, zstd) are decompressed automatically; only the first 1 KB is shown by default, the full stream is forwarded unmodified
 - **HAR export** — all captured traffic can be written to an HTTP Archive (`.har`) file on exit
 
 ---
@@ -102,6 +102,19 @@ httpmon --replay <file> [--replay-target <url>]
 | `--replay` | _(none)_ | Replay a recorded file (no proxy or command needed). |
 | `--replay-target` | _(none)_ | Override the base URL when replaying (e.g. `https://staging.example.com`). |
 | `--replay-delay` | `0` | Pause between replayed requests. |
+| `--replay-fail-on-diff` | `false` | Exit with code `2` if any replayed response differs from the recording. |
+| `--insecure-upstream` | `false` | Skip TLS certificate verification for upstream servers. |
+| `--max-body` | `1000` | Max bytes of each body shown in output. |
+| `--max-capture` | `1048576` | Max bytes of each body kept for `--record` / `--har` and decompression. |
+| `--version` | | Print version and exit. |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| _(subprocess code)_ | The wrapped command's own exit code is passed through. |
+| `1` | httpmon failed to start, or writing the HAR file failed. In replay mode: the recording could not be read or parsed. |
+| `2` | Replay mode only, with `--replay-fail-on-diff`: at least one response differed from the recording. |
 
 ---
 
@@ -186,8 +199,12 @@ httpmon --ui aws s3 ls
 | `↓` / `j` | Move down |
 | `Enter` / `Space` | Toggle detail panel |
 | `g` / `G` | Jump to first / last entry |
+| `PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D` | Scroll the detail panel |
+| `Home` / `End` | Jump to top / bottom of the detail panel |
 | `Esc` | Close detail panel |
 | `q` | Quit (also terminates the subprocess) |
+
+A `▼` in the status bar means there is more content below in the detail panel. Selecting a different entry returns the panel to the top; a response arriving for the entry you are reading does not move it.
 
 Pending entries (awaiting response) are highlighted and update in place when the response arrives.  
 Subprocess stdout/stderr is captured during the TUI session and printed to stderr after exit.
@@ -196,7 +213,9 @@ Subprocess stdout/stderr is captured during the TUI session and printed to stder
 
 ### Body decompression
 
-httpmon automatically decompresses `gzip` and `deflate` encoded response bodies before display. Most HTTPS APIs compress their responses; you see the decoded JSON or HTML rather than `[binary data, N bytes]`.
+httpmon automatically decompresses `gzip`, `deflate`, `brotli` (`br`) and `zstd` encoded response bodies before display. Most HTTPS APIs compress their responses — GitHub and anything behind Cloudflare default to `br` — so you see the decoded JSON or HTML rather than a binary placeholder.
+
+Chained encodings (`Content-Encoding: gzip, br`) are decoded layer by layer. An encoding httpmon does not recognise is shown as a `[<encoding>, N+ bytes]` placeholder rather than being printed raw.
 
 ```
 === RESPONSE ===
@@ -211,6 +230,8 @@ Body:
 ```
 
 The full compressed stream is still forwarded to the subprocess unmodified.
+
+When only part of a large body was captured, the decoded prefix is shown followed by a `… [truncated]` marker, so a cut-off body is never mistaken for a complete one. Raise `--max-capture` to decode more.
 
 ---
 
@@ -273,6 +294,12 @@ httpmon --replay traffic.ndjson --replay-target https://staging.example.com
 
 # Replay with realistic pacing
 httpmon --replay traffic.ndjson --replay-delay 500ms
+
+# Gate a CI job on the responses being unchanged (exits 2 on any difference)
+httpmon --replay traffic.ndjson --replay-target https://staging.example.com --replay-fail-on-diff
+
+# Machine-readable results, one JSON object per replayed request
+httpmon --replay traffic.ndjson --format json | jq 'select(.status_match | not)'
 ```
 
 Output for each request:
@@ -341,9 +368,23 @@ httpmon --port 0 curl https://api.example.com
 
 ---
 
+## Limitations
+
+- **HTTP/1.1 only.** Traffic is not negotiated over HTTP/2: the MITM listener does not advertise `h2` via ALPN, and the upstream transport does not enable HTTP/2. Clients that would otherwise use HTTP/2 are silently downgraded, and **gRPC does not work through httpmon**.
+- **Plaintext `ws://` is not supported.** Only `wss://` (established through a `CONNECT` tunnel) is proxied. A cleartext WebSocket upgrade is routed through the ordinary HTTP path, which cannot complete the `101` handshake.
+- **`--har` does not apply to `--replay`.** Replay mode neither starts the proxy nor captures entries.
+- **Bodies are capped.** Output shows `--max-body` bytes; `--record` / `--har` / decompression keep `--max-capture` bytes. Raising `--max-capture` increases per-request memory use, since each captured body is buffered in full.
+- **The HAR `bodySize` field** reports the transferred size only when the upstream sent a `Content-Length`, and `-1` otherwise. `timings.send` and `timings.receive` are always `-1`: httpmon measures the round trip as a whole.
+
+---
+
 ## Security note
 
 httpmon is a **local development and debugging tool**. It performs TLS interception using an ephemeral self-signed CA that exists only for the duration of the process. The CA private key is never written to disk. Do not use it in production environments or to intercept traffic you do not own.
+
+**Upstream certificates are verified by default.** Because httpmon terminates TLS, the wrapped subprocess only ever validates the certificate httpmon presents — it can no longer see the real one. httpmon therefore performs that verification on its behalf, and a failure surfaces as a `502` plus an explanatory line on stderr.
+
+`--insecure-upstream` disables that check. It is needed for self-signed or internal-CA endpoints, but while it is set **nothing in the chain validates the upstream certificate**, so the connection is open to interception. Use it only against hosts you control.
 
 ---
 

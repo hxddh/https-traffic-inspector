@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -23,11 +24,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // certEntry wraps a TLS certificate with an expiry time for cache TTL enforcement.
@@ -48,17 +51,24 @@ var (
 	upstreamClient *http.Client
 
 	// set by flags
-	filterPattern string
-	jsonMode      bool
-	tuiMode       bool
-	recordMode    bool
-	harMode       bool
-	harPath       string
+	filterPattern    string
+	jsonMode         bool
+	tuiMode          bool
+	recordMode       bool
+	harMode          bool
+	harPath          string
+	insecureUpstream bool
+	displayMaxBody   = 1000    // --max-body: bytes of body shown in text/JSON/TUI output
+	captureMaxBody   = 1 << 20 // --max-capture: bytes of body kept for --record/--har/decompression
 
 	// per-request start times for duration tracking (used in TUI and text mode)
 	reqStartTimes = make(map[int]time.Time)
 	reqStartMu    sync.Mutex
 )
+
+// version is the released build identifier, injected at link time with
+// -ldflags "-X main.version=<tag>".
+var version = "dev"
 
 func init() {
 	var err error
@@ -67,9 +77,16 @@ func init() {
 		log.Fatal("Failed to generate CA:", err)
 	}
 
-	upstreamClient = &http.Client{
+	// Verified by default; run() replaces this once --insecure-upstream is parsed.
+	upstreamClient = newUpstreamClient(false)
+}
+
+// newUpstreamClient builds the shared client used for all upstream requests.
+// When insecure is true, upstream certificates are not verified.
+func newUpstreamClient(insecure bool) *http.Client {
+	return &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec // opt-in via --insecure-upstream
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
@@ -78,6 +95,59 @@ func init() {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// ---- cleanup ----
+
+var (
+	cleanups   []func()
+	cleanupsMu sync.Mutex
+)
+
+// addCleanup registers a function to run before run() returns. An explicit list
+// is used instead of defer because run() has several exit points and because it
+// lets tests trigger cleanup directly.
+func addCleanup(f func()) {
+	cleanupsMu.Lock()
+	cleanups = append(cleanups, f)
+	cleanupsMu.Unlock()
+}
+
+// runCleanups executes registered cleanups in reverse registration order.
+func runCleanups() {
+	cleanupsMu.Lock()
+	fs := cleanups
+	cleanups = nil
+	cleanupsMu.Unlock()
+	for i := len(fs) - 1; i >= 0; i-- {
+		fs[i]()
+	}
+}
+
+// isTLSVerificationError reports whether err came from upstream certificate
+// verification, so the user can be pointed at --insecure-upstream.
+func isTLSVerificationError(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidErr x509.CertificateInvalidError
+	return errors.As(err, &unknownAuthority) ||
+		errors.As(err, &hostnameErr) ||
+		errors.As(err, &invalidErr)
+}
+
+// warnTLSVerification prints an actionable hint when an upstream request fails
+// certificate verification.
+func warnTLSVerification(host string, err error) {
+	if insecureUpstream || !isTLSVerificationError(err) {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"httpmon: upstream TLS verification failed for %s; re-run with --insecure-upstream to bypass\n",
+		host)
 }
 
 func randSerial() *big.Int {
@@ -148,8 +218,13 @@ func generateCert(host string) (*tls.Certificate, error) {
 		NotAfter:    time.Now().AddDate(1, 0, 0),
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:    []string{host, "*." + host},
-		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+	}
+
+	// An IP-literal host needs an IP SAN; a DNS name must not be put in one.
+	if ip := net.ParseIP(host); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{host}
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, caCert, &key.PublicKey, caKey)
@@ -295,41 +370,16 @@ func logRequest(req *http.Request) int {
 	reqStartTimes[reqID] = startTime
 	reqStartMu.Unlock()
 
-	var bodyStr string
-	if req.Body != nil {
-		enc := req.Header.Get("Content-Encoding")
-		compressed := enc != "" && enc != "identity"
-		peekN := 1000
-		if recordMode || harMode || compressed {
-			peekN = 1 << 20 // 1 MB for record/HAR/decompression
-		}
-		body := peekBody(&req.Body, peekN)
-		if len(body) > 0 {
-			if isPrintable(req.Header) {
-				bodyStr = string(body)
-			} else if compressed {
-				if dec, err := decompressBody(enc, body); err == nil && isPrintableContentType(req.Header.Get("Content-Type")) {
-					bodyStr = string(dec)
-				} else {
-					bodyStr = fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))
-				}
-			} else {
-				bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
-			}
-		}
-	}
+	bodyStr := renderBody(&req.Body, req.Header)
 
 	if recordMode {
-		recordRequest(reqID, req, bodyStr) // bodyStr may be up to 1 MB
+		recordRequest(reqID, req, bodyStr) // bodyStr may be up to captureMaxBody
 	}
 	if harMode {
 		addHARRequest(reqID, req, bodyStr, startTime)
 	}
 
-	// Cap to 1 KB for display output (TUI / JSON / text).
-	if len(bodyStr) > 1000 {
-		bodyStr = bodyStr[:1000]
-	}
+	bodyStr = truncateForDisplay(bodyStr)
 
 	if tuiMode {
 		entry := &tuiEntry{
@@ -425,29 +475,7 @@ func logResponse(resp *http.Response, reqID int) {
 		dur = time.Since(start)
 	}
 
-	var bodyStr string
-	if resp.Body != nil {
-		enc := resp.Header.Get("Content-Encoding")
-		compressed := enc != "" && enc != "identity"
-		peekN := 1000
-		if recordMode || harMode || compressed {
-			peekN = 1 << 20
-		}
-		body := peekBody(&resp.Body, peekN)
-		if len(body) > 0 {
-			if isPrintable(resp.Header) {
-				bodyStr = string(body)
-			} else if compressed {
-				if dec, err := decompressBody(enc, body); err == nil && isPrintableContentType(resp.Header.Get("Content-Type")) {
-					bodyStr = string(dec)
-				} else {
-					bodyStr = fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))
-				}
-			} else {
-				bodyStr = fmt.Sprintf("[binary data, %d+ bytes]", len(body))
-			}
-		}
-	}
+	bodyStr := renderBody(&resp.Body, resp.Header)
 
 	if recordMode {
 		recordResponse(reqID, resp, bodyStr, dur)
@@ -456,9 +484,7 @@ func logResponse(resp *http.Response, reqID int) {
 		addHARResponse(reqID, resp, bodyStr, dur)
 	}
 
-	if len(bodyStr) > 1000 {
-		bodyStr = bodyStr[:1000]
-	}
+	bodyStr = truncateForDisplay(bodyStr)
 
 	if tuiMode {
 		select {
@@ -502,6 +528,60 @@ func logResponse(resp *http.Response, reqID int) {
 	fmt.Println("\n" + strings.Repeat("-", 60))
 }
 
+// truncationMarker is appended whenever displayed content is incomplete, so a
+// cut-off body is never mistaken for the whole thing.
+const truncationMarker = "\n… [truncated]"
+
+// renderBody peeks at *bodyp and returns a printable representation, decoding
+// Content-Encoding when possible. The result may be up to captureMaxBody long;
+// callers apply truncateForDisplay before showing it.
+func renderBody(bodyp *io.ReadCloser, h http.Header) string {
+	if bodyp == nil || *bodyp == nil {
+		return ""
+	}
+
+	enc := h.Get("Content-Encoding")
+	compressed := len(splitEncodings(enc)) > 0
+
+	peekN := displayMaxBody
+	if recordMode || harMode || compressed {
+		peekN = captureMaxBody
+	}
+
+	body := peekBody(bodyp, peekN)
+	if len(body) == 0 {
+		return ""
+	}
+
+	if isPrintable(h) {
+		return string(body)
+	}
+	if compressed {
+		res, err := decompressBody(enc, body)
+		if err == nil && isPrintableContentType(h.Get("Content-Type")) {
+			if res.Truncated {
+				return string(res.Data) + truncationMarker
+			}
+			return string(res.Data)
+		}
+		return fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))
+	}
+	return fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+}
+
+// truncateForDisplay caps s at displayMaxBody bytes, backing off to a rune
+// boundary so multi-byte characters are never split.
+func truncateForDisplay(s string) string {
+	if len(s) <= displayMaxBody {
+		return s
+	}
+	cut := displayMaxBody
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + truncationMarker
+}
+
 // peekBody reads up to n bytes from *body for logging, then reconstructs *body
 // with a MultiReader so the full stream (including peeked bytes) can still be forwarded.
 func peekBody(body *io.ReadCloser, n int) []byte {
@@ -529,8 +609,7 @@ func isPrintableContentType(ct string) bool {
 // isPrintable returns true when the Content-Type suggests human-readable text
 // AND the Content-Encoding is not a compression scheme.
 func isPrintable(header http.Header) bool {
-	enc := header.Get("Content-Encoding")
-	if enc != "" && enc != "identity" {
+	if len(splitEncodings(header.Get("Content-Encoding"))) > 0 {
 		return false
 	}
 	return isPrintableContentType(header.Get("Content-Type"))
@@ -557,9 +636,9 @@ func writeConnError(w io.Writer, statusCode int, msg string) {
 var systemCAPaths = []string{
 	"/etc/ssl/certs/ca-certificates.crt",     // Debian / Ubuntu / Alpine
 	"/etc/pki/tls/certs/ca-bundle.crt",       // RHEL / CentOS / Fedora
-	"/etc/ssl/cert.pem",                       // macOS / OpenBSD
+	"/etc/ssl/cert.pem",                      // macOS / OpenBSD
 	"/usr/local/share/certs/ca-root-nss.crt", // FreeBSD
-	"/etc/ssl/ca-bundle.pem",                  // openSUSE
+	"/etc/ssl/ca-bundle.pem",                 // openSUSE
 }
 
 func systemCABundle() string {
@@ -613,6 +692,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 		removeHopByHopHeaders(proxyReq.Header)
 		resp, err := upstreamClient.Do(proxyReq)
 		if err != nil {
+			warnTLSVerification(req.Host, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -650,6 +730,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 	resp, err := upstreamClient.Do(proxyReq)
 	if err != nil {
 		discardReqID(reqID)
+		warnTLSVerification(req.Host, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -753,11 +834,15 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		// WebSocket upgrades require a raw bidirectional tunnel; bypass the
 		// normal hop-by-hop stripping and http.Client round-trip.
 		if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
-			upConn, dialErr := tls.Dial("tcp", r.Host, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+			upConn, dialErr := tls.Dial("tcp", r.Host, &tls.Config{
+				InsecureSkipVerify: insecureUpstream, //nolint:gosec // opt-in via --insecure-upstream
+				ServerName:         host,
+			})
 			if dialErr != nil {
 				if shouldLog {
 					discardReqID(reqID)
 				}
+				warnTLSVerification(host, dialErr)
 				writeConnError(bw, http.StatusBadGateway, dialErr.Error())
 				bw.Flush() //nolint:errcheck
 				break
@@ -775,6 +860,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstreamClient.Do(req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error making request: %v\n", err)
+			warnTLSVerification(host, err)
 			if shouldLog {
 				discardReqID(reqID)
 			}
@@ -808,7 +894,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func main() {
+func main() { os.Exit(run()) }
+
+// run holds the whole program body so that every exit path returns a code
+// instead of calling os.Exit directly, which would skip cleanup.
+func run() int {
+	defer runCleanups()
+
 	portFlag := flag.String("port", "8080", "proxy listen port; use 0 to pick a random free port")
 	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
 	formatFlag := flag.String("format", "text", "output format: text | json")
@@ -819,6 +911,11 @@ func main() {
 	replayFlag := flag.String("replay", "", "path of a recorded NDJSON file to replay (skips proxy, no <command> needed)")
 	replayTargetFlag := flag.String("replay-target", "", "override base URL for replay (e.g. https://staging.example.com)")
 	replayDelayFlag := flag.Duration("replay-delay", 0, "pause between replayed requests")
+	replayFailFlag := flag.Bool("replay-fail-on-diff", false, "exit with code 2 if any replayed response differs from the recording")
+	insecureFlag := flag.Bool("insecure-upstream", false, "skip TLS certificate verification for upstream servers")
+	maxBodyFlag := flag.Int("max-body", 1000, "max bytes of each body shown in output")
+	maxCaptureFlag := flag.Int("max-capture", 1<<20, "max bytes of each body kept for --record/--har and decompression")
+	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
 		fmt.Fprintln(os.Stderr, "       httpmon --replay <file> [--replay-target <url>]")
@@ -838,24 +935,44 @@ func main() {
 	}
 	flag.Parse()
 
+	if *versionFlag {
+		fmt.Printf("httpmon %s (%s, %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		return 0
+	}
+
+	if *maxBodyFlag <= 0 || *maxCaptureFlag <= 0 {
+		fmt.Fprintln(os.Stderr, "httpmon: --max-body and --max-capture must be greater than 0")
+		return 1
+	}
+	if *maxCaptureFlag < *maxBodyFlag {
+		fmt.Fprintln(os.Stderr, "httpmon: --max-capture must not be smaller than --max-body")
+		return 1
+	}
+	displayMaxBody = *maxBodyFlag
+	captureMaxBody = *maxCaptureFlag
+
+	jsonMode = *formatFlag == "json"
+
 	// ── Replay mode: no proxy, no subprocess ─────────────────────────────────
 	if *replayFlag != "" {
-		os.Exit(replayFile(*replayFlag, *replayTargetFlag, *replayDelayFlag))
+		return replayFile(*replayFlag, *replayTargetFlag, *replayDelayFlag, *replayFailFlag)
 	}
 
 	filterPattern = *filterFlag
-	jsonMode = *formatFlag == "json"
 	tuiMode = *uiFlag
 	recordMode = *recordFlag != ""
 	harMode = *harFlag != ""
 	harPath = *harFlag
 	certTTL = *certTTLFlag
+	insecureUpstream = *insecureFlag
+	upstreamClient = newUpstreamClient(insecureUpstream)
 
 	if recordMode {
 		if err := openRecordFile(*recordFlag); err != nil {
-			log.Fatalf("Cannot open record file %s: %v", *recordFlag, err)
+			fmt.Fprintf(os.Stderr, "httpmon: cannot open record file %s: %v\n", *recordFlag, err)
+			return 1
 		}
-		defer recordFile.Close()
+		addCleanup(func() { recordFile.Close() }) //nolint:errcheck
 	}
 	if certTTL > 0 {
 		// Sweep expired entries at 1/6 of the TTL interval, minimum every minute.
@@ -869,7 +986,7 @@ func main() {
 	cmdArgs := flag.Args()
 	if len(cmdArgs) < 1 {
 		flag.Usage()
-		os.Exit(1)
+		return 1
 	}
 
 	proxyCAPEM := &bytes.Buffer{}
@@ -880,13 +997,15 @@ func main() {
 
 	caCertPath, err := buildCABundle(proxyCAPEM.Bytes())
 	if err != nil {
-		log.Fatal("Failed to build CA bundle:", err)
+		fmt.Fprintf(os.Stderr, "httpmon: failed to build CA bundle: %v\n", err)
+		return 1
 	}
-	defer os.Remove(caCertPath)
+	addCleanup(func() { os.Remove(caCertPath) }) //nolint:errcheck
 
 	ln, err := net.Listen("tcp", ":"+*portFlag)
 	if err != nil {
-		log.Fatalf("Failed to bind proxy on :%s: %v", *portFlag, err)
+		fmt.Fprintf(os.Stderr, "httpmon: failed to bind proxy on :%s: %v\n", *portFlag, err)
+		return 1
 	}
 	proxyPort = strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 
@@ -898,6 +1017,10 @@ func main() {
 				handleHTTP(w, r)
 			}
 		}),
+		// Bounds how long a connection may sit mid-header. Request bodies and
+		// hijacked CONNECT tunnels are unaffected, so long-lived streams and
+		// WebSocket splices still work.
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	go func() {
@@ -910,9 +1033,14 @@ func main() {
 			if filterPattern != "" {
 				fmt.Printf("Filter: %q\n", filterPattern)
 			}
+			if insecureUpstream {
+				fmt.Println("Upstream TLS verification: DISABLED (--insecure-upstream)")
+			}
 		}
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Proxy error: %v", err)
+			// Print rather than exit: the subprocess is already running and
+			// os.Exit here would skip cleanup of the CA bundle.
+			fmt.Fprintf(os.Stderr, "httpmon: proxy error: %v\n", err)
 		}
 	}()
 
@@ -998,10 +1126,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "\n── Command Output ─────────────────────────────────────")
 			fmt.Fprint(os.Stderr, out)
 		}
-		if harMode {
-			writeHARFile(harPath) //nolint:errcheck
-		}
-		os.Exit(code)
+		return finishHAR(code)
 	}
 
 	cmd.Stdout = os.Stdout
@@ -1032,8 +1157,20 @@ func main() {
 		}
 	}
 
-	if harMode {
-		writeHARFile(harPath) //nolint:errcheck
+	return finishHAR(exitCode)
+}
+
+// finishHAR writes the HAR file when --har is active, promoting a write failure
+// to a non-zero exit code so a silent loss of captured traffic is impossible.
+func finishHAR(exitCode int) int {
+	if !harMode {
+		return exitCode
 	}
-	os.Exit(exitCode)
+	if err := writeHARFile(harPath); err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon: failed to write HAR file %s: %v\n", harPath, err)
+		if exitCode == 0 {
+			return 1
+		}
+	}
+	return exitCode
 }

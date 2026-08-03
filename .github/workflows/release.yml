@@ -57,7 +57,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go build -trimpath -ldflags="-s -w" \
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.ver.outputs.tag }}" \
             -o httpmon-${{ steps.ver.outputs.tag }}-${{ matrix.os_name }}-${{ matrix.goarch }}${{ matrix.suffix }} .
 
       - uses: actions/upload-artifact@v4

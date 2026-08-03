@@ -29,7 +29,7 @@ type tuiEntry struct {
 }
 
 // Messages exchanged with the TUI model via tuiCh.
-type tuiReqMsg  struct{ entry *tuiEntry }
+type tuiReqMsg struct{ entry *tuiEntry }
 type tuiRespMsg struct {
 	reqID      int
 	status     int
@@ -93,31 +93,43 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
-				m.refreshDetail()
+				m.refreshDetail(true)
 			}
+			return m, nil
 		case "down", "j":
 			if m.cursor < len(m.entries)-1 {
 				m.cursor++
-				m.refreshDetail()
+				m.refreshDetail(true)
 			}
+			return m, nil
 		case "g":
 			m.cursor = 0
-			m.refreshDetail()
+			m.refreshDetail(true)
+			return m, nil
 		case "G":
 			if len(m.entries) > 0 {
 				m.cursor = len(m.entries) - 1
-				m.refreshDetail()
+				m.refreshDetail(true)
 			}
+			return m, nil
 		case "enter", " ":
 			if len(m.entries) > 0 {
 				m.showDetail = !m.showDetail
 				m.applySize()
 			}
+			return m, nil
 		case "esc":
 			m.showDetail = false
 			m.applySize()
+			return m, nil
 		}
-		return m, nil
+		// Keys the list does not use (pgup/pgdn, ctrl+u/ctrl+d, home/end)
+		// scroll the detail panel. Without this the viewport never receives
+		// key events and long bodies are unreachable.
+		if m.showDetail {
+			m.vp, vpCmd = m.vp.Update(msg)
+		}
+		return m, vpCmd
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -133,7 +145,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Auto-follow if cursor was already at the last entry.
 		if m.cursor == len(m.entries)-2 {
 			m.cursor = len(m.entries) - 1
-			m.refreshDetail()
+			m.refreshDetail(true)
 		}
 		return m, listenTUI()
 
@@ -147,7 +159,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		m.refreshDetail()
+		// Keep the scroll position: the user may be reading the request half
+		// of the panel when the response lands.
+		m.refreshDetail(false)
 		return m, listenTUI()
 
 	case tuiDoneMsg:
@@ -185,14 +199,20 @@ func (m *tuiModel) applySize() {
 	}
 	m.vp.Width = m.width
 	m.vp.Height = m.detailH()
-	m.refreshDetail()
+	m.refreshDetail(false)
 }
 
-func (m *tuiModel) refreshDetail() {
+// refreshDetail re-renders the detail panel. resetScroll returns the viewport
+// to the top, which is wanted when the selected entry changes but not when the
+// current entry is merely updated in place.
+func (m *tuiModel) refreshDetail(resetScroll bool) {
 	if !m.ready || len(m.entries) == 0 || m.cursor >= len(m.entries) {
 		return
 	}
 	m.vp.SetContent(renderEntryDetail(m.entries[m.cursor]))
+	if resetScroll {
+		m.vp.GotoTop()
+	}
 }
 
 // ── Detail panel renderer ─────────────────────────────────────────────────────
@@ -232,6 +252,29 @@ func renderEntryDetail(e *tuiEntry) string {
 		b.WriteString(fmt.Sprintf("\nResponse Body:\n%s\n", e.respBody))
 	}
 	return b.String()
+}
+
+// truncateDisplay shortens s to at most w display cells, appending an ellipsis
+// when it cuts. Width is measured in cells rather than bytes so multi-byte and
+// wide characters are neither split nor misaligned.
+func truncateDisplay(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if used+rw > w-1 {
+			break
+		}
+		b.WriteRune(r)
+		used += rw
+	}
+	return b.String() + "…"
 }
 
 // ── View ─────────────────────────────────────────────────────────────────────
@@ -280,15 +323,14 @@ func (m tuiModel) View() string {
 			statusStr = fmt.Sprintf("%d", e.status)
 			durStr = e.duration.Round(time.Millisecond).String()
 		}
-		urlStr := e.host + e.path
-		if len(urlStr) > urlW {
-			urlStr = urlStr[:urlW-1] + "…"
+		urlStr := truncateDisplay(e.host+e.path, urlW)
+		pad := urlW - lipgloss.Width(urlStr)
+		if pad < 0 {
+			pad = 0
 		}
-		line := fmt.Sprintf(" %-5d %-8s %-6s %-*s %s",
-			e.id, e.method, statusStr, urlW, urlStr, durStr)
-		if len(line) > m.width {
-			line = line[:m.width]
-		}
+		line := fmt.Sprintf(" %-5d %-8s %-6s %s%s %s",
+			e.id, e.method, statusStr, urlStr, strings.Repeat(" ", pad), durStr)
+		line = truncateDisplay(line, m.width)
 		switch {
 		case i == m.cursor:
 			b.WriteString(styleSelected.Width(m.width).Render(line))
@@ -317,6 +359,12 @@ func (m tuiModel) View() string {
 
 	// ── Status bar
 	hint := " [↑↓/jk] navigate  [enter] detail  [g/G] top/bottom  [q] quit"
+	if m.showDetail {
+		hint = " [↑↓/jk] navigate  [pgup/pgdn] scroll  [esc] close  [q] quit"
+		if !m.vp.AtBottom() {
+			hint += "  ▼"
+		}
+	}
 	if m.doneMsg != "" {
 		hint = m.doneMsg
 	}

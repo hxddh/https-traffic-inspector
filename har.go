@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -69,7 +68,7 @@ type harEntry struct {
 
 type harFile struct {
 	Log struct {
-		Version string     `json:"version"`
+		Version string `json:"version"`
 		Creator struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
@@ -168,17 +167,25 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		statusText = statusText[4:] // strip "NNN "
 	}
 
-	bodySize := int64(len(body))
+	// content.size is the decoded size; bodySize is the bytes actually
+	// transferred, which is only known from Content-Length. -1 means unknown,
+	// as required by the HAR 1.2 spec.
+	contentSize := int64(len(body))
+	bodySize := resp.ContentLength
+	if bodySize < 0 {
+		bodySize = -1
+	}
+
 	ms := float64(dur) / float64(time.Millisecond)
 	e.Time = ms
 	e.Response = harResponse{
 		Status:      resp.StatusCode,
-		StatusText:  fmt.Sprintf("%s", statusText),
+		StatusText:  statusText,
 		HTTPVersion: resp.Proto,
 		Headers:     harHeaders(resp.Header),
 		Cookies:     []harNameValue{},
 		Content: harContent{
-			Size:     bodySize,
+			Size:     contentSize,
 			MimeType: mt,
 			Text:     body,
 		},
@@ -186,7 +193,9 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		HeadersSize: -1,
 		BodySize:    bodySize,
 	}
-	e.Timings = harTimings{Wait: ms}
+	// httpmon measures only the total round trip; send/receive are not
+	// separable here, and -1 is the spec's "not applicable" value.
+	e.Timings = harTimings{Send: -1, Wait: ms, Receive: -1}
 
 	harEntriesMu.Lock()
 	harEntries = append(harEntries, *e)
@@ -198,27 +207,28 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 // writeHARFile serialises all captured entries to path as HAR 1.2 JSON.
 func writeHARFile(path string) error {
 	harEntriesMu.Lock()
+	// make() never returns nil, so this always marshals as [] rather than null.
 	entries := make([]harEntry, len(harEntries))
 	copy(entries, harEntries)
 	harEntriesMu.Unlock()
-
-	if entries == nil {
-		entries = []harEntry{}
-	}
 
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	var out harFile
 	out.Log.Version = "1.2"
 	out.Log.Creator.Name = "httpmon"
-	out.Log.Creator.Version = "1.0"
+	out.Log.Creator.Version = version
 	out.Log.Entries = entries
 
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	if err := enc.Encode(out); err != nil {
+		f.Close() //nolint:errcheck // the encode error is the one worth reporting
+		return err
+	}
+	// Report close errors too: a failed flush here means truncated capture.
+	return f.Close()
 }

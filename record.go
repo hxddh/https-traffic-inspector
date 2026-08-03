@@ -41,7 +41,9 @@ var (
 
 // openRecordFile opens (or creates) the NDJSON recording file.
 func openRecordFile(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// 0600: recordings carry whole request headers, including Authorization
+	// values and cookies, so they must not be world-readable.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
@@ -90,10 +92,31 @@ func recordResponse(reqID int, resp *http.Response, body string, dur time.Durati
 
 // ── Replay ───────────────────────────────────────────────────────────────────
 
+// replayResult is the outcome of replaying a single recorded exchange.
+type replayResult struct {
+	ID             int    `json:"id"`
+	Method         string `json:"method"`
+	URL            string `json:"url"`
+	RecordedStatus int    `json:"recorded_status"`
+	ActualStatus   int    `json:"actual_status"`
+	StatusMatch    bool   `json:"status_match"`
+	BodyMatch      bool   `json:"body_match"`
+	DurationMs     int64  `json:"duration_ms"`
+	Err            string `json:"error,omitempty"`
+}
+
+// Differs reports whether the replayed response deviated from the recording.
+func (r replayResult) Differs() bool {
+	return r.Err != "" || !r.StatusMatch || !r.BodyMatch
+}
+
 // replayFile reads an NDJSON recording and replays each exchange.
 // If targetBase is non-empty it is used as the URL prefix (scheme+host),
 // replacing the original host. Results are printed to stdout.
-func replayFile(path, targetBase string, delayBetween time.Duration) int {
+//
+// Exit codes: 0 = clean, 1 = read/parse failure, 2 = differences found while
+// failOnDiff is set (so CI can gate on it).
+func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff bool) int {
 	f, err := os.Open(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "replay: cannot open %s: %v\n", path, err)
@@ -110,7 +133,7 @@ func replayFile(path, targetBase string, delayBetween time.Duration) int {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 
-	n, errs := 0, 0
+	n, errs, diffs := 0, 0, 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -128,22 +151,34 @@ func replayFile(path, targetBase string, delayBetween time.Duration) int {
 			time.Sleep(delayBetween)
 		}
 
-		replayOne(client, &ex, targetBase)
+		res := replayOne(client, &ex, targetBase)
+		if res.Differs() {
+			diffs++
+		}
 		n++
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "replay: read error: %v\n", err)
 		return 1
 	}
-	fmt.Printf("\n%s replayed %d request(s), %d error(s)\n",
-		strings.Repeat("─", 60), n, errs)
+	if !jsonMode {
+		fmt.Printf("\n%s replayed %d request(s), %d error(s), %d diff(s)\n",
+			strings.Repeat("─", 60), n, errs, diffs)
+	}
 	if errs > 0 {
 		return 1
+	}
+	if failOnDiff && diffs > 0 {
+		return 2
 	}
 	return 0
 }
 
-func replayOne(client *http.Client, ex *recordedExchange, targetBase string) {
+// replayOne re-issues a single recorded exchange and reports how the response
+// compares. Output goes to stdout as text, or as one NDJSON object when
+// --format json is set.
+func replayOne(client *http.Client, ex *recordedExchange, targetBase string) replayResult {
+	res := replayResult{ID: ex.ID, Method: ex.Method, RecordedStatus: ex.Status}
 	replayURL := ex.URL
 	if targetBase != "" {
 		// Replace scheme+host in the original URL with targetBase,
@@ -161,10 +196,13 @@ func replayOne(client *http.Client, ex *recordedExchange, targetBase string) {
 		}
 		replayURL = strings.TrimRight(targetBase, "/") + rest
 	}
+	res.URL = replayURL
 
-	fmt.Printf("\n\033[36m── REPLAY #%d ──\033[0m\n", ex.ID)
-	fmt.Printf("Original:  %s %s  →  %s\n", ex.Method, ex.URL, ex.StatusText)
-	fmt.Printf("Replaying: %s %s\n", ex.Method, replayURL)
+	if !jsonMode {
+		fmt.Printf("\n\033[36m── REPLAY #%d ──\033[0m\n", ex.ID)
+		fmt.Printf("Original:  %s %s  →  %s\n", ex.Method, ex.URL, ex.StatusText)
+		fmt.Printf("Replaying: %s %s\n", ex.Method, replayURL)
+	}
 
 	var bodyReader io.Reader
 	if ex.ReqBody != "" {
@@ -173,8 +211,9 @@ func replayOne(client *http.Client, ex *recordedExchange, targetBase string) {
 
 	req, err := http.NewRequest(ex.Method, replayURL, bodyReader)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  error building request: %v\n", err)
-		return
+		res.Err = err.Error()
+		emitReplayResult(res, "")
+		return res
 	}
 	for k, v := range ex.ReqHeaders {
 		req.Header.Set(k, v)
@@ -185,32 +224,69 @@ func replayOne(client *http.Client, ex *recordedExchange, targetBase string) {
 	start := time.Now()
 	resp, err := client.Do(req)
 	dur := time.Since(start)
+	res.DurationMs = dur.Milliseconds()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  \033[31mFAIL\033[0m: %v\n", err)
-		return
+		res.Err = err.Error()
+		emitReplayResult(res, "")
+		return res
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1000))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, int64(captureMaxBody)))
 
-	// Compare status.
-	statusMatch := resp.StatusCode == ex.Status
+	res.ActualStatus = resp.StatusCode
+	res.StatusMatch = resp.StatusCode == ex.Status
+
+	newBody := strings.TrimSpace(decodeForCompare(resp.Header, respBody))
+	res.BodyMatch = strings.TrimSpace(ex.RespBody) == newBody
+
+	emitReplayResult(res, newBody)
+	return res
+}
+
+// decodeForCompare decompresses a replayed response body so it can be compared
+// against the recording, which stores bodies already decoded. Without this,
+// every compressed endpoint would report a body difference on every replay.
+// Bodies that cannot be decoded are compared as-is.
+func decodeForCompare(h http.Header, body []byte) string {
+	enc := h.Get("Content-Encoding")
+	if len(splitEncodings(enc)) == 0 {
+		return string(body)
+	}
+	res, err := decompressBody(enc, body)
+	if err != nil {
+		return string(body)
+	}
+	return string(res.Data)
+}
+
+// emitReplayResult renders one replay outcome, as coloured text or NDJSON.
+func emitReplayResult(res replayResult, newBody string) {
+	if jsonMode {
+		jsonEncMu.Lock()
+		jsonEnc.Encode(res) //nolint:errcheck
+		jsonEncMu.Unlock()
+		return
+	}
+
+	if res.Err != "" {
+		fmt.Fprintf(os.Stderr, "  \033[31mFAIL\033[0m: %v\n", res.Err)
+		return
+	}
+
 	statusIcon := "\033[32m✓\033[0m"
-	if !statusMatch {
+	if !res.StatusMatch {
 		statusIcon = "\033[31m✗\033[0m"
 	}
-	fmt.Printf("  Status:  %s  recorded=%d  actual=%d  (%v)\n",
-		statusIcon, ex.Status, resp.StatusCode, dur.Round(time.Millisecond))
+	fmt.Printf("  Status:  %s  recorded=%d  actual=%d  (%dms)\n",
+		statusIcon, res.RecordedStatus, res.ActualStatus, res.DurationMs)
 
-	// Print response body diff summary.
-	origBody := strings.TrimSpace(ex.RespBody)
-	newBody := strings.TrimSpace(string(respBody))
-	if origBody == newBody {
+	if res.BodyMatch {
 		fmt.Printf("  Body:    \033[32m✓ unchanged\033[0m\n")
-	} else {
-		fmt.Printf("  Body:    \033[33m≠ changed\033[0m\n")
-		if len(newBody) > 200 {
-			newBody = newBody[:200] + "…"
-		}
-		fmt.Printf("    now: %s\n", newBody)
+		return
 	}
+	fmt.Printf("  Body:    \033[33m≠ changed\033[0m\n")
+	if len(newBody) > 200 {
+		newBody = newBody[:200] + "…"
+	}
+	fmt.Printf("    now: %s\n", newBody)
 }

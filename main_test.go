@@ -5,10 +5,16 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
+	crand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
+
 	"fmt"
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"io"
 	"net"
 	"net/http"
@@ -555,16 +561,16 @@ func TestReplay_StatusAndBodyDiff(t *testing.T) {
 
 	// Write a minimal recording file.
 	ex := recordedExchange{
-		ID:         1,
-		Time:       time.Now().Format(time.RFC3339),
-		Method:     "GET",
-		URL:        target.URL + "/hello",
-		ReqHeaders: map[string]string{"Accept": "*/*"},
-		Status:     200,
-		StatusText: "200 OK",
+		ID:          1,
+		Time:        time.Now().Format(time.RFC3339),
+		Method:      "GET",
+		URL:         target.URL + "/hello",
+		ReqHeaders:  map[string]string{"Accept": "*/*"},
+		Status:      200,
+		StatusText:  "200 OK",
 		RespHeaders: map[string]string{"Content-Type": "application/json"},
-		RespBody:   `{"hello":"world"}`,
-		DurationMs: 10,
+		RespBody:    `{"hello":"world"}`,
+		DurationMs:  10,
 	}
 	f, err := os.CreateTemp("", "httpmon-test-replay-*.ndjson")
 	if err != nil {
@@ -576,7 +582,7 @@ func TestReplay_StatusAndBodyDiff(t *testing.T) {
 	f.Close()
 
 	// Replay with target override.
-	code := replayFile(replayPath, target.URL, 0)
+	code := replayFile(replayPath, target.URL, 0, false)
 	// We don't assert code == 0 because the body diff causes no error exit,
 	// and status matched so code should be 0.
 	if code != 0 {
@@ -585,7 +591,7 @@ func TestReplay_StatusAndBodyDiff(t *testing.T) {
 }
 
 func TestReplay_MissingFile(t *testing.T) {
-	code := replayFile("/nonexistent/path.ndjson", "", 0)
+	code := replayFile("/nonexistent/path.ndjson", "", 0, false)
 	if code == 0 {
 		t.Error("expected non-zero exit for missing file")
 	}
@@ -602,7 +608,7 @@ func TestReplay_MalformedNDJSON(t *testing.T) {
 
 	// Should not panic; malformed lines are skipped with an error count.
 	// Returns 1 because errs > 0.
-	code := replayFile(f.Name(), "", 0)
+	code := replayFile(f.Name(), "", 0, false)
 	if code != 1 {
 		t.Errorf("expected exit code 1 for malformed NDJSON, got %d", code)
 	}
@@ -614,10 +620,10 @@ func TestReplay_MalformedNDJSON(t *testing.T) {
 // Expect: 100-continue does not deadlock the proxy.
 //
 // Without the fix, the sequence is:
-//   1. client sends headers + Expect: 100-continue, withholds body
-//   2. handleConnect calls logRequest → peekBody → io.ReadFull on client conn
-//   3. io.ReadFull blocks: client won't send body until it sees "100 Continue"
-//   4. deadlock — proxy never reaches sessionClient.Do
+//  1. client sends headers + Expect: 100-continue, withholds body
+//  2. handleConnect calls logRequest → peekBody → io.ReadFull on client conn
+//  3. io.ReadFull blocks: client won't send body until it sees "100 Continue"
+//  4. deadlock — proxy never reaches sessionClient.Do
 //
 // With the fix, the proxy immediately writes "HTTP/1.1 100 Continue\r\n\r\n"
 // to the client before reading the body, breaking the deadlock.
@@ -874,8 +880,11 @@ func TestDecompressBody_Gzip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != `{"hello":"world"}` {
-		t.Errorf("got %q", got)
+	if string(got.Data) != `{"hello":"world"}` {
+		t.Errorf("got %q", got.Data)
+	}
+	if got.Truncated {
+		t.Error("did not expect Truncated for a complete stream")
 	}
 }
 
@@ -889,28 +898,165 @@ func TestDecompressBody_Deflate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "deflated text" {
-		t.Errorf("got %q", got)
+	if string(got.Data) != "deflated text" {
+		t.Errorf("got %q", got.Data)
+	}
+}
+
+// Servers commonly send zlib-wrapped data under "deflate" despite the raw
+// deflate wording in older specs; both must decode.
+func TestDecompressBody_DeflateZlibWrapped(t *testing.T) {
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	w.Write([]byte("zlib wrapped")) //nolint:errcheck
+	w.Close()
+
+	got, err := decompressBody("deflate", buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data) != "zlib wrapped" {
+		t.Errorf("got %q", got.Data)
+	}
+}
+
+func TestDecompressBody_Brotli(t *testing.T) {
+	var buf bytes.Buffer
+	w := brotli.NewWriter(&buf)
+	w.Write([]byte(`{"br":true}`)) //nolint:errcheck
+	w.Close()
+
+	got, err := decompressBody("br", buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data) != `{"br":true}` {
+		t.Errorf("got %q", got.Data)
+	}
+}
+
+func TestDecompressBody_Zstd(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write([]byte(`{"zstd":true}`)) //nolint:errcheck
+	w.Close()
+
+	got, err := decompressBody("zstd", buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data) != `{"zstd":true}` {
+		t.Errorf("got %q", got.Data)
+	}
+}
+
+// A Content-Encoding list is applied left to right, so it must be decoded
+// right to left.
+func TestDecompressBody_Chained(t *testing.T) {
+	var inner bytes.Buffer
+	gz := gzip.NewWriter(&inner)
+	gz.Write([]byte("chained payload")) //nolint:errcheck
+	gz.Close()
+
+	var outer bytes.Buffer
+	br := brotli.NewWriter(&outer)
+	br.Write(inner.Bytes()) //nolint:errcheck
+	br.Close()
+
+	got, err := decompressBody("gzip, br", outer.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data) != "chained payload" {
+		t.Errorf("got %q", got.Data)
 	}
 }
 
 func TestDecompressBody_Identity(t *testing.T) {
-	got, err := decompressBody("identity", []byte("plain"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "plain" {
-		t.Errorf("got %q", got)
+	for _, enc := range []string{"", "identity", " identity "} {
+		got, err := decompressBody(enc, []byte("plain"))
+		if err != nil {
+			t.Fatalf("enc=%q: %v", enc, err)
+		}
+		if string(got.Data) != "plain" {
+			t.Errorf("enc=%q: got %q", enc, got.Data)
+		}
 	}
 }
 
-func TestDecompressBody_Unknown(t *testing.T) {
-	got, err := decompressBody("br", []byte("raw"))
-	if err != nil {
+// An encoding httpmon cannot decode must report an error rather than returning
+// the still-compressed bytes, which callers would print as garbage.
+func TestDecompressBody_UnknownReturnsError(t *testing.T) {
+	_, err := decompressBody("snappy", []byte("raw"))
+	if !errors.Is(err, errUnsupportedEncoding) {
+		t.Fatalf("got err=%v, want errUnsupportedEncoding", err)
+	}
+}
+
+// Only a prefix of a large compressed body is captured, so decoding hits an
+// unexpected EOF. The bytes decoded before that point are still useful.
+func TestDecompressBody_TruncatedKeepsPrefix(t *testing.T) {
+	payload := make([]byte, 4<<20)
+	if _, err := crand.Read(payload); err != nil { // incompressible
 		t.Fatal(err)
 	}
-	if string(got) != "raw" {
-		t.Errorf("got %q, want raw (pass-through)", got)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(payload) //nolint:errcheck
+	zw.Close()
+	if buf.Len() <= 1<<20 {
+		t.Fatalf("compressed size %d too small to truncate", buf.Len())
+	}
+
+	got, err := decompressBody("gzip", buf.Bytes()[:1<<20])
+	if err != nil {
+		t.Fatalf("truncated stream should not error: %v", err)
+	}
+	if !got.Truncated {
+		t.Error("expected Truncated=true")
+	}
+	if len(got.Data) == 0 {
+		t.Fatal("expected the successfully decoded prefix to be kept")
+	}
+	if !bytes.Equal(got.Data, payload[:len(got.Data)]) {
+		t.Error("decoded prefix does not match the original payload")
+	}
+}
+
+// Regression: an unsupported encoding once fell through to a nil error with the
+// raw bytes, so brotli responses were printed as binary garbage.
+func TestLogResponse_BrotliNotGarbled(t *testing.T) {
+	var buf bytes.Buffer
+	w := brotli.NewWriter(&buf)
+	w.Write([]byte(`{"login":"octocat"}`)) //nolint:errcheck
+	w.Close()
+
+	h := http.Header{}
+	h.Set("Content-Encoding", "br")
+	h.Set("Content-Type", "application/json")
+	body := io.NopCloser(bytes.NewReader(buf.Bytes()))
+
+	got := renderBody(&body, h)
+	if got != `{"login":"octocat"}` {
+		t.Errorf("got %q, want decoded JSON", got)
+	}
+	if got == buf.String() {
+		t.Error("raw compressed bytes were returned verbatim")
+	}
+}
+
+func TestRenderBody_UnsupportedEncodingPlaceholder(t *testing.T) {
+	h := http.Header{}
+	h.Set("Content-Encoding", "snappy")
+	h.Set("Content-Type", "application/json")
+	body := io.NopCloser(strings.NewReader("\x00\x01binary"))
+
+	got := renderBody(&body, h)
+	if !strings.HasPrefix(got, "[snappy, ") {
+		t.Errorf("got %q, want a [snappy, N+ bytes] placeholder", got)
 	}
 }
 
