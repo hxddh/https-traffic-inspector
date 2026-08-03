@@ -59,8 +59,13 @@ pkg.go.dev 与 `go install` 场景下会显示为 "License: none"，影响可采
 
 `decompress.go:15-29` 只支持 gzip 和 deflate。
 但 Cloudflare、GitHub、绝大多数现代 CDN 默认下发 `content-encoding: br`，
-Chrome/curl 也已普遍协商 `zstd`。当前这些响应会退化成
-`[br, N+ bytes]`（`main.go:444`），也就是最常见的 HTTPS API 反而看不到 body。
+Chrome/curl 也已普遍协商 `zstd`。
+
+实测确认，当前的表现比"显示占位符"更糟：`decompress.go:27` 的 `default`
+分支对未知编码返回 `(data, nil)`，调用方 `main.go:441` 只判断 `err == nil`，
+于是 br/zstd 响应的**原始压缩字节被当作文本直接打印成乱码**。
+细节与另外两个相关缺陷（链式编码、截断流丢弃已解出内容）见
+`docs/PLAN_v1.1.0.md` 的 PR-2。
 
 这是当前版本"body 可读性"最大的实际漏洞，建议列为 v1.1 的头号特性。
 实现上需引入 `github.com/andybalholm/brotli` 和 `github.com/klauspost/compress/zstd`
