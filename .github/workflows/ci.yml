@@ -36,3 +36,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.1.0
+          # `config verify` downloads a JSON schema from golangci-lint.run on
+          # every run, so a slow fetch fails the job for reasons unrelated to
+          # the code. The config is validated by the lint run itself.
+          verify: false
