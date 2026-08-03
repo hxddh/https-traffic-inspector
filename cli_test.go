@@ -196,7 +196,7 @@ func TestTruncateForDisplay_MarksTruncation(t *testing.T) {
 	displayMaxBody = 10
 	defer func() { displayMaxBody = saved }()
 
-	got := truncateForDisplay(strings.Repeat("a", 50))
+	got := truncateForDisplay(bodyView{Text: strings.Repeat("a", 50)})
 	if !strings.HasSuffix(got, truncationMarker) {
 		t.Errorf("got %q, want the truncation marker appended", got)
 	}
@@ -210,7 +210,7 @@ func TestTruncateForDisplay_ShortBodyUnchanged(t *testing.T) {
 	displayMaxBody = 100
 	defer func() { displayMaxBody = saved }()
 
-	if got := truncateForDisplay("short"); got != "short" {
+	if got := truncateForDisplay(bodyView{Text: "short"}); got != "short" {
 		t.Errorf("got %q, want %q", got, "short")
 	}
 }
@@ -223,7 +223,7 @@ func TestTruncateForDisplay_RuneBoundary(t *testing.T) {
 	body := strings.Repeat("日", 40) // 3 bytes each
 	for _, limit := range []int{10, 11, 12, 13} {
 		displayMaxBody = limit
-		got := truncateForDisplay(body)
+		got := truncateForDisplay(bodyView{Text: body})
 		if strings.ToValidUTF8(got, "") != got {
 			t.Errorf("limit %d produced invalid UTF-8: %q", limit, got)
 		}
@@ -243,8 +243,78 @@ func TestRenderBody_RespectsCaptureLimit(t *testing.T) {
 	body := io.NopCloser(strings.NewReader(strings.Repeat("x", 500)))
 
 	got := renderBody(&body, h)
-	if len(got) != 64 {
-		t.Errorf("len = %d, want 64 (captureMaxBody), not the display limit", len(got))
+	if len(got.Text) != 64 {
+		t.Errorf("len = %d, want 64 (captureMaxBody), not the display limit", len(got.Text))
+	}
+	if !got.Truncated {
+		t.Error("Truncated = false, want true for a body cut at the capture limit")
+	}
+}
+
+// Regression: a plain body cut off at exactly the peek limit used to look
+// complete, so truncateForDisplay added no marker and the output was silently
+// short. Reproduces what v1.1.0 shipped.
+func TestRenderBody_UncompressedOverflowIsMarked(t *testing.T) {
+	savedDisplay, savedCapture := displayMaxBody, captureMaxBody
+	savedRecord, savedHAR := recordMode, harMode
+	displayMaxBody, captureMaxBody, recordMode, harMode = 100, 1<<20, false, false
+	defer func() {
+		displayMaxBody, captureMaxBody = savedDisplay, savedCapture
+		recordMode, harMode = savedRecord, savedHAR
+	}()
+
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	body := io.NopCloser(strings.NewReader(strings.Repeat("x", 5000)))
+
+	v := renderBody(&body, h)
+	if !v.Truncated {
+		t.Fatal("Truncated = false for a 5000-byte body peeked at 100")
+	}
+	shown := truncateForDisplay(v)
+	if !strings.HasSuffix(shown, truncationMarker) {
+		t.Errorf("displayed body %q lacks the truncation marker", shown[max(0, len(shown)-40):])
+	}
+}
+
+// A body that exactly fills the limit is complete, not truncated.
+func TestRenderBody_ExactFitNotMarked(t *testing.T) {
+	savedDisplay, savedRecord, savedHAR := displayMaxBody, recordMode, harMode
+	displayMaxBody, recordMode, harMode = 100, false, false
+	defer func() { displayMaxBody, recordMode, harMode = savedDisplay, savedRecord, savedHAR }()
+
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	body := io.NopCloser(strings.NewReader(strings.Repeat("x", 100)))
+
+	v := renderBody(&body, h)
+	if v.Truncated {
+		t.Error("Truncated = true for a body that exactly fills the limit")
+	}
+	if got := truncateForDisplay(v); strings.Contains(got, "truncated") {
+		t.Errorf("got %q, want no truncation marker", got)
+	}
+}
+
+// The verbatim capture must stay marker-free so recordings and HAR entries are
+// not polluted, and replay comparison is not thrown off.
+func TestRenderBody_CaptureTextHasNoMarker(t *testing.T) {
+	savedDisplay, savedCapture, savedRecord := displayMaxBody, captureMaxBody, recordMode
+	displayMaxBody, captureMaxBody, recordMode = 10, 50, true
+	defer func() {
+		displayMaxBody, captureMaxBody, recordMode = savedDisplay, savedCapture, savedRecord
+	}()
+
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	body := io.NopCloser(strings.NewReader(strings.Repeat("y", 500)))
+
+	v := renderBody(&body, h)
+	if strings.Contains(v.Text, "truncated") {
+		t.Errorf("captured text contains a display marker: %q", v.Text)
+	}
+	if len(v.Text) != 50 {
+		t.Errorf("len = %d, want 50", len(v.Text))
 	}
 }
 

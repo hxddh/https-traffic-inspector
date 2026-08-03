@@ -370,16 +370,17 @@ func logRequest(req *http.Request) int {
 	reqStartTimes[reqID] = startTime
 	reqStartMu.Unlock()
 
-	bodyStr := renderBody(&req.Body, req.Header)
+	bodyView := renderBody(&req.Body, req.Header)
 
+	// Recordings and HAR keep the verbatim capture, without a display marker.
 	if recordMode {
-		recordRequest(reqID, req, bodyStr) // bodyStr may be up to captureMaxBody
+		recordRequest(reqID, req, bodyView.Text)
 	}
 	if harMode {
-		addHARRequest(reqID, req, bodyStr, startTime)
+		addHARRequest(reqID, req, bodyView.Text, startTime)
 	}
 
-	bodyStr = truncateForDisplay(bodyStr)
+	bodyStr := truncateForDisplay(bodyView)
 
 	if tuiMode {
 		entry := &tuiEntry{
@@ -475,16 +476,16 @@ func logResponse(resp *http.Response, reqID int) {
 		dur = time.Since(start)
 	}
 
-	bodyStr := renderBody(&resp.Body, resp.Header)
+	bodyView := renderBody(&resp.Body, resp.Header)
 
 	if recordMode {
-		recordResponse(reqID, resp, bodyStr, dur)
+		recordResponse(reqID, resp, bodyView.Text, dur)
 	}
 	if harMode {
-		addHARResponse(reqID, resp, bodyStr, dur)
+		addHARResponse(reqID, resp, bodyView.Text, dur)
 	}
 
-	bodyStr = truncateForDisplay(bodyStr)
+	bodyStr := truncateForDisplay(bodyView)
 
 	if tuiMode {
 		select {
@@ -532,12 +533,20 @@ func logResponse(resp *http.Response, reqID int) {
 // cut-off body is never mistaken for the whole thing.
 const truncationMarker = "\n… [truncated]"
 
+// bodyView is a captured body together with whether more data existed past the
+// capture limit. Text carries no truncation marker so that recordings and HAR
+// entries stay verbatim; the marker is added only when rendering for display.
+type bodyView struct {
+	Text      string
+	Truncated bool
+}
+
 // renderBody peeks at *bodyp and returns a printable representation, decoding
 // Content-Encoding when possible. The result may be up to captureMaxBody long;
 // callers apply truncateForDisplay before showing it.
-func renderBody(bodyp *io.ReadCloser, h http.Header) string {
+func renderBody(bodyp *io.ReadCloser, h http.Header) bodyView {
 	if bodyp == nil || *bodyp == nil {
-		return ""
+		return bodyView{}
 	}
 
 	enc := h.Get("Content-Encoding")
@@ -548,38 +557,47 @@ func renderBody(bodyp *io.ReadCloser, h http.Header) string {
 		peekN = captureMaxBody
 	}
 
-	body := peekBody(bodyp, peekN)
+	// Peek one byte past the limit so a body that exactly fills it can be told
+	// apart from one that overflows it. Without this, a body cut off at exactly
+	// peekN looks complete and is shown unmarked.
+	body := peekBody(bodyp, peekN+1)
+	overflow := len(body) > peekN
+	if overflow {
+		body = body[:peekN]
+	}
 	if len(body) == 0 {
-		return ""
+		return bodyView{}
 	}
 
 	if isPrintable(h) {
-		return string(body)
+		return bodyView{Text: string(body), Truncated: overflow}
 	}
 	if compressed {
 		res, err := decompressBody(enc, body)
 		if err == nil && isPrintableContentType(h.Get("Content-Type")) {
-			if res.Truncated {
-				return string(res.Data) + truncationMarker
-			}
-			return string(res.Data)
+			return bodyView{Text: string(res.Data), Truncated: res.Truncated || overflow}
 		}
-		return fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))
+		return bodyView{Text: fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))}
 	}
-	return fmt.Sprintf("[binary data, %d+ bytes]", len(body))
+	return bodyView{Text: fmt.Sprintf("[binary data, %d+ bytes]", len(body))}
 }
 
-// truncateForDisplay caps s at displayMaxBody bytes, backing off to a rune
-// boundary so multi-byte characters are never split.
-func truncateForDisplay(s string) string {
-	if len(s) <= displayMaxBody {
-		return s
+// truncateForDisplay caps v at displayMaxBody bytes, backing off to a rune
+// boundary so multi-byte characters are never split. Content cut here, or
+// already cut at capture time, is marked so it is never read as complete.
+func truncateForDisplay(v bodyView) string {
+	s := v.Text
+	if len(s) > displayMaxBody {
+		cut := displayMaxBody
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		return s[:cut] + truncationMarker
 	}
-	cut := displayMaxBody
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
+	if v.Truncated {
+		return s + truncationMarker
 	}
-	return s[:cut] + truncationMarker
+	return s
 }
 
 // peekBody reads up to n bytes from *body for logging, then reconstructs *body

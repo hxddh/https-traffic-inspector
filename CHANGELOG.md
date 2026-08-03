@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-08-03
+
+### Fixed
+
+- An **uncompressed** response body larger than `--max-body` was still cut
+  without a `… [truncated]` marker, so a shortened body looked complete — the
+  silent truncation 1.1.0 claimed to have fixed. The body was peeked at exactly
+  the limit, so the display step saw a string of exactly the maximum length and
+  judged it whole. httpmon now peeks one byte past the limit to tell a body that
+  fills it from one that overflows it. Compressed bodies were already marked
+  correctly.
+- The truncation marker is no longer written into `--record` and `--har`
+  captures. It is a display affordance; storing it corrupted the recorded body
+  and could skew `--replay` comparisons.
+
 ## [1.1.0] - 2026-08-03
 
 ### ⚠ Breaking

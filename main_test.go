@@ -1040,10 +1040,10 @@ func TestLogResponse_BrotliNotGarbled(t *testing.T) {
 	body := io.NopCloser(bytes.NewReader(buf.Bytes()))
 
 	got := renderBody(&body, h)
-	if got != `{"login":"octocat"}` {
-		t.Errorf("got %q, want decoded JSON", got)
+	if got.Text != `{"login":"octocat"}` {
+		t.Errorf("got %q, want decoded JSON", got.Text)
 	}
-	if got == buf.String() {
+	if got.Text == buf.String() {
 		t.Error("raw compressed bytes were returned verbatim")
 	}
 }
@@ -1055,8 +1055,8 @@ func TestRenderBody_UnsupportedEncodingPlaceholder(t *testing.T) {
 	body := io.NopCloser(strings.NewReader("\x00\x01binary"))
 
 	got := renderBody(&body, h)
-	if !strings.HasPrefix(got, "[snappy, ") {
-		t.Errorf("got %q, want a [snappy, N+ bytes] placeholder", got)
+	if !strings.HasPrefix(got.Text, "[snappy, ") {
+		t.Errorf("got %q, want a [snappy, N+ bytes] placeholder", got.Text)
 	}
 }
 
