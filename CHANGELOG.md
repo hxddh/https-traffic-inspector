@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-08-04
+
+### Fixed
+
+- **HTTPS requests could hang the wrapped command until its own timeout.** Two
+  independent faults in the `CONNECT` path, both found by running httpmon
+  against a real host rather than a local test server:
+  - The tunnel response was written through `http.ResponseWriter`, so net/http
+    appended `Date` and `Transfer-Encoding: chunked`. RFC 9110 §9.3.6 forbids
+    body framing on a 2xx `CONNECT` response. httpmon now writes
+    `HTTP/1.1 200 Connection Established` directly to the hijacked connection.
+  - When the upstream transport transparently gunzipped a response it dropped
+    `Content-Length`, leaving the length unknown. `Response.Write` then
+    delimited the body by closing the connection — but the tunnel loop keeps it
+    open for the next request, so the client blocked waiting for an EOF that
+    never came. Such responses are now framed as `chunked`, which delimits the
+    body without giving up keep-alive. This affected any gzipped HTTPS
+    response, which is most of them.
+
 ## [1.1.1] - 2026-08-03
 
 ### Fixed

@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andybalholm/brotli"
 )
@@ -500,5 +505,145 @@ func TestVersion_DefaultAndHARCreator(t *testing.T) {
 	}
 	if hf.Log.Creator.Name != "httpmon" {
 		t.Errorf("creator.name = %q, want httpmon", hf.Log.Creator.Name)
+	}
+}
+
+// ---- CONNECT tunnel framing ----
+
+// startTestProxy runs the real proxy handler on a loopback listener.
+func startTestProxy(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				handleConnect(w, r)
+			} else {
+				handleHTTP(w, r)
+			}
+		}),
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+	go srv.Serve(ln)                  //nolint:errcheck
+	t.Cleanup(func() { srv.Close() }) //nolint:errcheck
+	return ln.Addr().String()
+}
+
+// Regression: the tunnel response was written through ResponseWriter, so
+// net/http appended Date and Transfer-Encoding: chunked. RFC 9110 §9.3.6
+// forbids body framing on a 2xx CONNECT response, and clients that honour it
+// wait for a terminating chunk that never arrives.
+func TestHandleConnect_TunnelResponseHasNoFraming(t *testing.T) {
+	proxyAddr := startTestProxy(t)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+
+	fmt.Fprintf(conn, "CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+
+	br := bufio.NewReader(conn)
+	var headers []string
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading tunnel response: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		headers = append(headers, line)
+	}
+
+	if len(headers) == 0 || !strings.Contains(headers[0], "200") {
+		t.Fatalf("status line = %q, want a 2xx", headers)
+	}
+	for _, h := range headers[1:] {
+		name := strings.ToLower(strings.SplitN(h, ":", 2)[0])
+		if name == "transfer-encoding" || name == "content-length" {
+			t.Errorf("tunnel response carries framing header %q", h)
+		}
+	}
+}
+
+// Regression: when the transport transparently gunzipped a response it dropped
+// Content-Length, so Response.Write delimited the body by closing the
+// connection -- but the CONNECT loop keeps the tunnel open, leaving the client
+// blocked until its own timeout. Reproduces the hang seen against a real host.
+func TestHandleConnect_UnknownLengthResponseIsFramed(t *testing.T) {
+	const payload = `{"framing":"gzip"}`
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b bytes.Buffer
+		zw := gzip.NewWriter(&b)
+		zw.Write([]byte(payload)) //nolint:errcheck
+		zw.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", fmt.Sprint(b.Len()))
+		w.Write(b.Bytes()) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	savedClient := upstreamClient
+	upstreamClient = newUpstreamClient(true) // upstream is self-signed
+	defer func() { upstreamClient = savedClient }()
+
+	proxyAddr := startTestProxy(t)
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+			// Send no Accept-Encoding, so httpmon's own transport requests gzip
+			// and transparently decodes it -- the case that loses Content-Length.
+			DisableCompression: true,
+		},
+	}
+
+	resp, err := client.Get(upstream.URL + "/data")
+	if err != nil {
+		t.Fatalf("request through the tunnel failed (a timeout here is the hang): %v", err)
+	}
+	defer resp.Body.Close()
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	if string(got) != payload {
+		t.Errorf("body = %q, want %q", got, payload)
+	}
+	if resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 {
+		t.Error("response reached the client with no length and no chunked framing")
+	}
+}
+
+func TestBodyAllowedForStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   bool
+	}{
+		{100, false}, {101, false}, {199, false},
+		{200, true}, {201, true}, {404, true}, {500, true},
+		{204, false}, {304, false},
+	} {
+		if got := bodyAllowedForStatus(tc.status); got != tc.want {
+			t.Errorf("bodyAllowedForStatus(%d) = %v, want %v", tc.status, got, tc.want)
+		}
 	}
 }

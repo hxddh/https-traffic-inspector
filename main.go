@@ -340,6 +340,19 @@ func flattenHeaders(h http.Header) map[string]string {
 	return m
 }
 
+// bodyAllowedForStatus mirrors net/http's unexported helper of the same name:
+// 1xx, 204 and 304 responses carry no body, so they must not be given body
+// framing headers.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent, status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
+
 // hopByHopHeaders lists the standard hop-by-hop headers defined in RFC 7230 §6.1.
 var hopByHopHeaders = []string{
 	"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
@@ -787,14 +800,20 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hijack error for %s: %v\n", host, err)
 		return
 	}
 	defer clientConn.Close()
+
+	// Write the tunnel response directly rather than through ResponseWriter.
+	// net/http would add Date and Transfer-Encoding: chunked, which RFC 9110
+	// §9.3.6 forbids on a 2xx CONNECT response: the client then waits for a
+	// terminating chunk that never arrives and the command hangs.
+	if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		return
+	}
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
@@ -895,6 +914,17 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			strings.EqualFold(resp.Header.Get("Connection"), "close")
 
 		removeHopByHopHeaders(resp.Header) // strip before forwarding downstream
+
+		// The transport hands back a response with no known length whenever it
+		// transparently decoded the body -- gunzipping drops Content-Length.
+		// Response.Write would then delimit the body by closing the connection,
+		// but this loop keeps the tunnel open for the next request, so the
+		// client blocks waiting for an EOF that never arrives. Framing it as
+		// chunked delimits the body without giving up keep-alive.
+		if resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 &&
+			req.Method != http.MethodHead && bodyAllowedForStatus(resp.StatusCode) {
+			resp.TransferEncoding = []string{"chunked"}
+		}
 
 		if err := resp.Write(bw); err != nil {
 			resp.Body.Close()
