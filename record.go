@@ -53,14 +53,14 @@ func openRecordFile(path string) error {
 	return nil
 }
 
-// recordRequest stores request data in the pending map.
-func recordRequest(reqID int, req *http.Request, body string) {
+// recordRequestBody stores request data once its body has finished streaming.
+func recordRequestBody(reqID int, f requestFacts, body string) {
 	e := &recordedExchange{
 		ID:         reqID,
-		Time:       time.Now().Format(time.RFC3339),
-		Method:     req.Method,
-		URL:        req.URL.String(),
-		ReqHeaders: flattenHeaders(req.Header),
+		Time:       f.startTime.Format(time.RFC3339),
+		Method:     f.method,
+		URL:        f.rawURL,
+		ReqHeaders: flattenHeaders(f.headers),
 		ReqBody:    body,
 	}
 	pendingRecordsMu.Lock()
@@ -68,8 +68,10 @@ func recordRequest(reqID int, req *http.Request, body string) {
 	pendingRecordsMu.Unlock()
 }
 
-// recordResponse completes the pending entry and writes it to disk.
-func recordResponse(reqID int, resp *http.Response, body string, dur time.Duration) {
+// recordResponseBody completes the pending entry and writes it to disk. It runs
+// after the response body has finished streaming, so the record is only written
+// once the whole exchange is known.
+func recordResponseBody(reqID int, f responseFacts, body string) {
 	pendingRecordsMu.Lock()
 	e, ok := pendingRecords[reqID]
 	if ok {
@@ -80,11 +82,11 @@ func recordResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		return
 	}
 
-	e.Status = resp.StatusCode
-	e.StatusText = resp.Status
-	e.RespHeaders = flattenHeaders(resp.Header)
+	e.Status = f.status
+	e.StatusText = f.statusText
+	e.RespHeaders = flattenHeaders(f.headers)
 	e.RespBody = body
-	e.DurationMs = dur.Milliseconds()
+	e.DurationMs = f.duration.Milliseconds()
 
 	if recordEncoder != nil {
 		recordEncoder.Encode(e) //nolint:errcheck

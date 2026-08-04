@@ -247,7 +247,7 @@ func TestRenderBody_RespectsCaptureLimit(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	body := io.NopCloser(strings.NewReader(strings.Repeat("x", 500)))
 
-	got := renderBody(&body, h)
+	got := collectBody(&body, h)
 	if len(got.Text) != 64 {
 		t.Errorf("len = %d, want 64 (captureMaxBody), not the display limit", len(got.Text))
 	}
@@ -272,7 +272,7 @@ func TestRenderBody_UncompressedOverflowIsMarked(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	body := io.NopCloser(strings.NewReader(strings.Repeat("x", 5000)))
 
-	v := renderBody(&body, h)
+	v := collectBody(&body, h)
 	if !v.Truncated {
 		t.Fatal("Truncated = false for a 5000-byte body peeked at 100")
 	}
@@ -292,7 +292,7 @@ func TestRenderBody_ExactFitNotMarked(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	body := io.NopCloser(strings.NewReader(strings.Repeat("x", 100)))
 
-	v := renderBody(&body, h)
+	v := collectBody(&body, h)
 	if v.Truncated {
 		t.Error("Truncated = true for a body that exactly fills the limit")
 	}
@@ -314,7 +314,7 @@ func TestRenderBody_CaptureTextHasNoMarker(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	body := io.NopCloser(strings.NewReader(strings.Repeat("y", 500)))
 
-	v := renderBody(&body, h)
+	v := collectBody(&body, h)
 	if strings.Contains(v.Text, "truncated") {
 		t.Errorf("captured text contains a display marker: %q", v.Text)
 	}
@@ -675,5 +675,80 @@ func TestReplay_HonoursInsecureUpstream(t *testing.T) {
 	insecureUpstream = true
 	if code := replayFile(path, "", 0, true); code != 0 {
 		t.Errorf("code = %d, want 0 with --insecure-upstream", code)
+	}
+}
+
+// collectBody drains a body through the sampler and returns the resulting view,
+// mirroring what the proxy does while forwarding.
+func collectBody(bodyp *io.ReadCloser, h http.Header) bodyView {
+	var got bodyView
+	sampleBody(bodyp, h, func(v bodyView) { got = v })
+	if *bodyp != nil {
+		io.Copy(io.Discard, *bodyp) //nolint:errcheck
+		(*bodyp).Close()            //nolint:errcheck
+	}
+	return got
+}
+
+// ---- upstream proxy ----
+
+// httpmon's own upstream transport had no Proxy set, so HTTP(S)_PROXY was
+// ignored and it could not run behind an egress proxy -- exactly the
+// environment where traffic inspection is most needed.
+func TestNewUpstreamClient_UsesEnvironmentProxy(t *testing.T) {
+	saved := upstreamProxy
+	upstreamProxy = nil
+	defer func() { upstreamProxy = saved }()
+
+	tr, ok := newUpstreamClient(false).Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("transport is not *http.Transport")
+	}
+	if tr.Proxy == nil {
+		t.Fatal("Proxy is nil: HTTP(S)_PROXY would be ignored")
+	}
+
+	// http.ProxyFromEnvironment caches the environment in a sync.Once, so the
+	// assertion is that the transport defers to it rather than what it returns.
+	req, _ := http.NewRequest("GET", "https://example.com/", nil)
+	got, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := http.ProxyFromEnvironment(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch {
+	case got == nil && want == nil:
+	case got == nil || want == nil:
+		t.Errorf("proxy = %v, want %v", got, want)
+	case got.String() != want.String():
+		t.Errorf("proxy = %v, want %v", got, want)
+	}
+}
+
+func TestNewUpstreamClient_ExplicitProxyOverridesEnvironment(t *testing.T) {
+	saved := upstreamProxy
+	defer func() { upstreamProxy = saved }()
+
+	explicit, err := url.Parse("http://explicit.test.local:8888")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamProxy = explicit
+
+	tr, ok := newUpstreamClient(false).Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("transport is not *http.Transport")
+	}
+	t.Setenv("HTTPS_PROXY", "http://env.test.local:3128")
+	req, _ := http.NewRequest("GET", "https://example.com/", nil)
+	u, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u == nil || u.Host != "explicit.test.local:8888" {
+		t.Errorf("proxy = %v, want the explicit --upstream-proxy value", u)
 	}
 }

@@ -104,6 +104,7 @@ httpmon --replay <file> [--replay-target <url>]
 | `--replay-delay` | `0` | Pause between replayed requests. |
 | `--replay-fail-on-diff` | `false` | Exit with code `2` if any replayed response differs from the recording. |
 | `--insecure-upstream` | `false` | Skip TLS certificate verification for upstream servers. |
+| `--upstream-proxy` | _(env)_ | Proxy for httpmon's own upstream requests. Defaults to `HTTP_PROXY`/`HTTPS_PROXY` from the environment. |
 | `--max-body` | `1000` | Max bytes of each body shown in output. |
 | `--max-capture` | `1048576` | Max bytes of each body kept for `--record` / `--har` and decompression. |
 | `--version` | | Print version and exit. |
@@ -232,6 +233,22 @@ Body:
 The full compressed stream is still forwarded to the subprocess unmodified.
 
 When only part of a large body was captured, the decoded prefix is shown followed by a `… [truncated]` marker, so a cut-off body is never mistaken for a complete one. Raise `--max-capture` to decode more.
+
+---
+
+### Streaming
+
+Streaming responses and uploads are forwarded as they arrive rather than being
+buffered. Server-Sent Events, chunked uploads, long-polling and slow downloads
+all pass through with no added latency — the body is sampled for logging
+alongside delivery, not ahead of it.
+
+```bash
+httpmon curl -N https://api.example.com/events    # SSE arrives event by event
+```
+
+The body of a stream is logged once the stream ends; its headers appear
+immediately.
 
 ---
 
@@ -373,6 +390,7 @@ httpmon --port 0 curl https://api.example.com
 - **HTTP/1.1 only.** Traffic is not negotiated over HTTP/2: the MITM listener does not advertise `h2` via ALPN, and the upstream transport does not enable HTTP/2. Clients that would otherwise use HTTP/2 are silently downgraded, and **gRPC does not work through httpmon**.
 - **Plaintext `ws://` is not supported.** Only `wss://` (established through a `CONNECT` tunnel) is proxied. A cleartext WebSocket upgrade is routed through the ordinary HTTP path, which cannot complete the `101` handshake.
 - **`--har` does not apply to `--replay`.** Replay mode neither starts the proxy nor captures entries.
+- **Bodies are logged when they finish, not when their headers arrive.** Request and response headers print as soon as they are seen, so a long-lived stream is visible while it runs, but its body is only shown once the stream ends. `--format json` and `--record` emit one complete record per exchange, so for a stream that record appears at the end.
 - **Bodies are capped.** Output shows `--max-body` bytes; `--record` / `--har` / decompression keep `--max-capture` bytes. Raising `--max-capture` increases per-request memory use, since each captured body is buffered in full.
 - **The HAR `bodySize` field** reports the transferred size only when the upstream sent a `Content-Length`, and `-1` otherwise. `timings.send` and `timings.receive` are always `-1`: httpmon measures the round trip as a whole.
 

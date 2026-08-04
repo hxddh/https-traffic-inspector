@@ -58,6 +58,7 @@ var (
 	harMode          bool
 	harPath          string
 	insecureUpstream bool
+	upstreamProxy    *url.URL  // --upstream-proxy; nil means use the environment
 	displayMaxBody   = 1000    // --max-body: bytes of body shown in text/JSON/TUI output
 	captureMaxBody   = 1 << 20 // --max-capture: bytes of body kept for --record/--har/decompression
 
@@ -83,9 +84,19 @@ func init() {
 
 // newUpstreamClient builds the shared client used for all upstream requests.
 // When insecure is true, upstream certificates are not verified.
+//
+// Requests go through upstreamProxy, falling back to the environment's proxy
+// settings. httpmon only injects its own address into the *subprocess*
+// environment, so reading the environment here picks up the outer proxy rather
+// than looping back into httpmon.
 func newUpstreamClient(insecure bool) *http.Client {
+	proxy := http.ProxyFromEnvironment
+	if upstreamProxy != nil {
+		proxy = http.ProxyURL(upstreamProxy)
+	}
 	return &http.Client{
 		Transport: &http.Transport{
+			Proxy:               proxy,
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec // opt-in via --insecure-upstream
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
@@ -383,17 +394,18 @@ func logRequest(req *http.Request) int {
 	reqStartTimes[reqID] = startTime
 	reqStartMu.Unlock()
 
-	bodyView := renderBody(&req.Body, req.Header)
+	// Capture what the body sample will need later; req is reused downstream.
+	hdr := req.Header.Clone()
+	method, rawURL, proto, host := req.Method, req.URL.String(), req.Proto, req.Host
 
-	// Recordings and HAR keep the verbatim capture, without a display marker.
-	if recordMode {
-		recordRequest(reqID, req, bodyView.Text)
-	}
-	if harMode {
-		addHARRequest(reqID, req, bodyView.Text, startTime)
-	}
-
-	bodyStr := truncateForDisplay(bodyView)
+	// Sample the body alongside delivery instead of reading a prefix up front.
+	// Reading first would hold a chunked upload until the client finished it.
+	sampleBody(&req.Body, hdr, func(v bodyView) {
+		onRequestBody(reqID, requestFacts{
+			method: method, rawURL: rawURL, proto: proto, host: host,
+			headers: hdr, startTime: startTime,
+		}, v)
+	})
 
 	if tuiMode {
 		entry := &tuiEntry{
@@ -402,9 +414,8 @@ func logRequest(req *http.Request) int {
 			method:     req.Method,
 			host:       req.Host,
 			path:       req.URL.Path,
-			rawURL:     req.URL.String(),
-			reqHeaders: flattenHeaders(req.Header),
-			reqBody:    bodyStr,
+			rawURL:     rawURL,
+			reqHeaders: flattenHeaders(hdr),
 			pending:    true,
 		}
 		select {
@@ -414,28 +425,17 @@ func logRequest(req *http.Request) int {
 		return reqID
 	}
 
+	// JSON emits one object per request, so it waits for the body sample.
 	if jsonMode {
-		jsonEncMu.Lock()
-		jsonEnc.Encode(jsonRequest{ //nolint:errcheck
-			ID:      reqID,
-			Time:    time.Now().Format(time.RFC3339),
-			Method:  req.Method,
-			URL:     req.URL.String(),
-			Proto:   req.Proto,
-			Host:    req.Host,
-			Headers: flattenHeaders(req.Header),
-			Body:    bodyStr,
-		})
-		jsonEncMu.Unlock()
 		return reqID
 	}
 
 	fmt.Printf("\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
-	fmt.Printf("Time: %s\n", time.Now().Format("15:04:05"))
-	fmt.Printf("%s %s %s\n", req.Method, req.URL.String(), req.Proto)
-	fmt.Printf("Host: %s\n", req.Host)
+	fmt.Printf("Time: %s\n", startTime.Format("15:04:05"))
+	fmt.Printf("%s %s %s\n", method, rawURL, proto)
+	fmt.Printf("Host: %s\n", host)
 
-	if strings.Contains(req.Host, ".amazonaws.com") {
+	if strings.Contains(host, ".amazonaws.com") {
 		logS3Info(req)
 	}
 
@@ -448,15 +448,64 @@ func logRequest(req *http.Request) int {
 	}
 
 	fmt.Println("\nHeaders:")
-	for k, v := range req.Header {
+	for k, v := range hdr {
 		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
-	}
-
-	if bodyStr != "" {
-		fmt.Printf("\nBody:\n%s\n", bodyStr)
 	}
 	fmt.Println()
 	return reqID
+}
+
+// requestFacts carries the request details needed once its body has been
+// sampled, since the request itself is forwarded in the meantime.
+type requestFacts struct {
+	method    string
+	rawURL    string
+	proto     string
+	host      string
+	headers   http.Header
+	startTime time.Time
+}
+
+// onRequestBody runs when a request body finishes streaming.
+func onRequestBody(reqID int, f requestFacts, v bodyView) {
+	if recordMode {
+		recordRequestBody(reqID, f, v.Text)
+	}
+	if harMode {
+		addHARRequest(reqID, f, v.Text, f.startTime)
+	}
+
+	bodyStr := truncateForDisplay(v)
+
+	if tuiMode {
+		if bodyStr != "" {
+			select {
+			case tuiCh <- tuiReqBodyMsg{reqID: reqID, body: bodyStr}:
+			default:
+			}
+		}
+		return
+	}
+
+	if jsonMode {
+		jsonEncMu.Lock()
+		jsonEnc.Encode(jsonRequest{ //nolint:errcheck
+			ID:      reqID,
+			Time:    f.startTime.Format(time.RFC3339),
+			Method:  f.method,
+			URL:     f.rawURL,
+			Proto:   f.proto,
+			Host:    f.host,
+			Headers: flattenHeaders(f.headers),
+			Body:    bodyStr,
+		})
+		jsonEncMu.Unlock()
+		return
+	}
+
+	if bodyStr != "" {
+		fmt.Printf("\n\033[36m--- REQUEST #%d body ---\033[0m\n%s\n\n", reqID, bodyStr)
+	}
 }
 
 func logS3Info(req *http.Request) {
@@ -489,27 +538,72 @@ func logResponse(resp *http.Response, reqID int) {
 		dur = time.Since(start)
 	}
 
-	bodyView := renderBody(&resp.Body, resp.Header)
+	hdr := resp.Header.Clone()
+	status, statusText, proto := resp.StatusCode, resp.Status, resp.Proto
+	contentLength := resp.ContentLength
 
-	if recordMode {
-		recordResponse(reqID, resp, bodyView.Text, dur)
-	}
-	if harMode {
-		addHARResponse(reqID, resp, bodyView.Text, dur)
-	}
-
-	bodyStr := truncateForDisplay(bodyView)
+	// Sample alongside delivery. Reading a prefix first would withhold an SSE
+	// feed or any slow response until the upstream closed the stream.
+	sampleBody(&resp.Body, hdr, func(v bodyView) {
+		onResponseBody(reqID, responseFacts{
+			status: status, statusText: statusText, proto: proto,
+			headers: hdr, contentLength: contentLength, duration: dur,
+		}, v)
+	})
 
 	if tuiMode {
 		select {
 		case tuiCh <- tuiRespMsg{
 			reqID:      reqID,
-			status:     resp.StatusCode,
-			statusText: resp.Status,
-			headers:    flattenHeaders(resp.Header),
-			body:       bodyStr,
+			status:     status,
+			statusText: statusText,
+			headers:    flattenHeaders(hdr),
 			duration:   dur,
 		}:
+		default:
+		}
+		return
+	}
+
+	// JSON emits one object per response, so it waits for the body sample.
+	if jsonMode {
+		return
+	}
+
+	fmt.Printf("\n\033[32m=== RESPONSE ===\033[0m\n")
+	fmt.Printf("%s %s\n", proto, statusText)
+
+	fmt.Println("\nHeaders:")
+	for k, v := range hdr {
+		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
+	}
+}
+
+// responseFacts carries the response details needed once its body has been
+// sampled, since the response is forwarded in the meantime.
+type responseFacts struct {
+	status        int
+	statusText    string
+	proto         string
+	headers       http.Header
+	contentLength int64
+	duration      time.Duration
+}
+
+// onResponseBody runs when a response body finishes streaming.
+func onResponseBody(reqID int, f responseFacts, v bodyView) {
+	if recordMode {
+		recordResponseBody(reqID, f, v.Text)
+	}
+	if harMode {
+		addHARResponse(reqID, f, v.Text)
+	}
+
+	bodyStr := truncateForDisplay(v)
+
+	if tuiMode {
+		select {
+		case tuiCh <- tuiRespBodyMsg{reqID: reqID, body: bodyStr}:
 		default:
 		}
 		return
@@ -519,21 +613,13 @@ func logResponse(resp *http.Response, reqID int) {
 		jsonEncMu.Lock()
 		jsonEnc.Encode(jsonResponse{ //nolint:errcheck
 			ReqID:   reqID,
-			Status:  resp.StatusCode,
-			Proto:   resp.Proto,
-			Headers: flattenHeaders(resp.Header),
+			Status:  f.status,
+			Proto:   f.proto,
+			Headers: flattenHeaders(f.headers),
 			Body:    bodyStr,
 		})
 		jsonEncMu.Unlock()
 		return
-	}
-
-	fmt.Printf("\n\033[32m=== RESPONSE ===\033[0m\n")
-	fmt.Printf("%s %s\n", resp.Proto, resp.Status)
-
-	fmt.Println("\nHeaders:")
-	for k, v := range resp.Header {
-		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
 	}
 
 	if bodyStr != "" {
@@ -554,47 +640,6 @@ type bodyView struct {
 	Truncated bool
 }
 
-// renderBody peeks at *bodyp and returns a printable representation, decoding
-// Content-Encoding when possible. The result may be up to captureMaxBody long;
-// callers apply truncateForDisplay before showing it.
-func renderBody(bodyp *io.ReadCloser, h http.Header) bodyView {
-	if bodyp == nil || *bodyp == nil {
-		return bodyView{}
-	}
-
-	enc := h.Get("Content-Encoding")
-	compressed := len(splitEncodings(enc)) > 0
-
-	peekN := displayMaxBody
-	if recordMode || harMode || compressed {
-		peekN = captureMaxBody
-	}
-
-	// Peek one byte past the limit so a body that exactly fills it can be told
-	// apart from one that overflows it. Without this, a body cut off at exactly
-	// peekN looks complete and is shown unmarked.
-	body := peekBody(bodyp, peekN+1)
-	overflow := len(body) > peekN
-	if overflow {
-		body = body[:peekN]
-	}
-	if len(body) == 0 {
-		return bodyView{}
-	}
-
-	if isPrintable(h) {
-		return bodyView{Text: string(body), Truncated: overflow}
-	}
-	if compressed {
-		res, err := decompressBody(enc, body)
-		if err == nil && isPrintableContentType(h.Get("Content-Type")) {
-			return bodyView{Text: string(res.Data), Truncated: res.Truncated || overflow}
-		}
-		return bodyView{Text: fmt.Sprintf("[%s, %d+ bytes]", enc, len(body))}
-	}
-	return bodyView{Text: fmt.Sprintf("[binary data, %d+ bytes]", len(body))}
-}
-
 // truncateForDisplay caps v at displayMaxBody bytes, backing off to a rune
 // boundary so multi-byte characters are never split. Content cut here, or
 // already cut at capture time, is marked so it is never read as complete.
@@ -611,16 +656,6 @@ func truncateForDisplay(v bodyView) string {
 		return s + truncationMarker
 	}
 	return s
-}
-
-// peekBody reads up to n bytes from *body for logging, then reconstructs *body
-// with a MultiReader so the full stream (including peeked bytes) can still be forwarded.
-func peekBody(body *io.ReadCloser, n int) []byte {
-	buf := make([]byte, n)
-	nr, _ := io.ReadFull(*body, buf)
-	buf = buf[:nr]
-	*body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), *body))
-	return buf
 }
 
 // isPrintableContentType returns true when the MIME type suggests human-readable text.
@@ -774,7 +809,8 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	removeHopByHopHeaders(w.Header())
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body) //nolint:errcheck
+	fl, _ := w.(http.Flusher)
+	copyFlushing(w, resp.Body, fl) //nolint:errcheck
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -926,7 +962,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			resp.TransferEncoding = []string{"chunked"}
 		}
 
-		if err := resp.Write(bw); err != nil {
+		// Flush as the body is written: buffering here would hold a streaming
+		// response until the stream ended.
+		if err := resp.Write(flushWriter{w: bw, flush: bw.Flush}); err != nil {
 			resp.Body.Close()
 			break
 		}
@@ -961,6 +999,7 @@ func run() int {
 	replayDelayFlag := flag.Duration("replay-delay", 0, "pause between replayed requests")
 	replayFailFlag := flag.Bool("replay-fail-on-diff", false, "exit with code 2 if any replayed response differs from the recording")
 	insecureFlag := flag.Bool("insecure-upstream", false, "skip TLS certificate verification for upstream servers")
+	upstreamProxyFlag := flag.String("upstream-proxy", "", "proxy for httpmon's own upstream requests (default: HTTP(S)_PROXY from the environment)")
 	maxBodyFlag := flag.Int("max-body", 1000, "max bytes of each body shown in output")
 	maxCaptureFlag := flag.Int("max-capture", 1<<20, "max bytes of each body kept for --record/--har and decompression")
 	versionFlag := flag.Bool("version", false, "print version and exit")
@@ -998,6 +1037,15 @@ func run() int {
 	}
 	displayMaxBody = *maxBodyFlag
 	captureMaxBody = *maxCaptureFlag
+
+	if *upstreamProxyFlag != "" {
+		u, err := url.Parse(*upstreamProxyFlag)
+		if err != nil || u.Host == "" {
+			fmt.Fprintf(os.Stderr, "httpmon: invalid --upstream-proxy %q\n", *upstreamProxyFlag)
+			return 1
+		}
+		upstreamProxy = u
+	}
 
 	jsonMode = *formatFlag == "json"
 	// Assigned before the replay branch so replay honours it too: a recording

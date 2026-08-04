@@ -173,39 +173,108 @@ func TestGenerateCert_SignedByCA(t *testing.T) {
 	}
 }
 
-// ---- peekBody ----
+// ---- bodySampler ----
 
-func TestPeekBody_ShortBody(t *testing.T) {
+func TestBodySampler_PassesDataThroughUnchanged(t *testing.T) {
 	const original = "hello world"
 	rc := io.NopCloser(strings.NewReader(original))
-	peeked := peekBody(&rc, 1000)
-	if string(peeked) != original {
-		t.Errorf("peeked %q, want %q", peeked, original)
+
+	var got bodyView
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain")
+	sampleBody(&rc, h, func(v bodyView) { got = v })
+
+	forwarded, _ := io.ReadAll(rc)
+	if string(forwarded) != original {
+		t.Errorf("forwarded %q, want %q", forwarded, original)
 	}
-	remaining, _ := io.ReadAll(rc)
-	if string(remaining) != original {
-		t.Errorf("remaining body %q, want %q", remaining, original)
+	if got.Text != original {
+		t.Errorf("sampled %q, want %q", got.Text, original)
+	}
+	if got.Truncated {
+		t.Error("Truncated = true for a complete body")
 	}
 }
 
-func TestPeekBody_LongBody(t *testing.T) {
+func TestBodySampler_CapsAtLimit(t *testing.T) {
+	saved := displayMaxBody
+	displayMaxBody = 100
+	defer func() { displayMaxBody = saved }()
+
 	payload := strings.Repeat("x", 2000)
 	rc := io.NopCloser(strings.NewReader(payload))
-	peeked := peekBody(&rc, 100)
-	if len(peeked) != 100 {
-		t.Errorf("peeked %d bytes, want 100", len(peeked))
+
+	var got bodyView
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain")
+	sampleBody(&rc, h, func(v bodyView) { got = v })
+
+	forwarded, _ := io.ReadAll(rc)
+	if string(forwarded) != payload {
+		t.Errorf("forwarded %d bytes, want %d -- sampling must not consume the body",
+			len(forwarded), len(payload))
 	}
-	remaining, _ := io.ReadAll(rc)
-	if string(remaining) != payload {
-		t.Errorf("full body not restored after peek: got %d bytes, want %d", len(remaining), len(payload))
+	if len(got.Text) != 100 {
+		t.Errorf("sampled %d bytes, want 100", len(got.Text))
+	}
+	if !got.Truncated {
+		t.Error("Truncated = false for a body past the limit")
 	}
 }
 
-func TestPeekBody_EmptyBody(t *testing.T) {
+func TestBodySampler_EmptyBody(t *testing.T) {
 	rc := io.NopCloser(strings.NewReader(""))
-	peeked := peekBody(&rc, 100)
-	if len(peeked) != 0 {
-		t.Errorf("expected empty peek, got %q", peeked)
+	fired := 0
+	var got bodyView
+	sampleBody(&rc, http.Header{}, func(v bodyView) { fired++; got = v })
+
+	io.ReadAll(rc) //nolint:errcheck
+	rc.Close()     //nolint:errcheck
+	if fired != 1 {
+		t.Errorf("onDone fired %d times, want exactly 1", fired)
+	}
+	if got.Text != "" {
+		t.Errorf("sampled %q, want empty", got.Text)
+	}
+}
+
+func TestBodySampler_NilBodyFiresImmediately(t *testing.T) {
+	var rc io.ReadCloser
+	fired := 0
+	sampleBody(&rc, http.Header{}, func(bodyView) { fired++ })
+	if fired != 1 {
+		t.Errorf("onDone fired %d times, want 1 for a nil body", fired)
+	}
+}
+
+// Close must deliver the sample even when the consumer stops reading early,
+// otherwise a --record entry would never be completed.
+func TestBodySampler_FiresOnCloseWithoutEOF(t *testing.T) {
+	rc := io.NopCloser(strings.NewReader(strings.Repeat("y", 500)))
+	fired := 0
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain")
+	sampleBody(&rc, h, func(bodyView) { fired++ })
+
+	io.CopyN(io.Discard, rc, 10) //nolint:errcheck
+	rc.Close()                   //nolint:errcheck
+	if fired != 1 {
+		t.Errorf("onDone fired %d times, want 1", fired)
+	}
+}
+
+func TestBodySampler_FiresOnlyOnce(t *testing.T) {
+	rc := io.NopCloser(strings.NewReader("abc"))
+	fired := 0
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain")
+	sampleBody(&rc, h, func(bodyView) { fired++ })
+
+	io.ReadAll(rc) //nolint:errcheck
+	rc.Close()     //nolint:errcheck
+	rc.Close()     //nolint:errcheck
+	if fired != 1 {
+		t.Errorf("onDone fired %d times, want exactly 1", fired)
 	}
 }
 
@@ -408,6 +477,10 @@ func TestLogResponse_JSONCorrelation(t *testing.T) {
 	resp.Header.Set("Content-Type", "application/json")
 
 	logResponse(resp, 7)
+	// The JSON record is emitted once the body has streamed, which is what the
+	// proxy triggers by forwarding it.
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
+	resp.Body.Close()              //nolint:errcheck
 
 	var entry jsonResponse
 	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
@@ -1039,7 +1112,7 @@ func TestLogResponse_BrotliNotGarbled(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	body := io.NopCloser(bytes.NewReader(buf.Bytes()))
 
-	got := renderBody(&body, h)
+	got := collectBody(&body, h)
 	if got.Text != `{"login":"octocat"}` {
 		t.Errorf("got %q, want decoded JSON", got.Text)
 	}
@@ -1054,7 +1127,7 @@ func TestRenderBody_UnsupportedEncodingPlaceholder(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	body := io.NopCloser(strings.NewReader("\x00\x01binary"))
 
-	got := renderBody(&body, h)
+	got := collectBody(&body, h)
 	if !strings.HasPrefix(got.Text, "[snappy, ") {
 		t.Errorf("got %q, want a [snappy, N+ bytes] placeholder", got.Text)
 	}

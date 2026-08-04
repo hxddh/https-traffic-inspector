@@ -115,29 +115,33 @@ func harQueryString(rawQuery string) []harNameValue {
 
 // ── Capture ──────────────────────────────────────────────────────────────────
 
-func addHARRequest(reqID int, req *http.Request, body string, startTime time.Time) {
+func addHARRequest(reqID int, f requestFacts, body string, startTime time.Time) {
 	var postData *harPostData
-	bodySize := req.ContentLength
 	if body != "" {
-		mt := req.Header.Get("Content-Type")
+		mt := f.headers.Get("Content-Type")
 		if mt == "" {
 			mt = "application/octet-stream"
 		}
 		postData = &harPostData{MimeType: mt, Text: body}
 	}
 
+	var rawQuery string
+	if u, err := url.Parse(f.rawURL); err == nil {
+		rawQuery = u.RawQuery
+	}
+
 	e := &harEntry{
 		StartedDateTime: startTime.UTC().Format(time.RFC3339Nano),
 		Request: harRequest{
-			Method:      req.Method,
-			URL:         req.URL.String(),
-			HTTPVersion: req.Proto,
-			Headers:     harHeaders(req.Header),
-			QueryString: harQueryString(req.URL.RawQuery),
+			Method:      f.method,
+			URL:         f.rawURL,
+			HTTPVersion: f.proto,
+			Headers:     harHeaders(f.headers),
+			QueryString: harQueryString(rawQuery),
 			Cookies:     []harNameValue{},
 			PostData:    postData,
 			HeadersSize: -1,
-			BodySize:    bodySize,
+			BodySize:    int64(len(body)),
 		},
 	}
 
@@ -146,7 +150,7 @@ func addHARRequest(reqID int, req *http.Request, body string, startTime time.Tim
 	pendingHARMu.Unlock()
 }
 
-func addHARResponse(reqID int, resp *http.Response, body string, dur time.Duration) {
+func addHARResponse(reqID int, f responseFacts, body string) {
 	pendingHARMu.Lock()
 	e, ok := pendingHAR[reqID]
 	if ok {
@@ -157,12 +161,12 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 		return
 	}
 
-	mt := resp.Header.Get("Content-Type")
+	mt := f.headers.Get("Content-Type")
 	if mt == "" {
 		mt = "application/octet-stream"
 	}
 
-	statusText := resp.Status
+	statusText := f.statusText
 	if len(statusText) > 4 {
 		statusText = statusText[4:] // strip "NNN "
 	}
@@ -171,25 +175,25 @@ func addHARResponse(reqID int, resp *http.Response, body string, dur time.Durati
 	// transferred, which is only known from Content-Length. -1 means unknown,
 	// as required by the HAR 1.2 spec.
 	contentSize := int64(len(body))
-	bodySize := resp.ContentLength
+	bodySize := f.contentLength
 	if bodySize < 0 {
 		bodySize = -1
 	}
 
-	ms := float64(dur) / float64(time.Millisecond)
+	ms := float64(f.duration) / float64(time.Millisecond)
 	e.Time = ms
 	e.Response = harResponse{
-		Status:      resp.StatusCode,
+		Status:      f.status,
 		StatusText:  statusText,
-		HTTPVersion: resp.Proto,
-		Headers:     harHeaders(resp.Header),
+		HTTPVersion: f.proto,
+		Headers:     harHeaders(f.headers),
 		Cookies:     []harNameValue{},
 		Content: harContent{
 			Size:     contentSize,
 			MimeType: mt,
 			Text:     body,
 		},
-		RedirectURL: resp.Header.Get("Location"),
+		RedirectURL: f.headers.Get("Location"),
 		HeadersSize: -1,
 		BodySize:    bodySize,
 	}

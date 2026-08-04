@@ -40,6 +40,17 @@ type tuiRespMsg struct {
 }
 type tuiDoneMsg struct{ exitCode int }
 
+// Bodies arrive after their head: they are sampled as the body streams so that
+// delivery is never held up, then sent as a follow-up update.
+type tuiReqBodyMsg struct {
+	reqID int
+	body  string
+}
+type tuiRespBodyMsg struct {
+	reqID int
+	body  string
+}
+
 // tuiCh is the channel the proxy handlers write events to.
 // Buffered so proxy goroutines never block waiting for the TUI.
 var tuiCh = make(chan tea.Msg, 512)
@@ -161,6 +172,26 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Keep the scroll position: the user may be reading the request half
 		// of the panel when the response lands.
+		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiReqBodyMsg:
+		for _, e := range m.entries {
+			if e.id == msg.reqID {
+				e.reqBody = msg.body
+				break
+			}
+		}
+		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiRespBodyMsg:
+		for _, e := range m.entries {
+			if e.id == msg.reqID {
+				e.respBody = msg.body
+				break
+			}
+		}
 		m.refreshDetail(false)
 		return m, listenTUI()
 

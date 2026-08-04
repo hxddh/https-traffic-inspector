@@ -4,6 +4,36 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-04
+
+### Fixed
+
+- **Streaming was broken in both directions.** Bodies were read with
+  `io.ReadFull` before anything was forwarded, and `io.ReadFull` only returns
+  once its buffer is full or the stream ends. Anything that trickled — an SSE
+  feed, a chunked upload, a slow download — was withheld in full until the far
+  end closed. Measured against a live SSE endpoint, time-to-first-byte went
+  from 0.024s direct to 6.025s through httpmon; a chunked upload of four small
+  writes reached the server as a single write.
+
+  Bodies are now sampled alongside delivery rather than ahead of it, and
+  responses are flushed as they are written instead of sitting in a 32 KB
+  buffer until the end. Same measurement now reports 0.034s.
+
+  The visible consequence is that a body is logged when it finishes rather than
+  when its headers arrive. Request and response *heads* still print
+  immediately, so a long-lived stream is visible as it happens; `--format json`
+  and `--record` emit one complete record per exchange as before.
+
+### Added
+
+- `--upstream-proxy`, and httpmon's own upstream requests now honour
+  `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. The upstream transport previously
+  set no proxy at all, so httpmon could not run behind an egress proxy — the
+  environment where inspecting traffic matters most. httpmon injects its own
+  address only into the subprocess environment, so reading the environment here
+  picks up the outer proxy rather than looping back.
+
 ## [1.1.3] - 2026-08-04
 
 ### Fixed
