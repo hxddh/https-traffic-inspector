@@ -133,6 +133,11 @@ httpmon handles proxy configuration automatically for common tools:
 | **Node.js** | `NODE_EXTRA_CA_CERTS` |
 | Any HTTP-proxy-aware tool | `HTTP_PROXY`, `HTTPS_PROXY`, `SSL_CERT_FILE` |
 
+httpmon also clears `NO_PROXY` for the wrapped command. A host named in an
+inherited no-proxy list would otherwise skip httpmon and go uncaptured with no
+warning. httpmon's own upstream requests still honour the real `NO_PROXY`, so
+routing is unchanged — the traffic just passes through httpmon on the way.
+
 The CA bundle written to disk contains both the proxy CA and the system's trusted CA store (when found), so direct TLS connections made by the subprocess also work correctly.
 
 ---

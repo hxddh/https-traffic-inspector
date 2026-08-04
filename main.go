@@ -980,6 +980,33 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// subprocessEnv builds the environment for the wrapped command: it points the
+// command at httpmon and at the generated CA bundle.
+//
+// The inherited no-proxy list is cleared. A host named there would bypass
+// httpmon completely and its traffic would go uncaptured with no indication
+// that anything was missed — and the tools people wrap most often (go, pip,
+// npm) are exactly the ones such lists tend to name. httpmon's own upstream
+// client still applies the real NO_PROXY, so where the traffic ultimately goes
+// is unchanged; it just passes through httpmon on the way.
+func subprocessEnv(base []string, proxyURL, caCertPath, cmdName string) []string {
+	env := append(append([]string{}, base...),
+		"HTTP_PROXY="+proxyURL,
+		"HTTPS_PROXY="+proxyURL,
+		"http_proxy="+proxyURL,
+		"https_proxy="+proxyURL,
+		"NO_PROXY=",
+		"no_proxy=",
+		"REQUESTS_CA_BUNDLE="+caCertPath,
+		"SSL_CERT_FILE="+caCertPath,
+		"NODE_EXTRA_CA_CERTS="+caCertPath,
+	)
+	if cmdName == "aws" {
+		env = append(env, "AWS_CA_BUNDLE="+caCertPath)
+	}
+	return env
+}
+
 func main() { os.Exit(run()) }
 
 // run holds the whole program body so that every exit path returns a code
@@ -1174,19 +1201,7 @@ func run() int {
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 
 	proxyURL := "http://localhost:" + proxyPort
-	cmd.Env = append(os.Environ(),
-		"HTTP_PROXY="+proxyURL,
-		"HTTPS_PROXY="+proxyURL,
-		"http_proxy="+proxyURL,
-		"https_proxy="+proxyURL,
-		"REQUESTS_CA_BUNDLE="+caCertPath,
-		"SSL_CERT_FILE="+caCertPath,
-		"NODE_EXTRA_CA_CERTS="+caCertPath,
-	)
-
-	if cmdName == "aws" {
-		cmd.Env = append(cmd.Env, "AWS_CA_BUNDLE="+caCertPath)
-	}
+	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath, cmdName)
 
 	if tuiMode {
 		// In TUI mode the subprocess output is captured and shown after the UI exits.

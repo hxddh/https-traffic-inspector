@@ -752,3 +752,55 @@ func TestNewUpstreamClient_ExplicitProxyOverridesEnvironment(t *testing.T) {
 		t.Errorf("proxy = %v, want the explicit --upstream-proxy value", u)
 	}
 }
+
+// ---- subprocess environment ----
+
+// Regression: the inherited no-proxy list was passed straight through, so any
+// host named in it bypassed httpmon and its traffic went uncaptured with no
+// indication. Measured against a live host: 0 requests captured for a domain
+// in NO_PROXY, 1 for one that was not.
+func TestSubprocessEnv_ClearsNoProxy(t *testing.T) {
+	base := []string{
+		"PATH=/usr/bin",
+		"NO_PROXY=proxy.golang.org,pypi.org",
+		"no_proxy=proxy.golang.org,pypi.org",
+	}
+	env := subprocessEnv(base, "http://localhost:8080", "/tmp/ca.crt", "curl")
+
+	// Later entries win in os/exec, so check the effective value of each key.
+	effective := map[string]string{}
+	for _, kv := range env {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			effective[kv[:i]] = kv[i+1:]
+		}
+	}
+	for _, k := range []string{"NO_PROXY", "no_proxy"} {
+		if v, ok := effective[k]; !ok || v != "" {
+			t.Errorf("%s = %q (present=%v), want empty so nothing bypasses httpmon", k, v, ok)
+		}
+	}
+	if effective["HTTPS_PROXY"] != "http://localhost:8080" {
+		t.Errorf("HTTPS_PROXY = %q", effective["HTTPS_PROXY"])
+	}
+	if effective["PATH"] != "/usr/bin" {
+		t.Errorf("PATH = %q, want the inherited value preserved", effective["PATH"])
+	}
+}
+
+func TestSubprocessEnv_InjectsCABundleAndAWS(t *testing.T) {
+	for _, tc := range []struct {
+		cmdName string
+		wantAWS bool
+	}{{"curl", false}, {"aws", true}} {
+		env := subprocessEnv(nil, "http://localhost:1", "/tmp/ca.crt", tc.cmdName)
+		joined := strings.Join(env, "\n")
+		for _, k := range []string{"REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"} {
+			if !strings.Contains(joined, k+"=/tmp/ca.crt") {
+				t.Errorf("%s: %s not set to the CA bundle", tc.cmdName, k)
+			}
+		}
+		if got := strings.Contains(joined, "AWS_CA_BUNDLE=/tmp/ca.crt"); got != tc.wantAWS {
+			t.Errorf("%s: AWS_CA_BUNDLE present = %v, want %v", tc.cmdName, got, tc.wantAWS)
+		}
+	}
+}

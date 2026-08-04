@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-08-04
+
+### Fixed
+
+- **Hosts listed in the inherited `NO_PROXY` bypassed httpmon entirely**, so
+  their traffic went uncaptured with no indication that anything was missed —
+  the command simply worked and httpmon printed nothing. httpmon set its own
+  address as the subprocess proxy but passed the ambient no-proxy list straight
+  through, and the tools people wrap most often (`go`, `pip`, `npm`) are exactly
+  the ones such lists tend to name. Measured against live hosts: 0 requests
+  captured for a domain in `NO_PROXY`, 1 for one that was not.
+
+  The subprocess no-proxy list is now cleared. httpmon's own upstream client
+  still applies the real `NO_PROXY`, so where traffic ultimately goes is
+  unchanged — it just passes through httpmon on the way.
+
 ## [1.2.0] - 2026-08-04
 
 ### Fixed
