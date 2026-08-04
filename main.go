@@ -1000,6 +1000,9 @@ func run() int {
 	captureMaxBody = *maxCaptureFlag
 
 	jsonMode = *formatFlag == "json"
+	// Assigned before the replay branch so replay honours it too: a recording
+	// captured from a self-signed or internal-CA host must be replayable.
+	insecureUpstream = *insecureFlag
 
 	// ── Replay mode: no proxy, no subprocess ─────────────────────────────────
 	if *replayFlag != "" {
@@ -1012,7 +1015,6 @@ func run() int {
 	harMode = *harFlag != ""
 	harPath = *harFlag
 	certTTL = *certTTLFlag
-	insecureUpstream = *insecureFlag
 	upstreamClient = newUpstreamClient(insecureUpstream)
 
 	if recordMode {

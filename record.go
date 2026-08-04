@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -125,6 +126,11 @@ func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff 
 	defer f.Close()
 
 	client := &http.Client{
+		Transport: &http.Transport{
+			// Mirrors the proxy's policy so a recording captured from a
+			// self-signed or internal-CA host can still be replayed.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureUpstream}, //nolint:gosec // opt-in via --insecure-upstream
+		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-08-04
+
+### Fixed
+
+- `--replay` always verified TLS certificates and ignored `--insecure-upstream`
+  — the flag was assigned after the replay branch had already returned — so a
+  recording captured from a self-signed or internal-CA host could never be
+  replayed. Replay now mirrors the proxy's verification policy.
+
 ## [1.1.2] - 2026-08-04
 
 ### Fixed

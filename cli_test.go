@@ -647,3 +647,33 @@ func TestBodyAllowedForStatus(t *testing.T) {
 		}
 	}
 }
+
+// Regression: --insecure-upstream was assigned after the replay branch had
+// already returned, and the replay client always verified certificates, so a
+// recording captured from a self-signed or internal-CA host could never be
+// replayed.
+func TestReplay_HonoursInsecureUpstream(t *testing.T) {
+	const payload = "ok"
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(payload)) //nolint:errcheck
+	}))
+	defer target.Close()
+
+	path := writeRecording(t, recordedExchange{
+		ID: 1, Method: "GET", URL: target.URL + "/thing",
+		Status: 200, StatusText: "200 OK", RespBody: payload,
+	})
+
+	saved := insecureUpstream
+	defer func() { insecureUpstream = saved }()
+
+	insecureUpstream = false
+	if code := replayFile(path, "", 0, true); code != 2 {
+		t.Errorf("code = %d, want 2: an unverifiable host must count as a difference", code)
+	}
+
+	insecureUpstream = true
+	if code := replayFile(path, "", 0, true); code != 0 {
+		t.Errorf("code = %d, want 0 with --insecure-upstream", code)
+	}
+}
