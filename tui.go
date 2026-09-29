@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -28,7 +29,7 @@ type tuiEntry struct {
 	pending     bool
 }
 
-// Messages exchanged with the TUI model via tuiCh.
+// Messages exchanged with the TUI model via tuiQueue.
 type tuiReqMsg struct{ entry *tuiEntry }
 type tuiRespMsg struct {
 	reqID      int
@@ -51,9 +52,50 @@ type tuiRespBodyMsg struct {
 	body  string
 }
 
-// tuiCh is the channel the proxy handlers write events to.
-// Buffered so proxy goroutines never block waiting for the TUI.
-var tuiCh = make(chan tea.Msg, 512)
+// tuiQueue carries proxy events to the TUI. It is unbounded: proxy
+// goroutines must never block on the display, and a fixed-size channel with a
+// non-blocking send silently dropped events under load, leaving entries stuck
+// as pending forever.
+var tuiQueue = newEventQueue()
+
+// tuiSend queues an event for the TUI.
+func tuiSend(m tea.Msg) { tuiQueue.push(m) }
+
+type eventQueue struct {
+	mu    sync.Mutex
+	items []tea.Msg
+	ready chan struct{} // signalled when items becomes non-empty
+}
+
+func newEventQueue() *eventQueue {
+	return &eventQueue{ready: make(chan struct{}, 1)}
+}
+
+func (q *eventQueue) push(m tea.Msg) {
+	q.mu.Lock()
+	q.items = append(q.items, m)
+	q.mu.Unlock()
+	select {
+	case q.ready <- struct{}{}:
+	default:
+	}
+}
+
+// pop blocks until an event is available.
+func (q *eventQueue) pop() tea.Msg {
+	for {
+		q.mu.Lock()
+		if len(q.items) > 0 {
+			m := q.items[0]
+			q.items[0] = nil
+			q.items = q.items[1:]
+			q.mu.Unlock()
+			return m
+		}
+		q.mu.Unlock()
+		<-q.ready
+	}
+}
 
 // ── Styles ───────────────────────────────────────────────────────────────────
 
@@ -89,7 +131,7 @@ func runTUI() {
 func (m tuiModel) Init() tea.Cmd { return listenTUI() }
 
 func listenTUI() tea.Cmd {
-	return func() tea.Msg { return <-tuiCh }
+	return func() tea.Msg { return tuiQueue.pop() }
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {

@@ -311,6 +311,11 @@ Each line of the output file is a complete request/response pair:
 }
 ```
 
+When a stored body is only a prefix — it exceeded `--max-capture`, or the
+stream was cut off before it ended — `req_body_truncated` or
+`resp_body_truncated` is `true`, and replay compares only that prefix. HAR
+entries carry the same information as a `comment` on the body.
+
 ---
 
 ### Replay — `--replay`

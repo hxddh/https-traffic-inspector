@@ -1289,11 +1289,7 @@ func TestHAR_BasicCapture(t *testing.T) {
 	harEntriesMu.Lock()
 	harEntries = nil
 	harEntriesMu.Unlock()
-	pendingHARMu.Lock()
-	for k := range pendingHAR {
-		delete(pendingHAR, k)
-	}
-	pendingHARMu.Unlock()
+	captures = newExchangeJoiner()
 
 	savedHM := harMode
 	harMode = true

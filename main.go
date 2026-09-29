@@ -397,21 +397,14 @@ func nextReqID() int {
 	return requestCounter
 }
 
-// discardReqID cleans up reqStartTimes and pendingRecords when a request
-// cannot be completed and logResponse will never be called for this ID.
+// discardReqID cleans up per-request state when a request cannot be completed
+// and logResponse will never be called for this ID.
 func discardReqID(reqID int) {
 	reqStartMu.Lock()
 	delete(reqStartTimes, reqID)
 	reqStartMu.Unlock()
-	if recordMode {
-		pendingRecordsMu.Lock()
-		delete(pendingRecords, reqID)
-		pendingRecordsMu.Unlock()
-	}
-	if harMode {
-		pendingHARMu.Lock()
-		delete(pendingHAR, reqID)
-		pendingHARMu.Unlock()
+	if recordMode || harMode {
+		captures.drop(reqID)
 	}
 }
 
@@ -528,10 +521,7 @@ func logRequest(req *http.Request) int {
 			reqHeaders: flattenHeaders(hdr),
 			pending:    true,
 		}
-		select {
-		case tuiCh <- tuiReqMsg{entry}:
-		default:
-		}
+		tuiSend(tuiReqMsg{entry})
 		return reqID
 	}
 
@@ -578,21 +568,15 @@ type requestFacts struct {
 
 // onRequestBody runs when a request body finishes streaming.
 func onRequestBody(reqID int, f requestFacts, v bodyView) {
-	if recordMode {
-		recordRequestBody(reqID, f, v.Text)
-	}
-	if harMode {
-		addHARRequest(reqID, f, v.Text, f.startTime)
+	if recordMode || harMode {
+		captures.addRequest(reqID, capturedRequest{facts: f, body: v})
 	}
 
 	bodyStr := truncateForDisplay(v)
 
 	if tuiMode {
 		if bodyStr != "" {
-			select {
-			case tuiCh <- tuiReqBodyMsg{reqID: reqID, body: bodyStr}:
-			default:
-			}
+			tuiSend(tuiReqBodyMsg{reqID: reqID, body: bodyStr})
 		}
 		return
 	}
@@ -684,16 +668,13 @@ func logResponse(resp *http.Response, reqID int) {
 	})
 
 	if tuiMode {
-		select {
-		case tuiCh <- tuiRespMsg{
+		tuiSend(tuiRespMsg{
 			reqID:      reqID,
 			status:     status,
 			statusText: statusText,
 			headers:    flattenHeaders(hdr),
 			duration:   dur,
-		}:
-		default:
-		}
+		})
 		return
 	}
 
@@ -725,20 +706,14 @@ type responseFacts struct {
 
 // onResponseBody runs when a response body finishes streaming.
 func onResponseBody(reqID int, f responseFacts, v bodyView) {
-	if recordMode {
-		recordResponseBody(reqID, f, v.Text)
-	}
-	if harMode {
-		addHARResponse(reqID, f, v.Text)
+	if recordMode || harMode {
+		captures.addResponse(reqID, capturedResponse{facts: f, body: v})
 	}
 
 	bodyStr := truncateForDisplay(v)
 
 	if tuiMode {
-		select {
-		case tuiCh <- tuiRespBodyMsg{reqID: reqID, body: bodyStr}:
-		default:
-		}
+		tuiSend(tuiRespBodyMsg{reqID: reqID, body: bodyStr})
 		return
 	}
 
@@ -1407,10 +1382,7 @@ func run() int {
 					code = 1
 				}
 			}
-			select {
-			case tuiCh <- tuiDoneMsg{code}:
-			default:
-			}
+			tuiSend(tuiDoneMsg{code})
 			exitCh <- code
 		}()
 
