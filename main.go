@@ -430,28 +430,28 @@ func logRequest(req *http.Request) int {
 		return reqID
 	}
 
-	fmt.Printf("\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
-	fmt.Printf("Time: %s\n", startTime.Format("15:04:05"))
-	fmt.Printf("%s %s %s\n", method, rawURL, proto)
-	fmt.Printf("Host: %s\n", host)
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
+	fmt.Fprintf(&b, "Time: %s\n", startTime.Format("15:04:05"))
+	fmt.Fprintf(&b, "%s %s %s\n", method, rawURL, proto)
+	fmt.Fprintf(&b, "Host: %s\n", host)
 
 	if strings.Contains(host, ".amazonaws.com") {
-		logS3Info(req)
+		writeS3Info(&b, req)
 	}
 
 	if req.URL.RawQuery != "" {
-		fmt.Println("\nQuery Parameters:")
+		b.WriteString("\nQuery Parameters:\n")
 		params, _ := url.ParseQuery(req.URL.RawQuery)
 		for k, v := range params {
-			fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
+			fmt.Fprintf(&b, "  %s: %s\n", k, strings.Join(v, ", "))
 		}
 	}
 
-	fmt.Println("\nHeaders:")
-	for k, v := range hdr {
-		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
-	}
-	fmt.Println()
+	b.WriteString("\nHeaders:\n")
+	writeHeaders(&b, hdr)
+	b.WriteString("\n")
+	emitText(b.String())
 	return reqID
 }
 
@@ -504,26 +504,48 @@ func onRequestBody(reqID int, f requestFacts, v bodyView) {
 	}
 
 	if bodyStr != "" {
-		fmt.Printf("\n\033[36m--- REQUEST #%d body ---\033[0m\n%s\n\n", reqID, bodyStr)
+		emitText(fmt.Sprintf("\n\033[36m--- REQUEST #%d body ---\033[0m\n%s\n\n", reqID, bodyStr))
 	}
 }
 
-func logS3Info(req *http.Request) {
+// ---- text output ----
+
+var (
+	// textOut receives text-mode output; tests swap it for a buffer.
+	textOut   io.Writer = os.Stdout
+	textOutMu sync.Mutex
+)
+
+// emitText writes one complete output block. Each block goes out under a
+// single lock so concurrent exchanges never interleave inside one another.
+func emitText(s string) {
+	textOutMu.Lock()
+	io.WriteString(textOut, s) //nolint:errcheck
+	textOutMu.Unlock()
+}
+
+func writeHeaders(b *strings.Builder, h http.Header) {
+	for k, v := range h {
+		fmt.Fprintf(b, "  %s: %s\n", k, strings.Join(v, ", "))
+	}
+}
+
+func writeS3Info(b *strings.Builder, req *http.Request) {
 	host := req.Host
 	// virtual-hosted style: <bucket>.s3[.<region>].amazonaws.com/<key>
 	if idx := strings.Index(host, ".s3."); idx > 0 {
-		fmt.Printf("\033[93mS3 Bucket: %s\033[0m\n", host[:idx])
+		fmt.Fprintf(b, "\033[93mS3 Bucket: %s\033[0m\n", host[:idx])
 		if key := strings.TrimPrefix(req.URL.Path, "/"); key != "" {
-			fmt.Printf("\033[93mS3 Key/Prefix: %s\033[0m\n", key)
+			fmt.Fprintf(b, "\033[93mS3 Key/Prefix: %s\033[0m\n", key)
 		}
 		return
 	}
 	// path-style: s3[.<region>].amazonaws.com/<bucket>/<key>
 	pathParts := strings.SplitN(req.URL.Path, "/", 3)
 	if len(pathParts) >= 2 && pathParts[1] != "" {
-		fmt.Printf("\033[93mS3 Bucket: %s\033[0m\n", pathParts[1])
+		fmt.Fprintf(b, "\033[93mS3 Bucket: %s\033[0m\n", pathParts[1])
 		if len(pathParts) > 2 && pathParts[2] != "" {
-			fmt.Printf("\033[93mS3 Key/Prefix: %s\033[0m\n", pathParts[2])
+			fmt.Fprintf(b, "\033[93mS3 Key/Prefix: %s\033[0m\n", pathParts[2])
 		}
 	}
 }
@@ -570,13 +592,14 @@ func logResponse(resp *http.Response, reqID int) {
 		return
 	}
 
-	fmt.Printf("\n\033[32m=== RESPONSE ===\033[0m\n")
-	fmt.Printf("%s %s\n", proto, statusText)
-
-	fmt.Println("\nHeaders:")
-	for k, v := range hdr {
-		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
-	}
+	// Every block carries the request number: with concurrent requests the
+	// response to #2 may well print before the one to #1.
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\033[32m=== RESPONSE #%d ===\033[0m\n", reqID)
+	fmt.Fprintf(&b, "%s %s (%s)\n", proto, statusText, dur.Round(time.Millisecond))
+	b.WriteString("\nHeaders:\n")
+	writeHeaders(&b, hdr)
+	emitText(b.String())
 }
 
 // responseFacts carries the response details needed once its body has been
@@ -622,10 +645,12 @@ func onResponseBody(reqID int, f responseFacts, v bodyView) {
 		return
 	}
 
+	var b strings.Builder
 	if bodyStr != "" {
-		fmt.Printf("\nBody:\n%s\n", bodyStr)
+		fmt.Fprintf(&b, "\n\033[32m--- RESPONSE #%d body ---\033[0m\n%s\n", reqID, bodyStr)
 	}
-	fmt.Println("\n" + strings.Repeat("-", 60))
+	fmt.Fprintf(&b, "\n%s #%d end\n", strings.Repeat("-", 52), reqID)
+	emitText(b.String())
 }
 
 // truncationMarker is appended whenever displayed content is incomplete, so a
@@ -815,7 +840,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !jsonMode && !tuiMode {
-		fmt.Printf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host)
+		emitText(fmt.Sprintf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host))
 	}
 
 	host, _, err := net.SplitHostPort(r.Host)

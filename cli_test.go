@@ -14,7 +14,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -839,5 +841,92 @@ func TestProxyDialHost(t *testing.T) {
 		if got := proxyDialHost(listen); got != want {
 			t.Errorf("proxyDialHost(%q) = %q, want %q", listen, got, want)
 		}
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent writes emitText makes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// Regression: response headers and bodies printed without a request number,
+// one fmt.Printf per line, so with concurrent requests neither could be matched
+// to its request. Every block now names its request and is written whole.
+func TestTextOutput_ConcurrentResponsesAreAttributable(t *testing.T) {
+	const n = 8
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Stagger replies so completion order differs from request order.
+		id := strings.TrimPrefix(r.URL.Path, "/")
+		if id == "1" || id == "3" {
+			time.Sleep(100 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "body-for-%s", id)
+	}))
+	defer upstream.Close()
+
+	out := &syncBuffer{}
+	savedOut := textOut
+	textOut = out
+	defer func() { textOut = savedOut }()
+
+	proxyURL, err := url.Parse("http://" + startTestProxy(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+	var wg sync.WaitGroup
+	for i := 1; i <= n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := client.Get(fmt.Sprintf("%s/%d", upstream.URL, i))
+			if err != nil {
+				t.Errorf("request %d: %v", i, err)
+				return
+			}
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()              //nolint:errcheck
+		}(i)
+	}
+	wg.Wait()
+
+	// Map each request number to the URL path it was assigned.
+	text := out.String()
+	pathOf := map[string]string{}
+	reqRe := regexp.MustCompile(`=== REQUEST #(\d+) ===\x1b\[0m\nTime: [^\n]*\nGET http://[^/]+/(\d+) `)
+	for _, m := range reqRe.FindAllStringSubmatch(text, -1) {
+		pathOf[m[1]] = m[2]
+	}
+	if len(pathOf) != n {
+		t.Fatalf("found %d intact request blocks, want %d; output:\n%s", len(pathOf), n, text)
+	}
+
+	bodyRe := regexp.MustCompile(`--- RESPONSE #(\d+) body ---\x1b\[0m\nbody-for-(\d+)\n`)
+	bodies := bodyRe.FindAllStringSubmatch(text, -1)
+	if len(bodies) != n {
+		t.Fatalf("found %d intact response body blocks, want %d; output:\n%s", len(bodies), n, text)
+	}
+	for _, m := range bodies {
+		if pathOf[m[1]] != m[2] {
+			t.Errorf("RESPONSE #%s carries the body for /%s, but request #%s was /%s", m[1], m[2], m[1], pathOf[m[1]])
+		}
+	}
+	if got := strings.Count(text, "=== RESPONSE #"); got != n {
+		t.Errorf("found %d numbered response headers, want %d", got, n)
 	}
 }

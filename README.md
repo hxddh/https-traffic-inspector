@@ -17,16 +17,17 @@ Headers:
   User-Agent: curl/8.4.0
   Accept: */*
 
-=== RESPONSE ===
-HTTP/1.1 200 OK
+=== RESPONSE #1 ===
+HTTP/1.1 200 OK (212ms)
 
 Headers:
   Content-Type: application/json; charset=utf-8
   X-Ratelimit-Remaining: 59
 
-Body:
+--- RESPONSE #1 body ---
 {"login":"octocat","id":583231,...}
-------------------------------------------------------------
+
+---------------------------------------------------- #1 end
 ```
 
 ---
@@ -225,14 +226,14 @@ httpmon automatically decompresses `gzip`, `deflate`, `brotli` (`br`) and `zstd`
 Chained encodings (`Content-Encoding: gzip, br`) are decoded layer by layer. An encoding httpmon does not recognise is shown as a `[<encoding>, N+ bytes]` placeholder rather than being printed raw.
 
 ```
-=== RESPONSE ===
-HTTP/1.1 200 OK
+=== RESPONSE #1 ===
+HTTP/1.1 200 OK (212ms)
 
 Headers:
   Content-Encoding: gzip
   Content-Type: application/json
 
-Body:
+--- RESPONSE #1 body ---
 {"login":"octocat","id":583231,...}   ← decoded automatically
 ```
 
