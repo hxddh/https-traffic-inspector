@@ -385,8 +385,8 @@ httpmon --har trace.har curl https://api.github.com
 # Full session: TUI + HAR + filter
 httpmon --ui --har session.har --filter /api python3 app.py
 
-# Use a random port to avoid conflicts (useful in CI)
-httpmon --port 0 curl https://api.example.com
+# Accept connections from a container or VM (exposes the proxy to the network)
+httpmon --listen 0.0.0.0 --port 8080 python3 app.py
 ```
 
 ---
