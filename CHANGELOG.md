@@ -4,6 +4,55 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-29
+
+### ⚠ Breaking
+
+- **The proxy now listens on `127.0.0.1` only, on a random free port.** It
+  previously bound every interface on port 8080, so anyone on the same
+  network could use it as an open proxy — including to reach services bound
+  only to this machine's loopback, whose traffic then landed in the user's
+  recordings. `--listen <addr>` opts into another address (for a container or
+  VM) and prints a warning when it is not loopback. `--port` still fixes the
+  port.
+
+### Security
+
+- See the listener change above.
+
+### Added
+
+- The wrapped command now also gets `GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`,
+  `CARGO_HTTP_CAINFO`, `DENO_CERT`, `PIP_CERT` and `NODE_USE_ENV_PROXY=1`, and
+  `AWS_CA_BUNDLE` for every command rather than only a top-level `aws`.
+  Measured before this change: `git` over https failed certificate
+  verification, and Node 22's built-in `fetch` bypassed httpmon entirely, so
+  nothing was captured while the command appeared to succeed. These override
+  inherited values, which would point at a bundle without httpmon's CA.
+- `--record` entries carry `req_body_truncated` / `resp_body_truncated`, and
+  HAR bodies a `comment`, when only a prefix of the body was stored.
+
+### Fixed
+
+- **Text output could not be matched to requests under concurrency.** Response
+  headers and bodies carried no request number and were printed line by line,
+  so with `npm`, `pip` or `aws s3 sync` neither could be attributed. Every block
+  is now numbered (`=== RESPONSE #3 ===`, `--- RESPONSE #3 body ---`), the
+  response line shows the round-trip time, and each block is written whole.
+- **`--replay` and `wss://` tunnels ignored `--upstream-proxy` and
+  `HTTP(S)_PROXY`**, so both failed behind an egress proxy. All upstream
+  traffic now takes the same route; WebSocket tunnels go through the proxy
+  with `CONNECT`.
+- An exchange whose response finished before its request body — a server
+  answering an upload early with a 413 or an auth failure — was silently left
+  out of `--record` and `--har`.
+- Concurrent exchanges could interleave on one line of a `--record` file.
+- A body cut off before it ended (a client disconnecting mid-download) was
+  shown and stored as if complete. It is now marked truncated, and replay
+  compares only the recorded prefix.
+- A failed upstream request could leave a pending capture entry behind forever.
+- The TUI dropped events under load, leaving entries stuck as pending.
+
 ## [1.2.2] - 2026-09-29
 
 ### Fixed

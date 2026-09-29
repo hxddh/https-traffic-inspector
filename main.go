@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -89,14 +90,13 @@ func init() {
 // settings. httpmon only injects its own address into the *subprocess*
 // environment, so reading the environment here picks up the outer proxy rather
 // than looping back into httpmon.
+//
+// Every upstream path -- proxied requests, replay and WebSocket tunnels --
+// resolves its proxy through upstreamProxyFor, so none of them can bypass it.
 func newUpstreamClient(insecure bool) *http.Client {
-	proxy := http.ProxyFromEnvironment
-	if upstreamProxy != nil {
-		proxy = http.ProxyURL(upstreamProxy)
-	}
 	return &http.Client{
 		Transport: &http.Transport{
-			Proxy:               proxy,
+			Proxy:               func(r *http.Request) (*url.URL, error) { return upstreamProxyFor(r.URL) },
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec // opt-in via --insecure-upstream
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
@@ -106,6 +106,116 @@ func newUpstreamClient(insecure bool) *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// upstreamProxyFor returns the proxy httpmon's own traffic to u goes through,
+// or nil to connect directly: --upstream-proxy when set, else the environment.
+func upstreamProxyFor(u *url.URL) (*url.URL, error) {
+	if upstreamProxy != nil {
+		return upstreamProxy, nil
+	}
+	return http.ProxyFromEnvironment(&http.Request{URL: u})
+}
+
+// upstreamDialTimeout bounds connecting to an upstream or proxy and completing
+// the TLS handshake, matching what the upstream transport allows.
+const upstreamDialTimeout = 30 * time.Second
+
+// dialUpstreamTLS opens a TLS connection to hostport for a WebSocket splice,
+// tunnelling through the upstream proxy when one applies. The splice needs a
+// raw connection, which the shared http.Transport cannot hand out, but it must
+// follow the same route and verification policy as every other request.
+func dialUpstreamTLS(hostport, serverName string) (net.Conn, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify: insecureUpstream, //nolint:gosec // opt-in via --insecure-upstream
+		ServerName:         serverName,
+	}
+	d := &net.Dialer{Timeout: upstreamDialTimeout}
+
+	p, err := upstreamProxyFor(&url.URL{Scheme: "https", Host: hostport})
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return tls.DialWithDialer(d, "tcp", hostport, cfg)
+	}
+
+	raw, err := dialProxyTunnel(d, p, hostport)
+	if err != nil {
+		return nil, err
+	}
+	tc := tls.Client(raw, cfg)
+	raw.SetDeadline(time.Now().Add(upstreamDialTimeout)) //nolint:errcheck
+	if err := tc.Handshake(); err != nil {
+		raw.Close() //nolint:errcheck
+		return nil, err
+	}
+	raw.SetDeadline(time.Time{}) //nolint:errcheck
+	return tc, nil
+}
+
+// dialProxyTunnel connects to proxy p and asks it, with CONNECT, for a tunnel
+// to target.
+func dialProxyTunnel(d *net.Dialer, p *url.URL, target string) (net.Conn, error) {
+	var (
+		conn net.Conn
+		err  error
+	)
+	switch p.Scheme {
+	case "http", "":
+		conn, err = d.Dial("tcp", hostPortDefault(p, "80"))
+	case "https":
+		conn, err = tls.DialWithDialer(d, "tcp", hostPortDefault(p, "443"), &tls.Config{ServerName: p.Hostname()})
+	default:
+		return nil, fmt.Errorf("upstream proxy scheme %q is not supported for WebSocket tunnels", p.Scheme)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: target},
+		Host:   target,
+		Header: make(http.Header),
+	}
+	if p.User != nil {
+		pass, _ := p.User.Password()
+		cred := base64.StdEncoding.EncodeToString([]byte(p.User.Username() + ":" + pass))
+		req.Header.Set("Proxy-Authorization", "Basic "+cred)
+	}
+
+	conn.SetDeadline(time.Now().Add(upstreamDialTimeout)) //nolint:errcheck
+	if err := req.Write(conn); err != nil {
+		conn.Close() //nolint:errcheck
+		return nil, err
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close() //nolint:errcheck
+		return nil, err
+	}
+	resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		conn.Close() //nolint:errcheck
+		return nil, fmt.Errorf("upstream proxy refused CONNECT %s: %s", target, resp.Status)
+	}
+	// The server speaks first only after our TLS ClientHello, so anything
+	// already buffered here would be lost; treat it as a protocol error.
+	if br.Buffered() > 0 {
+		conn.Close() //nolint:errcheck
+		return nil, fmt.Errorf("upstream proxy sent unexpected data after CONNECT %s", target)
+	}
+	conn.SetDeadline(time.Time{}) //nolint:errcheck
+	return conn, nil
+}
+
+func hostPortDefault(u *url.URL, port string) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	return net.JoinHostPort(u.Hostname(), port)
 }
 
 // ---- cleanup ----
@@ -287,21 +397,14 @@ func nextReqID() int {
 	return requestCounter
 }
 
-// discardReqID cleans up reqStartTimes and pendingRecords when a request
-// cannot be completed and logResponse will never be called for this ID.
+// discardReqID cleans up per-request state when a request cannot be completed
+// and logResponse will never be called for this ID.
 func discardReqID(reqID int) {
 	reqStartMu.Lock()
 	delete(reqStartTimes, reqID)
 	reqStartMu.Unlock()
-	if recordMode {
-		pendingRecordsMu.Lock()
-		delete(pendingRecords, reqID)
-		pendingRecordsMu.Unlock()
-	}
-	if harMode {
-		pendingHARMu.Lock()
-		delete(pendingHAR, reqID)
-		pendingHARMu.Unlock()
+	if recordMode || harMode {
+		captures.drop(reqID)
 	}
 }
 
@@ -418,10 +521,7 @@ func logRequest(req *http.Request) int {
 			reqHeaders: flattenHeaders(hdr),
 			pending:    true,
 		}
-		select {
-		case tuiCh <- tuiReqMsg{entry}:
-		default:
-		}
+		tuiSend(tuiReqMsg{entry})
 		return reqID
 	}
 
@@ -430,28 +530,28 @@ func logRequest(req *http.Request) int {
 		return reqID
 	}
 
-	fmt.Printf("\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
-	fmt.Printf("Time: %s\n", startTime.Format("15:04:05"))
-	fmt.Printf("%s %s %s\n", method, rawURL, proto)
-	fmt.Printf("Host: %s\n", host)
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
+	fmt.Fprintf(&b, "Time: %s\n", startTime.Format("15:04:05"))
+	fmt.Fprintf(&b, "%s %s %s\n", method, rawURL, proto)
+	fmt.Fprintf(&b, "Host: %s\n", host)
 
 	if strings.Contains(host, ".amazonaws.com") {
-		logS3Info(req)
+		writeS3Info(&b, req)
 	}
 
 	if req.URL.RawQuery != "" {
-		fmt.Println("\nQuery Parameters:")
+		b.WriteString("\nQuery Parameters:\n")
 		params, _ := url.ParseQuery(req.URL.RawQuery)
 		for k, v := range params {
-			fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
+			fmt.Fprintf(&b, "  %s: %s\n", k, strings.Join(v, ", "))
 		}
 	}
 
-	fmt.Println("\nHeaders:")
-	for k, v := range hdr {
-		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
-	}
-	fmt.Println()
+	b.WriteString("\nHeaders:\n")
+	writeHeaders(&b, hdr)
+	b.WriteString("\n")
+	emitText(b.String())
 	return reqID
 }
 
@@ -468,21 +568,15 @@ type requestFacts struct {
 
 // onRequestBody runs when a request body finishes streaming.
 func onRequestBody(reqID int, f requestFacts, v bodyView) {
-	if recordMode {
-		recordRequestBody(reqID, f, v.Text)
-	}
-	if harMode {
-		addHARRequest(reqID, f, v.Text, f.startTime)
+	if recordMode || harMode {
+		captures.addRequest(reqID, capturedRequest{facts: f, body: v})
 	}
 
 	bodyStr := truncateForDisplay(v)
 
 	if tuiMode {
 		if bodyStr != "" {
-			select {
-			case tuiCh <- tuiReqBodyMsg{reqID: reqID, body: bodyStr}:
-			default:
-			}
+			tuiSend(tuiReqBodyMsg{reqID: reqID, body: bodyStr})
 		}
 		return
 	}
@@ -504,26 +598,48 @@ func onRequestBody(reqID int, f requestFacts, v bodyView) {
 	}
 
 	if bodyStr != "" {
-		fmt.Printf("\n\033[36m--- REQUEST #%d body ---\033[0m\n%s\n\n", reqID, bodyStr)
+		emitText(fmt.Sprintf("\n\033[36m--- REQUEST #%d body ---\033[0m\n%s\n\n", reqID, bodyStr))
 	}
 }
 
-func logS3Info(req *http.Request) {
+// ---- text output ----
+
+var (
+	// textOut receives text-mode output; tests swap it for a buffer.
+	textOut   io.Writer = os.Stdout
+	textOutMu sync.Mutex
+)
+
+// emitText writes one complete output block. Each block goes out under a
+// single lock so concurrent exchanges never interleave inside one another.
+func emitText(s string) {
+	textOutMu.Lock()
+	io.WriteString(textOut, s) //nolint:errcheck
+	textOutMu.Unlock()
+}
+
+func writeHeaders(b *strings.Builder, h http.Header) {
+	for k, v := range h {
+		fmt.Fprintf(b, "  %s: %s\n", k, strings.Join(v, ", "))
+	}
+}
+
+func writeS3Info(b *strings.Builder, req *http.Request) {
 	host := req.Host
 	// virtual-hosted style: <bucket>.s3[.<region>].amazonaws.com/<key>
 	if idx := strings.Index(host, ".s3."); idx > 0 {
-		fmt.Printf("\033[93mS3 Bucket: %s\033[0m\n", host[:idx])
+		fmt.Fprintf(b, "\033[93mS3 Bucket: %s\033[0m\n", host[:idx])
 		if key := strings.TrimPrefix(req.URL.Path, "/"); key != "" {
-			fmt.Printf("\033[93mS3 Key/Prefix: %s\033[0m\n", key)
+			fmt.Fprintf(b, "\033[93mS3 Key/Prefix: %s\033[0m\n", key)
 		}
 		return
 	}
 	// path-style: s3[.<region>].amazonaws.com/<bucket>/<key>
 	pathParts := strings.SplitN(req.URL.Path, "/", 3)
 	if len(pathParts) >= 2 && pathParts[1] != "" {
-		fmt.Printf("\033[93mS3 Bucket: %s\033[0m\n", pathParts[1])
+		fmt.Fprintf(b, "\033[93mS3 Bucket: %s\033[0m\n", pathParts[1])
 		if len(pathParts) > 2 && pathParts[2] != "" {
-			fmt.Printf("\033[93mS3 Key/Prefix: %s\033[0m\n", pathParts[2])
+			fmt.Fprintf(b, "\033[93mS3 Key/Prefix: %s\033[0m\n", pathParts[2])
 		}
 	}
 }
@@ -552,16 +668,13 @@ func logResponse(resp *http.Response, reqID int) {
 	})
 
 	if tuiMode {
-		select {
-		case tuiCh <- tuiRespMsg{
+		tuiSend(tuiRespMsg{
 			reqID:      reqID,
 			status:     status,
 			statusText: statusText,
 			headers:    flattenHeaders(hdr),
 			duration:   dur,
-		}:
-		default:
-		}
+		})
 		return
 	}
 
@@ -570,13 +683,14 @@ func logResponse(resp *http.Response, reqID int) {
 		return
 	}
 
-	fmt.Printf("\n\033[32m=== RESPONSE ===\033[0m\n")
-	fmt.Printf("%s %s\n", proto, statusText)
-
-	fmt.Println("\nHeaders:")
-	for k, v := range hdr {
-		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
-	}
+	// Every block carries the request number: with concurrent requests the
+	// response to #2 may well print before the one to #1.
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\033[32m=== RESPONSE #%d ===\033[0m\n", reqID)
+	fmt.Fprintf(&b, "%s %s (%s)\n", proto, statusText, dur.Round(time.Millisecond))
+	b.WriteString("\nHeaders:\n")
+	writeHeaders(&b, hdr)
+	emitText(b.String())
 }
 
 // responseFacts carries the response details needed once its body has been
@@ -592,20 +706,14 @@ type responseFacts struct {
 
 // onResponseBody runs when a response body finishes streaming.
 func onResponseBody(reqID int, f responseFacts, v bodyView) {
-	if recordMode {
-		recordResponseBody(reqID, f, v.Text)
-	}
-	if harMode {
-		addHARResponse(reqID, f, v.Text)
+	if recordMode || harMode {
+		captures.addResponse(reqID, capturedResponse{facts: f, body: v})
 	}
 
 	bodyStr := truncateForDisplay(v)
 
 	if tuiMode {
-		select {
-		case tuiCh <- tuiRespBodyMsg{reqID: reqID, body: bodyStr}:
-		default:
-		}
+		tuiSend(tuiRespBodyMsg{reqID: reqID, body: bodyStr})
 		return
 	}
 
@@ -622,10 +730,12 @@ func onResponseBody(reqID int, f responseFacts, v bodyView) {
 		return
 	}
 
+	var b strings.Builder
 	if bodyStr != "" {
-		fmt.Printf("\nBody:\n%s\n", bodyStr)
+		fmt.Fprintf(&b, "\n\033[32m--- RESPONSE #%d body ---\033[0m\n%s\n", reqID, bodyStr)
 	}
-	fmt.Println("\n" + strings.Repeat("-", 60))
+	fmt.Fprintf(&b, "\n%s #%d end\n", strings.Repeat("-", 52), reqID)
+	emitText(b.String())
 }
 
 // truncationMarker is appended whenever displayed content is incomplete, so a
@@ -815,7 +925,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !jsonMode && !tuiMode {
-		fmt.Printf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host)
+		emitText(fmt.Sprintf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host))
 	}
 
 	host, _, err := net.SplitHostPort(r.Host)
@@ -907,10 +1017,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		// WebSocket upgrades require a raw bidirectional tunnel; bypass the
 		// normal hop-by-hop stripping and http.Client round-trip.
 		if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
-			upConn, dialErr := tls.Dial("tcp", r.Host, &tls.Config{
-				InsecureSkipVerify: insecureUpstream, //nolint:gosec // opt-in via --insecure-upstream
-				ServerName:         host,
-			})
+			upConn, dialErr := dialUpstreamTLS(r.Host, host)
 			if dialErr != nil {
 				if shouldLog {
 					discardReqID(reqID)
@@ -989,22 +1096,69 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 // npm) are exactly the ones such lists tend to name. httpmon's own upstream
 // client still applies the real NO_PROXY, so where the traffic ultimately goes
 // is unchanged; it just passes through httpmon on the way.
-func subprocessEnv(base []string, proxyURL, caCertPath, cmdName string) []string {
-	env := append(append([]string{}, base...),
+//
+// Most tools read SSL_CERT_FILE, but several keep their own variable and
+// ignore it, failing verification or — worse — silently bypassing httpmon.
+// Each variable here overrides an inherited value of the same name, which
+// would otherwise point the tool at a bundle without httpmon's CA.
+func subprocessEnv(base []string, proxyURL, caCertPath string) []string {
+	env := append([]string{}, base...)
+	env = append(env,
 		"HTTP_PROXY="+proxyURL,
 		"HTTPS_PROXY="+proxyURL,
 		"http_proxy="+proxyURL,
 		"https_proxy="+proxyURL,
 		"NO_PROXY=",
 		"no_proxy=",
-		"REQUESTS_CA_BUNDLE="+caCertPath,
-		"SSL_CERT_FILE="+caCertPath,
-		"NODE_EXTRA_CA_CERTS="+caCertPath,
+		// Node's built-in fetch ignores the proxy variables unless told
+		// otherwise, so its requests went straight past httpmon.
+		"NODE_USE_ENV_PROXY=1",
 	)
-	if cmdName == "aws" {
-		env = append(env, "AWS_CA_BUNDLE="+caCertPath)
+	for _, k := range caBundleEnvVars {
+		env = append(env, k+"="+caCertPath)
 	}
 	return env
+}
+
+// caBundleEnvVars name every variable httpmon sets to its CA bundle.
+var caBundleEnvVars = []string{
+	"SSL_CERT_FILE",       // OpenSSL-based tools, Go, Ruby, Python ssl
+	"REQUESTS_CA_BUNDLE",  // Python requests
+	"PIP_CERT",            // pip, which otherwise prefers its vendored certifi
+	"AWS_CA_BUNDLE",       // botocore (aws CLI, boto3), which ignores the above
+	"NODE_EXTRA_CA_CERTS", // Node.js
+	"CURL_CA_BUNDLE",      // curl run from scripts, where -x/--cacert are not injected
+	"GIT_SSL_CAINFO",      // git, whose libcurl ignores SSL_CERT_FILE
+	"CARGO_HTTP_CAINFO",   // cargo
+	"DENO_CERT",           // Deno
+}
+
+// isLoopbackHost reports whether a listen address only accepts local
+// connections. "localhost" counts: it resolves to loopback addresses.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// proxyDialHost returns the host the wrapped command should dial to reach a
+// proxy listening on listenHost. An unspecified (wildcard) address accepts
+// connections but cannot be dialled, so loopback stands in for it. A literal
+// IP is used rather than "localhost", which may resolve to ::1 while the
+// listener is IPv4-only.
+func proxyDialHost(listenHost string) string {
+	if listenHost == "" || strings.EqualFold(listenHost, "localhost") {
+		return "127.0.0.1"
+	}
+	if ip := net.ParseIP(listenHost); ip != nil && ip.IsUnspecified() {
+		if ip.To4() != nil {
+			return "127.0.0.1"
+		}
+		return "::1"
+	}
+	return listenHost
 }
 
 func main() { os.Exit(run()) }
@@ -1014,7 +1168,8 @@ func main() { os.Exit(run()) }
 func run() int {
 	defer runCleanups()
 
-	portFlag := flag.String("port", "8080", "proxy listen port; use 0 to pick a random free port")
+	portFlag := flag.String("port", "0", "proxy listen port; 0 picks a random free port")
+	listenFlag := flag.String("listen", "127.0.0.1", "address the proxy listens on; anything other than loopback exposes it to the network")
 	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
 	formatFlag := flag.String("format", "text", "output format: text | json")
 	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
@@ -1127,12 +1282,20 @@ func run() int {
 	}
 	addCleanup(func() { os.Remove(caCertPath) }) //nolint:errcheck
 
-	ln, err := net.Listen("tcp", ":"+*portFlag)
+	listenAddr := net.JoinHostPort(*listenFlag, *portFlag)
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: failed to bind proxy on :%s: %v\n", *portFlag, err)
+		fmt.Fprintf(os.Stderr, "httpmon: failed to bind proxy on %s: %v\n", listenAddr, err)
 		return 1
 	}
 	proxyPort = strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	if !isLoopbackHost(*listenFlag) {
+		fmt.Fprintf(os.Stderr,
+			"httpmon: WARNING: proxy listening on %s is reachable from the network; anyone who can reach it can use it, including to reach services bound to this machine's loopback\n",
+			ln.Addr())
+	}
+	// What the wrapped command dials. A wildcard bind is reached via loopback.
+	proxyURL := "http://" + net.JoinHostPort(proxyDialHost(*listenFlag), proxyPort)
 
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1150,7 +1313,7 @@ func run() int {
 
 	go func() {
 		if !jsonMode {
-			fmt.Printf("Starting MITM proxy on :%s\n", proxyPort)
+			fmt.Printf("Starting MITM proxy on %s\n", ln.Addr())
 			fmt.Printf("CA bundle written to: %s\n", caCertPath)
 			if sysCA := systemCABundle(); sysCA != "" {
 				fmt.Printf("System CA bundle merged from: %s\n", sysCA)
@@ -1189,7 +1352,7 @@ func run() int {
 
 		newArgs := []string{cmdArgs[0]}
 		if !hasProxy {
-			newArgs = append(newArgs, "-x", "http://localhost:"+proxyPort)
+			newArgs = append(newArgs, "-x", proxyURL)
 		}
 		if !hasCACert && !hasInsecure {
 			newArgs = append(newArgs, "--cacert", caCertPath)
@@ -1200,8 +1363,7 @@ func run() int {
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 
-	proxyURL := "http://localhost:" + proxyPort
-	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath, cmdName)
+	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath)
 
 	if tuiMode {
 		// In TUI mode the subprocess output is captured and shown after the UI exits.
@@ -1220,10 +1382,7 @@ func run() int {
 					code = 1
 				}
 			}
-			select {
-			case tuiCh <- tuiDoneMsg{code}:
-			default:
-			}
+			tuiSend(tuiDoneMsg{code})
 			exitCh <- code
 		}()
 

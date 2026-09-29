@@ -12,6 +12,10 @@ import (
 // delivery. Bytes are copied into an internal buffer, capped at limit, as the
 // consumer reads them; onDone fires exactly once when the body ends.
 //
+// incomplete reports that the body stopped short of its end: capture overflowed
+// the limit, the stream failed, or the consumer closed it before EOF (a client
+// that disconnected mid-download). Either way the sample is only a prefix.
+//
 // This replaces reading a fixed prefix with io.ReadFull. ReadFull only returns
 // once the buffer is full or the stream ends, so a body that trickles — an SSE
 // feed, a chunked upload, a slow download — was withheld in full until the far
@@ -19,7 +23,7 @@ import (
 type bodySampler struct {
 	rc     io.ReadCloser
 	limit  int
-	onDone func(raw []byte, overflow bool)
+	onDone func(raw []byte, incomplete bool)
 
 	mu       sync.Mutex
 	buf      bytes.Buffer
@@ -27,7 +31,7 @@ type bodySampler struct {
 	fired    bool
 }
 
-func newBodySampler(rc io.ReadCloser, limit int, onDone func(raw []byte, overflow bool)) *bodySampler {
+func newBodySampler(rc io.ReadCloser, limit int, onDone func(raw []byte, incomplete bool)) *bodySampler {
 	return &bodySampler{rc: rc, limit: limit, onDone: onDone}
 }
 
@@ -48,19 +52,19 @@ func (s *bodySampler) Read(p []byte) (int, error) {
 		s.mu.Unlock()
 	}
 	if err != nil {
-		s.fire()
+		s.fire(err == io.EOF)
 	}
 	return n, err
 }
 
 func (s *bodySampler) Close() error {
-	s.fire()
+	s.fire(false) // a no-op if EOF was already seen
 	return s.rc.Close()
 }
 
 // fire delivers the sample once, whether the body ended in EOF, an error, or a
 // Close by a consumer that stopped reading early.
-func (s *bodySampler) fire() {
+func (s *bodySampler) fire(reachedEOF bool) {
 	s.mu.Lock()
 	if s.fired {
 		s.mu.Unlock()
@@ -69,12 +73,12 @@ func (s *bodySampler) fire() {
 	s.fired = true
 	raw := make([]byte, s.buf.Len())
 	copy(raw, s.buf.Bytes())
-	overflow := s.overflow
+	incomplete := s.overflow || !reachedEOF
 	cb := s.onDone
 	s.mu.Unlock()
 
 	if cb != nil {
-		cb(raw, overflow)
+		cb(raw, incomplete)
 	}
 }
 
@@ -91,8 +95,8 @@ func sampleBody(bodyp *io.ReadCloser, h http.Header, onDone func(bodyView)) {
 		onDone(bodyView{})
 		return
 	}
-	*bodyp = newBodySampler(*bodyp, limit, func(raw []byte, overflow bool) {
-		onDone(decodeBody(h, raw, overflow))
+	*bodyp = newBodySampler(*bodyp, limit, func(raw []byte, incomplete bool) {
+		onDone(decodeBody(h, raw, incomplete))
 	})
 }
 
@@ -106,9 +110,9 @@ func captureLimitFor(h http.Header) int {
 }
 
 // decodeBody turns captured bytes into a printable view, decoding
-// Content-Encoding when possible. overflow reports that more data followed the
-// captured prefix.
-func decodeBody(h http.Header, raw []byte, overflow bool) bodyView {
+// Content-Encoding when possible. incomplete reports that raw is only a prefix
+// of the body.
+func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 	if len(raw) == 0 {
 		return bodyView{}
 	}
@@ -118,14 +122,14 @@ func decodeBody(h http.Header, raw []byte, overflow bool) bodyView {
 
 	if !compressed {
 		if isPrintableContentType(h.Get("Content-Type")) {
-			return bodyView{Text: string(raw), Truncated: overflow}
+			return bodyView{Text: string(raw), Truncated: incomplete}
 		}
 		return bodyView{Text: binaryPlaceholder(raw)}
 	}
 
 	res, err := decompressBody(enc, raw)
 	if err == nil && isPrintableContentType(h.Get("Content-Type")) {
-		return bodyView{Text: string(res.Data), Truncated: res.Truncated || overflow}
+		return bodyView{Text: string(res.Data), Truncated: res.Truncated || incomplete}
 	}
 	return bodyView{Text: encodedPlaceholder(enc, raw)}
 }

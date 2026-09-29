@@ -14,7 +14,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -765,7 +767,7 @@ func TestSubprocessEnv_ClearsNoProxy(t *testing.T) {
 		"NO_PROXY=proxy.golang.org,pypi.org",
 		"no_proxy=proxy.golang.org,pypi.org",
 	}
-	env := subprocessEnv(base, "http://localhost:8080", "/tmp/ca.crt", "curl")
+	env := subprocessEnv(base, "http://localhost:8080", "/tmp/ca.crt")
 
 	// Later entries win in os/exec, so check the effective value of each key.
 	effective := map[string]string{}
@@ -787,20 +789,159 @@ func TestSubprocessEnv_ClearsNoProxy(t *testing.T) {
 	}
 }
 
-func TestSubprocessEnv_InjectsCABundleAndAWS(t *testing.T) {
-	for _, tc := range []struct {
-		cmdName string
-		wantAWS bool
-	}{{"curl", false}, {"aws", true}} {
-		env := subprocessEnv(nil, "http://localhost:1", "/tmp/ca.crt", tc.cmdName)
-		joined := strings.Join(env, "\n")
-		for _, k := range []string{"REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"} {
-			if !strings.Contains(joined, k+"=/tmp/ca.crt") {
-				t.Errorf("%s: %s not set to the CA bundle", tc.cmdName, k)
+// Regression: git and Node were not wired up. git's libcurl ignores
+// SSL_CERT_FILE and failed verification; Node's built-in fetch ignores the
+// proxy variables and bypassed httpmon entirely, capturing nothing. Inherited
+// values must be overridden too, or they point at a bundle without httpmon's CA.
+func TestSubprocessEnv_InjectsCABundleForEachTool(t *testing.T) {
+	base := []string{
+		"GIT_SSL_CAINFO=/etc/corp-ca.pem",
+		"CURL_CA_BUNDLE=/etc/corp-ca.pem",
+		"AWS_CA_BUNDLE=/etc/corp-ca.pem",
+	}
+	env := subprocessEnv(base, "http://localhost:1", "/tmp/ca.crt")
+
+	// Later entries win in os/exec, so check the effective value of each key.
+	effective := map[string]string{}
+	for _, kv := range env {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			effective[kv[:i]] = kv[i+1:]
+		}
+	}
+	for _, k := range []string{
+		"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT", "AWS_CA_BUNDLE",
+		"NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+		"CARGO_HTTP_CAINFO", "DENO_CERT",
+	} {
+		if effective[k] != "/tmp/ca.crt" {
+			t.Errorf("%s = %q, want the httpmon CA bundle", k, effective[k])
+		}
+	}
+	if effective["NODE_USE_ENV_PROXY"] != "1" {
+		t.Errorf("NODE_USE_ENV_PROXY = %q, want 1 so Node's fetch uses the proxy", effective["NODE_USE_ENV_PROXY"])
+	}
+}
+
+func TestIsLoopbackHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"127.0.0.1": true,
+		"127.0.0.5": true,
+		"::1":       true,
+		"localhost": true,
+		"LOCALHOST": true,
+		"0.0.0.0":   false,
+		"::":        false,
+		"":          false,
+		"192.0.2.1": false,
+		"example":   false,
+	} {
+		if got := isLoopbackHost(host); got != want {
+			t.Errorf("isLoopbackHost(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+// A wildcard bind cannot be dialled, and "localhost" may resolve to ::1 while
+// the listener is IPv4-only, so the wrapped command gets a literal address.
+func TestProxyDialHost(t *testing.T) {
+	for listen, want := range map[string]string{
+		"127.0.0.1": "127.0.0.1",
+		"localhost": "127.0.0.1",
+		"":          "127.0.0.1",
+		"0.0.0.0":   "127.0.0.1",
+		"::":        "::1",
+		"::1":       "::1",
+		"192.0.2.7": "192.0.2.7",
+	} {
+		if got := proxyDialHost(listen); got != want {
+			t.Errorf("proxyDialHost(%q) = %q, want %q", listen, got, want)
+		}
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent writes emitText makes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// Regression: response headers and bodies printed without a request number,
+// one fmt.Printf per line, so with concurrent requests neither could be matched
+// to its request. Every block now names its request and is written whole.
+func TestTextOutput_ConcurrentResponsesAreAttributable(t *testing.T) {
+	const n = 8
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Stagger replies so completion order differs from request order.
+		id := strings.TrimPrefix(r.URL.Path, "/")
+		if id == "1" || id == "3" {
+			time.Sleep(100 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "body-for-%s", id)
+	}))
+	defer upstream.Close()
+
+	out := &syncBuffer{}
+	savedOut := textOut
+	textOut = out
+	defer func() { textOut = savedOut }()
+
+	proxyURL, err := url.Parse("http://" + startTestProxy(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+	var wg sync.WaitGroup
+	for i := 1; i <= n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := client.Get(fmt.Sprintf("%s/%d", upstream.URL, i))
+			if err != nil {
+				t.Errorf("request %d: %v", i, err)
+				return
 			}
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()              //nolint:errcheck
+		}(i)
+	}
+	wg.Wait()
+
+	// Map each request number to the URL path it was assigned.
+	text := out.String()
+	pathOf := map[string]string{}
+	reqRe := regexp.MustCompile(`=== REQUEST #(\d+) ===\x1b\[0m\nTime: [^\n]*\nGET http://[^/]+/(\d+) `)
+	for _, m := range reqRe.FindAllStringSubmatch(text, -1) {
+		pathOf[m[1]] = m[2]
+	}
+	if len(pathOf) != n {
+		t.Fatalf("found %d intact request blocks, want %d; output:\n%s", len(pathOf), n, text)
+	}
+
+	bodyRe := regexp.MustCompile(`--- RESPONSE #(\d+) body ---\x1b\[0m\nbody-for-(\d+)\n`)
+	bodies := bodyRe.FindAllStringSubmatch(text, -1)
+	if len(bodies) != n {
+		t.Fatalf("found %d intact response body blocks, want %d; output:\n%s", len(bodies), n, text)
+	}
+	for _, m := range bodies {
+		if pathOf[m[1]] != m[2] {
+			t.Errorf("RESPONSE #%s carries the body for /%s, but request #%s was /%s", m[1], m[2], m[1], pathOf[m[1]])
 		}
-		if got := strings.Contains(joined, "AWS_CA_BUNDLE=/tmp/ca.crt"); got != tc.wantAWS {
-			t.Errorf("%s: AWS_CA_BUNDLE present = %v, want %v", tc.cmdName, got, tc.wantAWS)
-		}
+	}
+	if got := strings.Count(text, "=== RESPONSE #"); got != n {
+		t.Errorf("found %d numbered response headers, want %d", got, n)
 	}
 }

@@ -19,12 +19,14 @@ type harNameValue struct {
 type harPostData struct {
 	MimeType string `json:"mimeType"`
 	Text     string `json:"text"`
+	Comment  string `json:"comment,omitempty"`
 }
 
 type harContent struct {
 	Size     int64  `json:"size"`
 	MimeType string `json:"mimeType"`
 	Text     string `json:"text,omitempty"`
+	Comment  string `json:"comment,omitempty"`
 }
 
 type harRequest struct {
@@ -82,10 +84,17 @@ type harFile struct {
 var (
 	harEntries   []harEntry
 	harEntriesMu sync.Mutex
-
-	pendingHAR   = make(map[int]*harEntry)
-	pendingHARMu sync.Mutex
 )
+
+// harTruncatedComment marks a body HAR holds only a prefix of.
+const harTruncatedComment = "httpmon: body truncated; only a prefix was captured"
+
+func truncatedComment(v bodyView) string {
+	if v.Truncated {
+		return harTruncatedComment
+	}
+	return ""
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -115,58 +124,30 @@ func harQueryString(rawQuery string) []harNameValue {
 
 // ── Capture ──────────────────────────────────────────────────────────────────
 
-func addHARRequest(reqID int, f requestFacts, body string, startTime time.Time) {
+// addHAREntry appends one completed exchange to the HAR log.
+func addHAREntry(r capturedRequest, rs capturedResponse) {
+	rf, sf := r.facts, rs.facts
+
 	var postData *harPostData
-	if body != "" {
-		mt := f.headers.Get("Content-Type")
+	if r.body.Text != "" {
+		mt := rf.headers.Get("Content-Type")
 		if mt == "" {
 			mt = "application/octet-stream"
 		}
-		postData = &harPostData{MimeType: mt, Text: body}
+		postData = &harPostData{MimeType: mt, Text: r.body.Text, Comment: truncatedComment(r.body)}
 	}
 
 	var rawQuery string
-	if u, err := url.Parse(f.rawURL); err == nil {
+	if u, err := url.Parse(rf.rawURL); err == nil {
 		rawQuery = u.RawQuery
 	}
 
-	e := &harEntry{
-		StartedDateTime: startTime.UTC().Format(time.RFC3339Nano),
-		Request: harRequest{
-			Method:      f.method,
-			URL:         f.rawURL,
-			HTTPVersion: f.proto,
-			Headers:     harHeaders(f.headers),
-			QueryString: harQueryString(rawQuery),
-			Cookies:     []harNameValue{},
-			PostData:    postData,
-			HeadersSize: -1,
-			BodySize:    int64(len(body)),
-		},
-	}
-
-	pendingHARMu.Lock()
-	pendingHAR[reqID] = e
-	pendingHARMu.Unlock()
-}
-
-func addHARResponse(reqID int, f responseFacts, body string) {
-	pendingHARMu.Lock()
-	e, ok := pendingHAR[reqID]
-	if ok {
-		delete(pendingHAR, reqID)
-	}
-	pendingHARMu.Unlock()
-	if !ok {
-		return
-	}
-
-	mt := f.headers.Get("Content-Type")
+	mt := sf.headers.Get("Content-Type")
 	if mt == "" {
 		mt = "application/octet-stream"
 	}
 
-	statusText := f.statusText
+	statusText := sf.statusText
 	if len(statusText) > 4 {
 		statusText = statusText[4:] // strip "NNN "
 	}
@@ -174,35 +155,49 @@ func addHARResponse(reqID int, f responseFacts, body string) {
 	// content.size is the decoded size; bodySize is the bytes actually
 	// transferred, which is only known from Content-Length. -1 means unknown,
 	// as required by the HAR 1.2 spec.
-	contentSize := int64(len(body))
-	bodySize := f.contentLength
+	bodySize := sf.contentLength
 	if bodySize < 0 {
 		bodySize = -1
 	}
 
-	ms := float64(f.duration) / float64(time.Millisecond)
-	e.Time = ms
-	e.Response = harResponse{
-		Status:      f.status,
-		StatusText:  statusText,
-		HTTPVersion: f.proto,
-		Headers:     harHeaders(f.headers),
-		Cookies:     []harNameValue{},
-		Content: harContent{
-			Size:     contentSize,
-			MimeType: mt,
-			Text:     body,
+	ms := float64(sf.duration) / float64(time.Millisecond)
+	e := harEntry{
+		StartedDateTime: rf.startTime.UTC().Format(time.RFC3339Nano),
+		Time:            ms,
+		Request: harRequest{
+			Method:      rf.method,
+			URL:         rf.rawURL,
+			HTTPVersion: rf.proto,
+			Headers:     harHeaders(rf.headers),
+			QueryString: harQueryString(rawQuery),
+			Cookies:     []harNameValue{},
+			PostData:    postData,
+			HeadersSize: -1,
+			BodySize:    int64(len(r.body.Text)),
 		},
-		RedirectURL: f.headers.Get("Location"),
-		HeadersSize: -1,
-		BodySize:    bodySize,
+		Response: harResponse{
+			Status:      sf.status,
+			StatusText:  statusText,
+			HTTPVersion: sf.proto,
+			Headers:     harHeaders(sf.headers),
+			Cookies:     []harNameValue{},
+			Content: harContent{
+				Size:     int64(len(rs.body.Text)),
+				MimeType: mt,
+				Text:     rs.body.Text,
+				Comment:  truncatedComment(rs.body),
+			},
+			RedirectURL: sf.headers.Get("Location"),
+			HeadersSize: -1,
+			BodySize:    bodySize,
+		},
+		// httpmon measures only the total round trip; send/receive are not
+		// separable here, and -1 is the spec's "not applicable" value.
+		Timings: harTimings{Send: -1, Wait: ms, Receive: -1},
 	}
-	// httpmon measures only the total round trip; send/receive are not
-	// separable here, and -1 is the spec's "not applicable" value.
-	e.Timings = harTimings{Send: -1, Wait: ms, Receive: -1}
 
 	harEntriesMu.Lock()
-	harEntries = append(harEntries, *e)
+	harEntries = append(harEntries, e)
 	harEntriesMu.Unlock()
 }
 

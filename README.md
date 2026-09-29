@@ -17,16 +17,17 @@ Headers:
   User-Agent: curl/8.4.0
   Accept: */*
 
-=== RESPONSE ===
-HTTP/1.1 200 OK
+=== RESPONSE #1 ===
+HTTP/1.1 200 OK (212ms)
 
 Headers:
   Content-Type: application/json; charset=utf-8
   X-Ratelimit-Remaining: 59
 
-Body:
+--- RESPONSE #1 body ---
 {"login":"octocat","id":583231,...}
-------------------------------------------------------------
+
+---------------------------------------------------- #1 end
 ```
 
 ---
@@ -92,7 +93,8 @@ httpmon --replay <file> [--replay-target <url>]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `8080` | Proxy listen port. `0` picks a random free port. |
+| `--port` | `0` | Proxy listen port. `0` picks a random free port. |
+| `--listen` | `127.0.0.1` | Address the proxy listens on. Only loopback is safe: any other address lets anyone who can reach it use the proxy, including to reach services bound to this machine's loopback. |
 | `--filter` | _(none)_ | Case-insensitive substring; only matching requests are logged. Non-matching traffic is still proxied. |
 | `--format` | `text` | Output format: `text` or `json` (NDJSON). |
 | `--cert-ttl` | `1h` | How long per-host TLS certificates are cached. `0` disables caching. |
@@ -127,11 +129,19 @@ httpmon handles proxy configuration automatically for common tools:
 
 | Tool | What is injected |
 |------|------------------|
-| **curl** | `-x http://localhost:<port> --cacert <ca>` |
-| **aws** | `AWS_CA_BUNDLE` |
-| **Python requests** | `REQUESTS_CA_BUNDLE` |
-| **Node.js** | `NODE_EXTRA_CA_CERTS` |
+| **curl** | `-x http://127.0.0.1:<port> --cacert <ca>` (plus `CURL_CA_BUNDLE` for curl run from scripts) |
+| **aws** / boto3 | `AWS_CA_BUNDLE` |
+| **Python requests** / **pip** | `REQUESTS_CA_BUNDLE`, `PIP_CERT` |
+| **Node.js** | `NODE_EXTRA_CA_CERTS`, and `NODE_USE_ENV_PROXY=1` so the built-in `fetch` uses the proxy |
+| **git** | `GIT_SSL_CAINFO` |
+| **cargo** / **Deno** | `CARGO_HTTP_CAINFO` / `DENO_CERT` |
 | Any HTTP-proxy-aware tool | `HTTP_PROXY`, `HTTPS_PROXY`, `SSL_CERT_FILE` |
+
+These override any inherited value of the same name, which would otherwise
+point the tool at a bundle that lacks httpmon's CA. JVM tools read a
+truststore rather than a PEM file and are not configured automatically.
+`NODE_USE_ENV_PROXY` needs Node 22.21 or 24; older Node versions ignore it,
+and their built-in `fetch` bypasses httpmon.
 
 httpmon also clears `NO_PROXY` for the wrapped command. A host named in an
 inherited no-proxy list would otherwise skip httpmon and go uncaptured with no
@@ -183,7 +193,7 @@ httpmon --ui aws s3 ls
 ```
 
 ```
- httpmon  proxy :8080                              3 requests
+ httpmon  proxy :41873                             3 requests
  #     Method   Status  URL                          Duration
  1     GET      200     api.github.com/users/octocat  245ms
  2 ▶   POST     201     api.github.com/repos          123ms
@@ -224,14 +234,14 @@ httpmon automatically decompresses `gzip`, `deflate`, `brotli` (`br`) and `zstd`
 Chained encodings (`Content-Encoding: gzip, br`) are decoded layer by layer. An encoding httpmon does not recognise is shown as a `[<encoding>, N+ bytes]` placeholder rather than being printed raw.
 
 ```
-=== RESPONSE ===
-HTTP/1.1 200 OK
+=== RESPONSE #1 ===
+HTTP/1.1 200 OK (212ms)
 
 Headers:
   Content-Encoding: gzip
   Content-Type: application/json
 
-Body:
+--- RESPONSE #1 body ---
 {"login":"octocat","id":583231,...}   ← decoded automatically
 ```
 
@@ -300,6 +310,11 @@ Each line of the output file is a complete request/response pair:
   "duration_ms": 245
 }
 ```
+
+When a stored body is only a prefix — it exceeded `--max-capture`, or the
+stream was cut off before it ended — `req_body_truncated` or
+`resp_body_truncated` is `true`, and replay compares only that prefix. HAR
+entries carry the same information as a `comment` on the body.
 
 ---
 
@@ -384,8 +399,8 @@ httpmon --har trace.har curl https://api.github.com
 # Full session: TUI + HAR + filter
 httpmon --ui --har session.har --filter /api python3 app.py
 
-# Use a random port to avoid conflicts (useful in CI)
-httpmon --port 0 curl https://api.example.com
+# Accept connections from a container or VM (exposes the proxy to the network)
+httpmon --listen 0.0.0.0 --port 8080 python3 app.py
 ```
 
 ---

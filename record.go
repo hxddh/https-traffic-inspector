@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,16 +27,21 @@ type recordedExchange struct {
 	RespHeaders map[string]string `json:"resp_headers"`
 	RespBody    string            `json:"resp_body,omitempty"`
 	DurationMs  int64             `json:"duration_ms"`
+
+	// Set when the stored body is only a prefix: it exceeded --max-capture,
+	// or the stream was cut off before it ended.
+	ReqBodyTruncated  bool `json:"req_body_truncated,omitempty"`
+	RespBodyTruncated bool `json:"resp_body_truncated,omitempty"`
 }
 
 // recordFile is the open file used by the proxy when --record is active.
 var (
 	recordFile    *os.File
 	recordEncoder *json.Encoder
-
-	// pendingRecords buffers request data until the response arrives.
-	pendingRecords   = make(map[int]*recordedExchange)
-	pendingRecordsMu sync.Mutex
+	// recordMu serialises writes: exchanges complete concurrently, and a
+	// json.Encoder is not safe for concurrent use, so unguarded writes could
+	// interleave two records on one line.
+	recordMu sync.Mutex
 )
 
 // openRecordFile opens (or creates) the NDJSON recording file.
@@ -53,41 +57,25 @@ func openRecordFile(path string) error {
 	return nil
 }
 
-// recordRequestBody stores request data once its body has finished streaming.
-func recordRequestBody(reqID int, f requestFacts, body string) {
-	e := &recordedExchange{
-		ID:         reqID,
-		Time:       f.startTime.Format(time.RFC3339),
-		Method:     f.method,
-		URL:        f.rawURL,
-		ReqHeaders: flattenHeaders(f.headers),
-		ReqBody:    body,
+// writeRecord appends one completed exchange to the recording.
+func writeRecord(id int, r capturedRequest, rs capturedResponse) {
+	e := recordedExchange{
+		ID:                id,
+		Time:              r.facts.startTime.Format(time.RFC3339),
+		Method:            r.facts.method,
+		URL:               r.facts.rawURL,
+		ReqHeaders:        flattenHeaders(r.facts.headers),
+		ReqBody:           r.body.Text,
+		ReqBodyTruncated:  r.body.Truncated,
+		Status:            rs.facts.status,
+		StatusText:        rs.facts.statusText,
+		RespHeaders:       flattenHeaders(rs.facts.headers),
+		RespBody:          rs.body.Text,
+		RespBodyTruncated: rs.body.Truncated,
+		DurationMs:        rs.facts.duration.Milliseconds(),
 	}
-	pendingRecordsMu.Lock()
-	pendingRecords[reqID] = e
-	pendingRecordsMu.Unlock()
-}
-
-// recordResponseBody completes the pending entry and writes it to disk. It runs
-// after the response body has finished streaming, so the record is only written
-// once the whole exchange is known.
-func recordResponseBody(reqID int, f responseFacts, body string) {
-	pendingRecordsMu.Lock()
-	e, ok := pendingRecords[reqID]
-	if ok {
-		delete(pendingRecords, reqID)
-	}
-	pendingRecordsMu.Unlock() //nolint:govet
-	if !ok {
-		return
-	}
-
-	e.Status = f.status
-	e.StatusText = f.statusText
-	e.RespHeaders = flattenHeaders(f.headers)
-	e.RespBody = body
-	e.DurationMs = f.duration.Milliseconds()
-
+	recordMu.Lock()
+	defer recordMu.Unlock()
 	if recordEncoder != nil {
 		recordEncoder.Encode(e) //nolint:errcheck
 	}
@@ -127,16 +115,10 @@ func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff 
 	}
 	defer f.Close()
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			// Mirrors the proxy's policy so a recording captured from a
-			// self-signed or internal-CA host can still be replayed.
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureUpstream}, //nolint:gosec // opt-in via --insecure-upstream
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	// The proxy's own client, so replay follows the same verification policy
+	// and upstream proxy: a recording from a self-signed host, or one taken
+	// behind an egress proxy, must still be replayable.
+	client := newUpstreamClient(insecureUpstream)
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
@@ -245,7 +227,12 @@ func replayOne(client *http.Client, ex *recordedExchange, targetBase string) rep
 	res.StatusMatch = resp.StatusCode == ex.Status
 
 	newBody := strings.TrimSpace(decodeForCompare(resp.Header, respBody))
-	res.BodyMatch = strings.TrimSpace(ex.RespBody) == newBody
+	if ex.RespBodyTruncated {
+		// Only a prefix was recorded, so only a prefix can be compared.
+		res.BodyMatch = strings.HasPrefix(newBody, strings.TrimSpace(ex.RespBody))
+	} else {
+		res.BodyMatch = strings.TrimSpace(ex.RespBody) == newBody
+	}
 
 	emitReplayResult(res, newBody)
 	return res
