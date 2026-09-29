@@ -1007,6 +1007,34 @@ func subprocessEnv(base []string, proxyURL, caCertPath, cmdName string) []string
 	return env
 }
 
+// isLoopbackHost reports whether a listen address only accepts local
+// connections. "localhost" counts: it resolves to loopback addresses.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// proxyDialHost returns the host the wrapped command should dial to reach a
+// proxy listening on listenHost. An unspecified (wildcard) address accepts
+// connections but cannot be dialled, so loopback stands in for it. A literal
+// IP is used rather than "localhost", which may resolve to ::1 while the
+// listener is IPv4-only.
+func proxyDialHost(listenHost string) string {
+	if listenHost == "" || strings.EqualFold(listenHost, "localhost") {
+		return "127.0.0.1"
+	}
+	if ip := net.ParseIP(listenHost); ip != nil && ip.IsUnspecified() {
+		if ip.To4() != nil {
+			return "127.0.0.1"
+		}
+		return "::1"
+	}
+	return listenHost
+}
+
 func main() { os.Exit(run()) }
 
 // run holds the whole program body so that every exit path returns a code
@@ -1014,7 +1042,8 @@ func main() { os.Exit(run()) }
 func run() int {
 	defer runCleanups()
 
-	portFlag := flag.String("port", "8080", "proxy listen port; use 0 to pick a random free port")
+	portFlag := flag.String("port", "0", "proxy listen port; 0 picks a random free port")
+	listenFlag := flag.String("listen", "127.0.0.1", "address the proxy listens on; anything other than loopback exposes it to the network")
 	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
 	formatFlag := flag.String("format", "text", "output format: text | json")
 	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
@@ -1127,12 +1156,20 @@ func run() int {
 	}
 	addCleanup(func() { os.Remove(caCertPath) }) //nolint:errcheck
 
-	ln, err := net.Listen("tcp", ":"+*portFlag)
+	listenAddr := net.JoinHostPort(*listenFlag, *portFlag)
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: failed to bind proxy on :%s: %v\n", *portFlag, err)
+		fmt.Fprintf(os.Stderr, "httpmon: failed to bind proxy on %s: %v\n", listenAddr, err)
 		return 1
 	}
 	proxyPort = strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	if !isLoopbackHost(*listenFlag) {
+		fmt.Fprintf(os.Stderr,
+			"httpmon: WARNING: proxy listening on %s is reachable from the network; anyone who can reach it can use it, including to reach services bound to this machine's loopback\n",
+			ln.Addr())
+	}
+	// What the wrapped command dials. A wildcard bind is reached via loopback.
+	proxyURL := "http://" + net.JoinHostPort(proxyDialHost(*listenFlag), proxyPort)
 
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1150,7 +1187,7 @@ func run() int {
 
 	go func() {
 		if !jsonMode {
-			fmt.Printf("Starting MITM proxy on :%s\n", proxyPort)
+			fmt.Printf("Starting MITM proxy on %s\n", ln.Addr())
 			fmt.Printf("CA bundle written to: %s\n", caCertPath)
 			if sysCA := systemCABundle(); sysCA != "" {
 				fmt.Printf("System CA bundle merged from: %s\n", sysCA)
@@ -1189,7 +1226,7 @@ func run() int {
 
 		newArgs := []string{cmdArgs[0]}
 		if !hasProxy {
-			newArgs = append(newArgs, "-x", "http://localhost:"+proxyPort)
+			newArgs = append(newArgs, "-x", proxyURL)
 		}
 		if !hasCACert && !hasInsecure {
 			newArgs = append(newArgs, "--cacert", caCertPath)
@@ -1200,7 +1237,6 @@ func run() int {
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 
-	proxyURL := "http://localhost:" + proxyPort
 	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath, cmdName)
 
 	if tuiMode {

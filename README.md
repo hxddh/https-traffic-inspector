@@ -92,7 +92,8 @@ httpmon --replay <file> [--replay-target <url>]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `8080` | Proxy listen port. `0` picks a random free port. |
+| `--port` | `0` | Proxy listen port. `0` picks a random free port. |
+| `--listen` | `127.0.0.1` | Address the proxy listens on. Only loopback is safe: any other address lets anyone who can reach it use the proxy, including to reach services bound to this machine's loopback. |
 | `--filter` | _(none)_ | Case-insensitive substring; only matching requests are logged. Non-matching traffic is still proxied. |
 | `--format` | `text` | Output format: `text` or `json` (NDJSON). |
 | `--cert-ttl` | `1h` | How long per-host TLS certificates are cached. `0` disables caching. |
@@ -127,7 +128,7 @@ httpmon handles proxy configuration automatically for common tools:
 
 | Tool | What is injected |
 |------|------------------|
-| **curl** | `-x http://localhost:<port> --cacert <ca>` |
+| **curl** | `-x http://127.0.0.1:<port> --cacert <ca>` |
 | **aws** | `AWS_CA_BUNDLE` |
 | **Python requests** | `REQUESTS_CA_BUNDLE` |
 | **Node.js** | `NODE_EXTRA_CA_CERTS` |
@@ -183,7 +184,7 @@ httpmon --ui aws s3 ls
 ```
 
 ```
- httpmon  proxy :8080                              3 requests
+ httpmon  proxy :41873                             3 requests
  #     Method   Status  URL                          Duration
  1     GET      200     api.github.com/users/octocat  245ms
  2 ▶   POST     201     api.github.com/repos          123ms

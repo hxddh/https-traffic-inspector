@@ -804,3 +804,40 @@ func TestSubprocessEnv_InjectsCABundleAndAWS(t *testing.T) {
 		}
 	}
 }
+
+func TestIsLoopbackHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"127.0.0.1": true,
+		"127.0.0.5": true,
+		"::1":       true,
+		"localhost": true,
+		"LOCALHOST": true,
+		"0.0.0.0":   false,
+		"::":        false,
+		"":          false,
+		"192.0.2.1": false,
+		"example":   false,
+	} {
+		if got := isLoopbackHost(host); got != want {
+			t.Errorf("isLoopbackHost(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+// A wildcard bind cannot be dialled, and "localhost" may resolve to ::1 while
+// the listener is IPv4-only, so the wrapped command gets a literal address.
+func TestProxyDialHost(t *testing.T) {
+	for listen, want := range map[string]string{
+		"127.0.0.1": "127.0.0.1",
+		"localhost": "127.0.0.1",
+		"":          "127.0.0.1",
+		"0.0.0.0":   "127.0.0.1",
+		"::":        "::1",
+		"::1":       "::1",
+		"192.0.2.7": "192.0.2.7",
+	} {
+		if got := proxyDialHost(listen); got != want {
+			t.Errorf("proxyDialHost(%q) = %q, want %q", listen, got, want)
+		}
+	}
+}
