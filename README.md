@@ -39,7 +39,8 @@ No system configuration is changed, and the temporary CA bundle is removed when 
 
 - **HTTP** — forwarded and logged transparently
 - **HTTPS** — intercepted via TLS termination with a per-host certificate signed by the ephemeral CA
-- **WebSocket (`wss://`)** — upgrade handshake is proxied and frames are spliced bidirectionally
+- **HTTP/2 and gRPC** — negotiated with the client via ALPN and with the upstream independently; trailers are carried through, and gRPC calls show their status
+- **WebSocket (`wss://` and `ws://`)** — upgrade handshake is proxied and frames are spliced bidirectionally
 - **Body display** — compressed responses (gzip, deflate, brotli, zstd) are decompressed automatically; only the first 1 KB is shown by default, the full stream is forwarded unmodified
 - **HAR export** — all captured traffic can be written to an HTTP Archive (`.har`) file on exit
 
@@ -135,6 +136,7 @@ httpmon handles proxy configuration automatically for common tools:
 | **Node.js** | `NODE_EXTRA_CA_CERTS`, and `NODE_USE_ENV_PROXY=1` so the built-in `fetch` uses the proxy |
 | **git** | `GIT_SSL_CAINFO` |
 | **cargo** / **Deno** | `CARGO_HTTP_CAINFO` / `DENO_CERT` |
+| **gRPC C-core** (Python `grpcio`, Ruby, PHP) | `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` |
 | Any HTTP-proxy-aware tool | `HTTP_PROXY`, `HTTPS_PROXY`, `SSL_CERT_FILE` |
 
 These override any inherited value of the same name, which would otherwise
@@ -267,9 +269,47 @@ immediately.
 
 ---
 
+### HTTP/2 and gRPC
+
+httpmon offers HTTP/2 to the wrapped command through ALPN and negotiates it
+with the upstream separately, so each side gets the best protocol it
+supports — an HTTP/2 client talking to an HTTP/1.1-only server works, and so
+does the reverse. Response trailers are forwarded, and `TE: trailers` is kept,
+which is what gRPC needs to work end to end.
+
+Inside a `CONNECT` tunnel httpmon also accepts cleartext HTTP/2 with prior
+knowledge. That is how an insecure gRPC client (`grpc.insecure_channel`,
+`grpc.WithTransportCredentials(insecure.NewCredentials())`) talks through a
+proxy, and the request goes upstream the same way.
+
+gRPC messages are length-prefixed binary, so bodies are summarised rather than
+printed, and the call's status is decoded from the trailers:
+
+```
+=== RESPONSE #2 ===
+HTTP/2.0 200 OK (1ms)
+
+Headers:
+  Content-Type: application/grpc
+
+--- RESPONSE #2 body ---
+[gRPC: 1 message, 0 payload bytes]
+
+Trailers:
+  Grpc-Status: 5
+
+gRPC status: 5 NOT_FOUND
+```
+
+`--format json` reports trailers in a `trailers` field, and `--record` in
+`resp_trailers`. gRPC C-core clients (Python `grpcio`, Ruby, PHP) get
+`GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` so they trust httpmon's CA.
+
+---
+
 ### WebSocket support
 
-`wss://` connections established via CONNECT tunnels are handled transparently. The upgrade handshake is proxied and logged; after the 101 response, frames are spliced bidirectionally between client and upstream without buffering.
+`wss://` connections established via CONNECT tunnels, and plaintext `ws://` upgrades sent to the proxy, are handled transparently. The upgrade handshake is proxied and logged; after the 101 response, frames are spliced bidirectionally between client and upstream without buffering.
 
 ```bash
 httpmon node ws-client.js          # wss:// connections work automatically
@@ -407,8 +447,10 @@ httpmon --listen 0.0.0.0 --port 8080 python3 app.py
 
 ## Limitations
 
-- **HTTP/1.1 only.** Traffic is not negotiated over HTTP/2: the MITM listener does not advertise `h2` via ALPN, and the upstream transport does not enable HTTP/2. Clients that would otherwise use HTTP/2 are silently downgraded, and **gRPC does not work through httpmon**.
-- **Plaintext `ws://` is not supported.** Only `wss://` (established through a `CONNECT` tunnel) is proxied. A cleartext WebSocket upgrade is routed through the ordinary HTTP path, which cannot complete the `101` handshake.
+- **Go programs skip the proxy for loopback targets.** Go's `ProxyFromEnvironment`, which grpc-go and `net/http` both use, never proxies `localhost` or `127.0.0.1`, so a Go client calling a local server is not captured. Clients in other languages are unaffected.
+- **gRPC bodies are summarised, not decoded.** httpmon has no `.proto` schemas, so it shows message counts and sizes. Recordings of gRPC calls store that summary, so `--replay` cannot re-send them.
+- **WebSocket over HTTP/2 (RFC 8441) is not supported.** Clients fall back to an HTTP/1.1 connection for the upgrade, which works.
+- **Cleartext HTTP/2 cannot be sent through `--upstream-proxy`.** An insecure gRPC call to an upstream reached only via another proxy fails.
 - **`--har` does not apply to `--replay`.** Replay mode neither starts the proxy nor captures entries.
 - **Bodies are logged when they finish, not when their headers arrive.** Request and response headers print as soon as they are seen, so a long-lived stream is visible while it runs, but its body is only shown once the stream ends. `--format json` and `--record` emit one complete record per exchange, so for a stream that record appears at the end.
 - **Bodies are capped.** Output shows `--max-body` bytes; `--record` / `--har` / decompression keep `--max-capture` bytes. Raising `--max-capture` increases per-request memory use, since each captured body is buffered in full.

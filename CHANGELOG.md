@@ -4,6 +4,43 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-09-29
+
+### Added
+
+- **HTTP/2 and gRPC.** httpmon now offers HTTP/2 to the wrapped command via
+  ALPN and negotiates it with the upstream independently, instead of silently
+  downgrading everything to HTTP/1.1. Response trailers are forwarded and
+  `TE: trailers` is kept, so gRPC works end to end. Measured with a real
+  Python `grpcio` client and server: through 1.3.0 every call failed with
+  `UNAVAILABLE`, both over TLS and in the clear; through 1.4.0 both succeed,
+  and httpmon shows each call.
+- Cleartext HTTP/2 with prior knowledge inside `CONNECT` tunnels — how an
+  insecure gRPC client talks through a proxy — relayed to the upstream the
+  same way. Cleartext HTTP/1.1 inside a tunnel works too.
+- gRPC-aware output: bodies are summarised by message count and size, and the
+  call's status is decoded from the trailers (`gRPC status: 5 NOT_FOUND`).
+- Response trailers in every output: a `Trailers:` block in text, `trailers`
+  in `--format json`, `resp_trailers` in `--record`, and the TUI detail panel.
+- Plaintext `ws://` WebSocket upgrades, previously unsupported.
+- `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` for gRPC C-core clients (Python
+  `grpcio`, Ruby, PHP), which ship their own trust roots.
+
+### Changed
+
+- Requests inside `CONNECT` tunnels are now served by Go's standard HTTP
+  server rather than a hand-written HTTP/1.1 read loop. It brings HTTP/2 with
+  it and handles `Expect: 100-continue`, keep-alive and response framing, each
+  of which the old loop had to patch by hand.
+- A client that disconnects now cancels its upstream request.
+
+### Fixed
+
+- An empty `POST`/`PUT` sent over HTTP/2 (`content-length: 0`, as
+  `curl --http2 -d ""` sends it) reached the upstream as
+  `Transfer-Encoding: chunked` — the 1.2.2 fix applied only to HTTP/1.1
+  clients. Found while testing this release, before it shipped.
+
 ## [1.3.0] - 2026-09-29
 
 ### ⚠ Breaking
