@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-09-29
+
+### Fixed
+
+- **An empty `POST` or `PUT` was forwarded upstream as
+  `Transfer-Encoding: chunked`** instead of `Content-Length: 0`, a regression
+  from 1.2.0. The streaming body sampler also wrapped `http.NoBody`, so the
+  upstream transport no longer recognised the body as empty and fell back to
+  chunked framing. Servers that reject chunked requests — S3 among them —
+  failed calls that worked without httpmon, such as starting a multipart
+  upload. Empty bodies are now left untouched, and requests are framed exactly
+  as the client sent them.
+
 ## [1.2.1] - 2026-08-04
 
 ### Fixed

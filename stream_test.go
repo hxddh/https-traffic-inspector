@@ -185,3 +185,67 @@ func proxiedClient(t *testing.T) (*http.Client, func()) {
 	}
 	return &http.Client{Timeout: 30 * time.Second, Transport: tr}, tr.CloseIdleConnections
 }
+
+// Regression: sampleBody wrapped http.NoBody, so the transport saw a body of
+// unknown length and forwarded an empty POST or PUT as Transfer-Encoding:
+// chunked instead of Content-Length: 0. Servers such as S3 reject that.
+func TestEmptyBodyKeepsContentLengthFraming(t *testing.T) {
+	type framing struct {
+		te []string
+		cl int64
+	}
+	seen := make(chan framing, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- framing{te: r.TransferEncoding, cl: r.ContentLength}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	savedClient := upstreamClient
+	upstreamClient = newUpstreamClient(true)
+	defer func() { upstreamClient = savedClient }()
+
+	plain := httptest.NewServer(handler)
+	defer plain.Close()
+	tlsSrv := httptest.NewTLSServer(handler)
+	defer tlsSrv.Close()
+
+	proxyURL, err := url.Parse("http://" + startTestProxy(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpClient := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	httpsClient, cleanup := proxiedClient(t)
+	defer cleanup()
+
+	cases := []struct {
+		name   string
+		client *http.Client
+		url    string
+	}{
+		{"http", httpClient, plain.URL},
+		{"https", httpsClient, tlsSrv.URL},
+	}
+	for _, c := range cases {
+		for _, method := range []string{http.MethodPost, http.MethodPut} {
+			t.Run(c.name+"/"+method, func(t *testing.T) {
+				req, err := http.NewRequest(method, c.url+"/empty", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp, err := c.client.Do(req)
+				if err != nil {
+					t.Fatalf("request failed: %v", err)
+				}
+				resp.Body.Close() //nolint:errcheck
+
+				got := <-seen
+				if len(got.te) != 0 {
+					t.Errorf("upstream saw Transfer-Encoding %v; an empty body must be sent with Content-Length: 0", got.te)
+				}
+				if got.cl != 0 {
+					t.Errorf("upstream saw ContentLength %d, want 0", got.cl)
+				}
+			})
+		}
+	}
+}
