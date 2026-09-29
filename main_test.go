@@ -182,7 +182,7 @@ func TestBodySampler_PassesDataThroughUnchanged(t *testing.T) {
 	var got bodyView
 	h := http.Header{}
 	h.Set("Content-Type", "text/plain")
-	sampleBody(&rc, h, func(v bodyView) { got = v })
+	sampleBody(&rc, h, -1, func(v bodyView) { got = v })
 
 	forwarded, _ := io.ReadAll(rc)
 	if string(forwarded) != original {
@@ -207,7 +207,7 @@ func TestBodySampler_CapsAtLimit(t *testing.T) {
 	var got bodyView
 	h := http.Header{}
 	h.Set("Content-Type", "text/plain")
-	sampleBody(&rc, h, func(v bodyView) { got = v })
+	sampleBody(&rc, h, -1, func(v bodyView) { got = v })
 
 	forwarded, _ := io.ReadAll(rc)
 	if string(forwarded) != payload {
@@ -226,7 +226,7 @@ func TestBodySampler_EmptyBody(t *testing.T) {
 	rc := io.NopCloser(strings.NewReader(""))
 	fired := 0
 	var got bodyView
-	sampleBody(&rc, http.Header{}, func(v bodyView) { fired++; got = v })
+	sampleBody(&rc, http.Header{}, -1, func(v bodyView) { fired++; got = v })
 
 	io.ReadAll(rc) //nolint:errcheck
 	rc.Close()     //nolint:errcheck
@@ -241,7 +241,7 @@ func TestBodySampler_EmptyBody(t *testing.T) {
 func TestBodySampler_NilBodyFiresImmediately(t *testing.T) {
 	var rc io.ReadCloser
 	fired := 0
-	sampleBody(&rc, http.Header{}, func(bodyView) { fired++ })
+	sampleBody(&rc, http.Header{}, -1, func(bodyView) { fired++ })
 	if fired != 1 {
 		t.Errorf("onDone fired %d times, want 1 for a nil body", fired)
 	}
@@ -254,7 +254,7 @@ func TestBodySampler_FiresOnCloseWithoutEOF(t *testing.T) {
 	fired := 0
 	h := http.Header{}
 	h.Set("Content-Type", "text/plain")
-	sampleBody(&rc, h, func(bodyView) { fired++ })
+	sampleBody(&rc, h, -1, func(bodyView) { fired++ })
 
 	io.CopyN(io.Discard, rc, 10) //nolint:errcheck
 	rc.Close()                   //nolint:errcheck
@@ -268,7 +268,7 @@ func TestBodySampler_FiresOnlyOnce(t *testing.T) {
 	fired := 0
 	h := http.Header{}
 	h.Set("Content-Type", "text/plain")
-	sampleBody(&rc, h, func(bodyView) { fired++ })
+	sampleBody(&rc, h, -1, func(bodyView) { fired++ })
 
 	io.ReadAll(rc) //nolint:errcheck
 	rc.Close()     //nolint:errcheck

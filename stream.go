@@ -23,22 +23,25 @@ import (
 type bodySampler struct {
 	rc     io.ReadCloser
 	limit  int
+	expect int64 // declared length, or -1 when unknown
 	onDone func(raw []byte, incomplete bool)
 
 	mu       sync.Mutex
 	buf      bytes.Buffer
+	total    int64
 	overflow bool
 	fired    bool
 }
 
-func newBodySampler(rc io.ReadCloser, limit int, onDone func(raw []byte, incomplete bool)) *bodySampler {
-	return &bodySampler{rc: rc, limit: limit, onDone: onDone}
+func newBodySampler(rc io.ReadCloser, limit int, expect int64, onDone func(raw []byte, incomplete bool)) *bodySampler {
+	return &bodySampler{rc: rc, limit: limit, expect: expect, onDone: onDone}
 }
 
 func (s *bodySampler) Read(p []byte) (int, error) {
 	n, err := s.rc.Read(p)
 	if n > 0 {
 		s.mu.Lock()
+		s.total += int64(n)
 		if room := s.limit - s.buf.Len(); room > 0 {
 			if n <= room {
 				s.buf.Write(p[:n])
@@ -73,7 +76,10 @@ func (s *bodySampler) fire(reachedEOF bool) {
 	s.fired = true
 	raw := make([]byte, s.buf.Len())
 	copy(raw, s.buf.Bytes())
-	incomplete := s.overflow || !reachedEOF
+	// A body that delivered its whole declared length is complete even if
+	// its consumer stopped before reading EOF.
+	whole := reachedEOF || (s.expect >= 0 && s.total == s.expect)
+	incomplete := s.overflow || !whole
 	cb := s.onDone
 	s.mu.Unlock()
 
@@ -85,7 +91,7 @@ func (s *bodySampler) fire(reachedEOF bool) {
 // sampleBody installs a sampler on *bodyp and returns. onDone is invoked when
 // the body completes — immediately when there is no body at all, so callers can
 // rely on it firing exactly once.
-func sampleBody(bodyp *io.ReadCloser, h http.Header, onDone func(bodyView)) {
+func sampleBody(bodyp *io.ReadCloser, h http.Header, length int64, onDone func(bodyView)) {
 	limit := captureLimitFor(h)
 
 	// http.NoBody must stay as it is. Wrapped, it no longer reads as empty to
@@ -95,7 +101,7 @@ func sampleBody(bodyp *io.ReadCloser, h http.Header, onDone func(bodyView)) {
 		onDone(bodyView{})
 		return
 	}
-	*bodyp = newBodySampler(*bodyp, limit, func(raw []byte, incomplete bool) {
+	*bodyp = newBodySampler(*bodyp, limit, length, func(raw []byte, incomplete bool) {
 		onDone(decodeBody(h, raw, incomplete))
 	})
 }

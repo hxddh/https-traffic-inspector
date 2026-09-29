@@ -106,12 +106,20 @@ type replayResult struct {
 	BodyMatch      bool   `json:"body_match"`
 	DurationMs     int64  `json:"duration_ms"`
 	Err            string `json:"error,omitempty"`
+	// Skipped explains why the exchange was not re-sent.
+	Skipped string `json:"skipped,omitempty"`
 }
 
 // Differs reports whether the replayed response deviated from the recording.
 func (r replayResult) Differs() bool {
+	if r.Skipped != "" {
+		return false
+	}
 	return r.Err != "" || !r.StatusMatch || !r.BodyMatch
 }
+
+// grpcReplaySkip is why recorded gRPC calls are not replayed.
+const grpcReplaySkip = "gRPC call: the recording holds a summary of its binary body, not the bytes"
 
 // replayFile reads an NDJSON recording and replays each exchange.
 // If targetBase is non-empty it is used as the URL prefix (scheme+host),
@@ -135,7 +143,7 @@ func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 
-	n, errs, diffs := 0, 0, 0
+	n, errs, diffs, skipped := 0, 0, 0, 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -157,6 +165,9 @@ func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff 
 		if res.Differs() {
 			diffs++
 		}
+		if res.Skipped != "" {
+			skipped++
+		}
 		n++
 	}
 	if err := scanner.Err(); err != nil {
@@ -164,8 +175,8 @@ func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff 
 		return 1
 	}
 	if !jsonMode {
-		fmt.Printf("\n%s replayed %d request(s), %d error(s), %d diff(s)\n",
-			strings.Repeat("─", 60), n, errs, diffs)
+		fmt.Printf("\n%s replayed %d request(s), %d error(s), %d diff(s), %d skipped\n",
+			strings.Repeat("─", 60), n-skipped, errs, diffs, skipped)
 	}
 	if errs > 0 {
 		return 1
@@ -204,6 +215,14 @@ func replayOne(client *http.Client, ex *recordedExchange, targetBase string) rep
 		fmt.Printf("\n\033[36m── REPLAY #%d ──\033[0m\n", ex.ID)
 		fmt.Printf("Original:  %s %s  →  %s\n", ex.Method, ex.URL, ex.StatusText)
 		fmt.Printf("Replaying: %s %s\n", ex.Method, replayURL)
+	}
+
+	// Re-sending the summary text as a request body would send the server
+	// garbage and report a spurious difference.
+	if isGRPCContentType(ex.ReqHeaders["Content-Type"]) {
+		res.Skipped = grpcReplaySkip
+		emitReplayResult(res, "")
+		return res
 	}
 
 	var bodyReader io.Reader
@@ -275,6 +294,10 @@ func emitReplayResult(res replayResult, newBody string) {
 		return
 	}
 
+	if res.Skipped != "" {
+		fmt.Printf("  \033[33mSKIP\033[0m: %s\n", res.Skipped)
+		return
+	}
 	if res.Err != "" {
 		fmt.Fprintf(os.Stderr, "  \033[31mFAIL\033[0m: %v\n", res.Err)
 		return
