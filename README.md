@@ -448,7 +448,8 @@ httpmon --listen 0.0.0.0 --port 8080 python3 app.py
 ## Limitations
 
 - **Go programs skip the proxy for loopback targets.** Go's `ProxyFromEnvironment`, which grpc-go and `net/http` both use, never proxies `localhost` or `127.0.0.1`, so a Go client calling a local server is not captured. Clients in other languages are unaffected.
-- **gRPC bodies are summarised, not decoded.** httpmon has no `.proto` schemas, so it shows message counts and sizes. Recordings of gRPC calls store that summary, so `--replay` cannot re-send them.
+- **gRPC bodies are summarised, not decoded.** httpmon has no `.proto` schemas, so it shows message counts and sizes. Recordings of gRPC calls store that summary, so `--replay` skips them.
+- **Only HTTP is inspected.** A `CONNECT` tunnel carrying another protocol (SSH, SMTP, database wire protocols) is relayed untouched and noted as such. A server-first protocol waits up to one second before httpmon concludes the client is not going to speak.
 - **WebSocket over HTTP/2 (RFC 8441) is not supported.** Clients fall back to an HTTP/1.1 connection for the upgrade, which works.
 - **Cleartext HTTP/2 cannot be sent through `--upstream-proxy`.** An insecure gRPC call to an upstream reached only via another proxy fails.
 - **`--har` does not apply to `--replay`.** Replay mode neither starts the proxy nor captures entries.

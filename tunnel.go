@@ -14,16 +14,35 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // ---- forwarding ----
+
+// inflight counts exchanges still being relayed. The wrapped command can see
+// the last byte of a response before httpmon has read the upstream's
+// end-of-stream -- with an HTTP/2 upstream they arrive separately -- so
+// when the command exits, its final exchange may not be logged, recorded or
+// added to the HAR yet.
+var inflight atomic.Int64
+
+// drainInflight waits, up to max, for in-flight exchanges to finish.
+func drainInflight(max time.Duration) {
+	deadline := time.Now().Add(max)
+	for inflight.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
 
 // forwardRequest sends req upstream through client and relays the response to
 // w. Every proxied request takes this path, whether it arrived as a plain
 // proxy request or inside a CONNECT tunnel, over HTTP/1.1 or HTTP/2.
 // req.URL must already be absolute.
 func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Client) {
+	inflight.Add(1)
+	defer inflight.Add(-1)
+
 	// A body known to be empty must reach the transport as http.NoBody, or it
 	// reads as "length unknown" and goes upstream as Transfer-Encoding:
 	// chunked, which S3 and others reject. HTTP/1.1 servers already hand one
@@ -66,11 +85,14 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
-
 	if shouldLog {
 		logResponse(resp, reqID)
 	}
+	// Close whatever resp.Body is by now: logResponse wraps it in a sampler,
+	// and a deferred resp.Body.Close() bound earlier would close the original
+	// underneath it. The sampler would then never report, and an exchange
+	// whose copy stopped short of EOF was never logged or recorded at all.
+	defer func() { resp.Body.Close() }() //nolint:errcheck
 
 	h := w.Header()
 	for k, v := range resp.Header {
@@ -191,21 +213,34 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The first byte tells TLS (a handshake record) from cleartext.
+	// The first byte tells TLS (a handshake record) from cleartext. A client
+	// that sends nothing is waiting for the server to speak first (SMTP, SSH,
+	// MySQL…): that is not HTTP, so the tunnel is relayed untouched.
 	br := bufio.NewReader(clientConn)
-	clientConn.SetReadDeadline(time.Now().Add(tunnelSetupTimeout)) //nolint:errcheck
+	conn := &bufferedConn{Conn: clientConn, r: br}
+	clientConn.SetReadDeadline(time.Now().Add(clientFirstByteWait)) //nolint:errcheck
 	first, err := br.Peek(1)
 	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			clientConn.SetReadDeadline(time.Time{}) //nolint:errcheck
+			relayOpaque(conn, r.Host, host)
+			return
+		}
 		clientConn.Close() //nolint:errcheck
 		return
 	}
-	conn := &bufferedConn{Conn: clientConn, r: br}
 
 	if first[0] != tlsHandshakeRecord {
 		clientConn.SetReadDeadline(time.Time{}) //nolint:errcheck
+		if !looksLikeHTTP(first[0]) {
+			relayOpaque(conn, r.Host, host)
+			return
+		}
 		plainTunnels.serve(conn, r.Host)
 		return
 	}
+	clientConn.SetReadDeadline(time.Now().Add(tunnelSetupTimeout)) //nolint:errcheck
 
 	cert, err := generateCert(host)
 	if err != nil {
@@ -229,7 +264,53 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 const (
 	tlsHandshakeRecord = 0x16
 	tunnelSetupTimeout = 30 * time.Second
+	// clientFirstByteWait is how long a tunnel may stay silent before it is
+	// taken to carry a server-first protocol. TLS and HTTP clients speak
+	// immediately after the CONNECT response.
+	clientFirstByteWait = time.Second
 )
+
+// looksLikeHTTP reports whether a cleartext tunnel opens like HTTP: a method
+// token (GET, POST…) or the HTTP/2 preface "PRI", all uppercase ASCII.
+func looksLikeHTTP(first byte) bool {
+	return first >= 'A' && first <= 'Z'
+}
+
+// relayOpaque splices a tunnel that does not carry HTTP straight to its
+// target. Breaking it would break the wrapped command for traffic httpmon
+// cannot show anyway.
+func relayOpaque(client net.Conn, target, host string) {
+	if !jsonMode && !tuiMode {
+		emitText(fmt.Sprintf("\033[33m    %s: not HTTP, relayed without inspection\033[0m\n\n", target))
+	}
+	up, err := dialUpstream(target, host, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon: tunnel to %s failed: %v\n", target, err)
+		client.Close() //nolint:errcheck
+		return
+	}
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(up, client); closeWrite(up); done <- struct{}{} }()     //nolint:errcheck
+	go func() { io.Copy(client, up); closeWrite(client); done <- struct{}{} }() //nolint:errcheck
+	<-done
+	<-done
+	up.Close()     //nolint:errcheck
+	client.Close() //nolint:errcheck
+}
+
+// closeWrite half-closes c when it supports it, so each direction of a
+// relay can finish independently; otherwise it closes c entirely.
+func closeWrite(c net.Conn) {
+	type closeWriter interface{ CloseWrite() error }
+	if bc, ok := c.(*bufferedConn); ok {
+		c = bc.Conn
+	}
+	if cw, ok := c.(closeWriter); ok {
+		cw.CloseWrite() //nolint:errcheck
+		return
+	}
+	c.Close() //nolint:errcheck
+}
 
 // bufferedConn is a net.Conn whose reads first drain the bytes peeked to
 // classify the tunnel.

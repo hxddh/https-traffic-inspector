@@ -4,6 +4,35 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-09-29
+
+### Fixed
+
+- **An exchange could vanish from the output, `--record` and `--har`.** The
+  response body was wrapped in the logging sampler after a deferred
+  `resp.Body.Close()` had already been bound to the original body, so the
+  sampler was never closed. When the copy to the client stopped before
+  end-of-stream — a client that hangs up once it has every byte — the
+  exchange was never reported at all. Measured with `curl` and a single
+  request: 2 in 120 runs produced a HAR with no entries; now 0 in 200. In a
+  200-request HTTP/2 stress run, 1 in 5 runs lost an exchange; now 0 in 10.
+  Present since 1.2.0 for plain HTTP; 1.4.0 routed every request through the
+  same path.
+- A body that delivered its whole declared `Content-Length` is no longer
+  marked truncated just because the consumer stopped before reading EOF.
+- On exit, httpmon waits (up to 3s) for exchanges still being relayed, so the
+  wrapped command's last request is logged and recorded before the HAR is
+  written.
+- **Non-HTTP traffic through a `CONNECT` tunnel is relayed instead of
+  broken.** A protocol where the server speaks first (SMTP, SSH, MySQL)
+  deadlocked until the client timed out, and one where the client speaks
+  first but not in TLS or HTTP (Redis, Postgres, MQTT) was answered with a
+  400. Such tunnels are now spliced to their target untouched and marked
+  `not HTTP, relayed without inspection`.
+- `--replay` skips recorded gRPC calls instead of re-sending their body
+  summary as a request body, which failed against the server and reported a
+  spurious difference.
+
 ## [1.4.0] - 2026-09-29
 
 ### Added

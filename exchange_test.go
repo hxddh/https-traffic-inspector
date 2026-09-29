@@ -126,7 +126,7 @@ func TestSampler_ClosedBeforeEOFIsIncomplete(t *testing.T) {
 	var got bodyView
 	h := http.Header{"Content-Type": {"text/plain"}}
 	body := io.NopCloser(strings.NewReader("hello world"))
-	sampleBody(&body, h, func(v bodyView) { got = v })
+	sampleBody(&body, h, -1, func(v bodyView) { got = v })
 
 	buf := make([]byte, 5)
 	io.ReadFull(body, buf) //nolint:errcheck
@@ -144,7 +144,7 @@ func TestSampler_ReadToEOFIsComplete(t *testing.T) {
 	var got bodyView
 	h := http.Header{"Content-Type": {"text/plain"}}
 	body := io.NopCloser(strings.NewReader("hello world"))
-	sampleBody(&body, h, func(v bodyView) { got = v })
+	sampleBody(&body, h, -1, func(v bodyView) { got = v })
 	io.Copy(io.Discard, body) //nolint:errcheck
 	body.Close()              //nolint:errcheck
 	if got.Text != "hello world" || got.Truncated {
@@ -197,3 +197,63 @@ func TestEventQueue_KeepsEveryEventInOrder(t *testing.T) {
 		t.Fatal("pop did not wake for an event pushed while it waited")
 	}
 }
+
+// A consumer that stops once it has the declared length has the whole body,
+// even though it never read EOF; that must not be reported as truncated.
+func TestSampler_DeclaredLengthReachedIsComplete(t *testing.T) {
+	var got bodyView
+	fired := 0
+	h := http.Header{"Content-Type": {"text/plain"}}
+	body := io.NopCloser(strings.NewReader("hello"))
+	sampleBody(&body, h, 5, func(v bodyView) { fired++; got = v })
+
+	buf := make([]byte, 5)
+	io.ReadFull(body, buf) //nolint:errcheck
+	body.Close()           //nolint:errcheck
+
+	if fired != 1 || got.Text != "hello" || got.Truncated {
+		t.Errorf("fired=%d got=%+v, want one complete \"hello\"", fired, got)
+	}
+}
+
+// Regression: forwardRequest deferred resp.Body.Close() before logResponse
+// wrapped the body in the sampler, so the deferred call closed the original
+// underneath it. When the copy to the client stopped before EOF -- a client
+// that hangs up once it has every byte -- the sampler never reported and the
+// exchange vanished from the output, the recording and the HAR. Measured: 2 in
+// 120 single-request runs lost their only exchange.
+func TestForward_ResponseLoggedWhenCopyStopsBeforeEOF(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, "partial") //nolint:errcheck
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // never finishes on its own
+	}))
+	defer upstream.Close()
+
+	savedHM, savedCaptures := harMode, captures
+	harMode, captures = true, newExchangeJoiner()
+	harEntriesMu.Lock()
+	harEntries = nil
+	harEntriesMu.Unlock()
+	defer func() { harMode, captures = savedHM, savedCaptures }()
+
+	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/", nil)
+	req.RequestURI = ""
+	forwardRequest(failingWriter{httptest.NewRecorder()}, req, upstreamClient)
+
+	harEntriesMu.Lock()
+	defer harEntriesMu.Unlock()
+	if len(harEntries) != 1 {
+		t.Fatalf("HAR has %d entries, want 1", len(harEntries))
+	}
+	if c := harEntries[0].Response.Content; c.Comment == "" {
+		t.Errorf("a body cut short should be marked truncated, got %+v", c)
+	}
+}
+
+// failingWriter accepts headers but fails every body write, as a connection
+// the client has closed does.
+type failingWriter struct{ *httptest.ResponseRecorder }
+
+func (failingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }

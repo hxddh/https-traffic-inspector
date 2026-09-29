@@ -544,7 +544,7 @@ func logRequest(req *http.Request) int {
 
 	// Sample the body alongside delivery instead of reading a prefix up front.
 	// Reading first would hold a chunked upload until the client finished it.
-	sampleBody(&req.Body, hdr, func(v bodyView) {
+	sampleBody(&req.Body, hdr, req.ContentLength, func(v bodyView) {
 		onRequestBody(reqID, requestFacts{
 			method: method, rawURL: rawURL, proto: proto, host: host,
 			headers: hdr, startTime: startTime,
@@ -704,7 +704,7 @@ func logResponse(resp *http.Response, reqID int) {
 	//
 	// Trailers are read when the body completes: the transport fills
 	// resp.Trailer in place just before the body reports EOF.
-	sampleBody(&resp.Body, hdr, func(v bodyView) {
+	sampleBody(&resp.Body, hdr, contentLength, func(v bodyView) {
 		onResponseBody(reqID, responseFacts{
 			status: status, statusText: statusText, proto: proto,
 			headers: hdr, trailers: resp.Trailer.Clone(),
@@ -1215,6 +1215,7 @@ func run() int {
 			cmd.Process.Kill() //nolint:errcheck
 		}
 		code := <-exitCh
+		drainInflight(exitDrainTimeout)
 
 		if out := subOut.String(); out != "" {
 			fmt.Fprintln(os.Stderr, "\n── Command Output ─────────────────────────────────────")
@@ -1251,8 +1252,13 @@ func run() int {
 		}
 	}
 
+	drainInflight(exitDrainTimeout)
 	return finishHAR(exitCode)
 }
+
+// exitDrainTimeout bounds how long httpmon waits, once the wrapped command
+// has exited, for exchanges still in flight to be logged and recorded.
+const exitDrainTimeout = 3 * time.Second
 
 // finishHAR writes the HAR file when --har is active, promoting a write failure
 // to a non-zero exit code so a silent loss of captured traffic is impossible.

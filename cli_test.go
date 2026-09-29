@@ -684,7 +684,7 @@ func TestReplay_HonoursInsecureUpstream(t *testing.T) {
 // mirroring what the proxy does while forwarding.
 func collectBody(bodyp *io.ReadCloser, h http.Header) bodyView {
 	var got bodyView
-	sampleBody(bodyp, h, func(v bodyView) { got = v })
+	sampleBody(bodyp, h, -1, func(v bodyView) { got = v })
 	if *bodyp != nil {
 		io.Copy(io.Discard, *bodyp) //nolint:errcheck
 		(*bodyp).Close()            //nolint:errcheck
