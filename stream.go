@@ -117,6 +117,10 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 		return bodyView{}
 	}
 
+	if isGRPCContentType(h.Get("Content-Type")) {
+		return bodyView{Text: grpcSummary(raw, incomplete), Truncated: incomplete}
+	}
+
 	enc := h.Get("Content-Encoding")
 	compressed := len(splitEncodings(enc)) > 0
 
