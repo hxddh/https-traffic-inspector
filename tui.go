@@ -25,6 +25,7 @@ type tuiEntry struct {
 	statusText  string
 	respHeaders map[string]string
 	respBody    string
+	respTrailer map[string]string
 	duration    time.Duration
 	pending     bool
 }
@@ -48,8 +49,9 @@ type tuiReqBodyMsg struct {
 	body  string
 }
 type tuiRespBodyMsg struct {
-	reqID int
-	body  string
+	reqID    int
+	body     string
+	trailers map[string]string
 }
 
 // tuiQueue carries proxy events to the TUI. It is unbounded: proxy
@@ -231,6 +233,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, e := range m.entries {
 			if e.id == msg.reqID {
 				e.respBody = msg.body
+				e.respTrailer = msg.trailers
 				break
 			}
 		}
@@ -323,6 +326,12 @@ func renderEntryDetail(e *tuiEntry) string {
 	}
 	if e.respBody != "" {
 		b.WriteString(fmt.Sprintf("\nResponse Body:\n%s\n", e.respBody))
+	}
+	if len(e.respTrailer) > 0 {
+		b.WriteString("\nResponse Trailers:\n")
+		for k, v := range e.respTrailer {
+			b.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
+		}
 	}
 	return b.String()
 }

@@ -26,7 +26,9 @@ type recordedExchange struct {
 	StatusText  string            `json:"status_text"`
 	RespHeaders map[string]string `json:"resp_headers"`
 	RespBody    string            `json:"resp_body,omitempty"`
-	DurationMs  int64             `json:"duration_ms"`
+	// RespTrailers holds trailers sent after the body, where gRPC puts its status.
+	RespTrailers map[string]string `json:"resp_trailers,omitempty"`
+	DurationMs   int64             `json:"duration_ms"`
 
 	// Set when the stored body is only a prefix: it exceeded --max-capture,
 	// or the stream was cut off before it ended.
@@ -57,6 +59,15 @@ func openRecordFile(path string) error {
 	return nil
 }
 
+// nonEmptyFlat flattens h, or returns nil for an empty header so the JSON
+// field is omitted.
+func nonEmptyFlat(h http.Header) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	return flattenHeaders(h)
+}
+
 // writeRecord appends one completed exchange to the recording.
 func writeRecord(id int, r capturedRequest, rs capturedResponse) {
 	e := recordedExchange{
@@ -72,6 +83,7 @@ func writeRecord(id int, r capturedRequest, rs capturedResponse) {
 		RespHeaders:       flattenHeaders(rs.facts.headers),
 		RespBody:          rs.body.Text,
 		RespBodyTruncated: rs.body.Truncated,
+		RespTrailers:      nonEmptyFlat(rs.facts.trailers),
 		DurationMs:        rs.facts.duration.Milliseconds(),
 	}
 	recordMu.Lock()

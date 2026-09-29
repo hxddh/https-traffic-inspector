@@ -50,6 +50,9 @@ var (
 	certMu         sync.Mutex
 	certTTL        = time.Hour // overridden by --cert-ttl flag
 	upstreamClient *http.Client
+	// h2cClient speaks cleartext HTTP/2 upstream, for clients that spoke it
+	// to httpmon: an insecure gRPC server accepts nothing else.
+	h2cClient *http.Client
 
 	// set by flags
 	filterPattern    string
@@ -81,6 +84,7 @@ func init() {
 
 	// Verified by default; run() replaces this once --insecure-upstream is parsed.
 	upstreamClient = newUpstreamClient(false)
+	h2cClient = newH2CClient()
 }
 
 // newUpstreamClient builds the shared client used for all upstream requests.
@@ -96,11 +100,29 @@ func init() {
 func newUpstreamClient(insecure bool) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			Proxy:               func(r *http.Request) (*url.URL, error) { return upstreamProxyFor(r.URL) },
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec // opt-in via --insecure-upstream
+			Proxy:           func(r *http.Request) (*url.URL, error) { return upstreamProxyFor(r.URL) },
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec // opt-in via --insecure-upstream
+			// A custom TLS config otherwise turns HTTP/2 off. Without it gRPC
+			// cannot work, and every HTTP/2 client is silently downgraded.
+			ForceAttemptHTTP2:   true,
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// newH2CClient builds the client for cleartext HTTP/2 upstreams.
+func newH2CClient() *http.Client {
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:     func(r *http.Request) (*url.URL, error) { return upstreamProxyFor(r.URL) },
+			Protocols: p,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -439,6 +461,8 @@ type jsonResponse struct {
 	Proto   string            `json:"proto"`
 	Headers map[string]string `json:"headers"`
 	Body    string            `json:"body,omitempty"`
+	// Trailers follow the body; gRPC reports its status here.
+	Trailers map[string]string `json:"trailers,omitempty"`
 }
 
 var (
@@ -475,7 +499,24 @@ var hopByHopHeaders = []string{
 
 // removeHopByHopHeaders strips hop-by-hop headers from h per RFC 7230 §6.1.
 // It also removes any headers named in the Connection header value.
+//
+// "TE: trailers" survives: it is the one TE value HTTP/2 permits, and gRPC
+// servers reject a call without it.
 func removeHopByHopHeaders(h http.Header) {
+	wantsTrailers := false
+	for _, v := range h.Values("TE") {
+		for _, f := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(f), "trailers") {
+				wantsTrailers = true
+			}
+		}
+	}
+	defer func() {
+		if wantsTrailers {
+			h.Set("TE", "trailers")
+		}
+	}()
+
 	for _, v := range h["Connection"] {
 		for _, f := range strings.Split(v, ",") {
 			h.Del(strings.TrimSpace(f))
@@ -660,10 +701,14 @@ func logResponse(resp *http.Response, reqID int) {
 
 	// Sample alongside delivery. Reading a prefix first would withhold an SSE
 	// feed or any slow response until the upstream closed the stream.
+	//
+	// Trailers are read when the body completes: the transport fills
+	// resp.Trailer in place just before the body reports EOF.
 	sampleBody(&resp.Body, hdr, func(v bodyView) {
 		onResponseBody(reqID, responseFacts{
 			status: status, statusText: statusText, proto: proto,
-			headers: hdr, contentLength: contentLength, duration: dur,
+			headers: hdr, trailers: resp.Trailer.Clone(),
+			contentLength: contentLength, duration: dur,
 		}, v)
 	})
 
@@ -700,6 +745,7 @@ type responseFacts struct {
 	statusText    string
 	proto         string
 	headers       http.Header
+	trailers      http.Header
 	contentLength int64
 	duration      time.Duration
 }
@@ -713,18 +759,23 @@ func onResponseBody(reqID int, f responseFacts, v bodyView) {
 	bodyStr := truncateForDisplay(v)
 
 	if tuiMode {
-		tuiSend(tuiRespBodyMsg{reqID: reqID, body: bodyStr})
+		tuiSend(tuiRespBodyMsg{reqID: reqID, body: bodyStr, trailers: flattenHeaders(f.trailers)})
 		return
 	}
 
 	if jsonMode {
+		var trailers map[string]string
+		if len(f.trailers) > 0 {
+			trailers = flattenHeaders(f.trailers)
+		}
 		jsonEncMu.Lock()
 		jsonEnc.Encode(jsonResponse{ //nolint:errcheck
-			ReqID:   reqID,
-			Status:  f.status,
-			Proto:   f.proto,
-			Headers: flattenHeaders(f.headers),
-			Body:    bodyStr,
+			ReqID:    reqID,
+			Status:   f.status,
+			Proto:    f.proto,
+			Headers:  flattenHeaders(f.headers),
+			Body:     bodyStr,
+			Trailers: trailers,
 		})
 		jsonEncMu.Unlock()
 		return
@@ -733,6 +784,13 @@ func onResponseBody(reqID int, f responseFacts, v bodyView) {
 	var b strings.Builder
 	if bodyStr != "" {
 		fmt.Fprintf(&b, "\n\033[32m--- RESPONSE #%d body ---\033[0m\n%s\n", reqID, bodyStr)
+	}
+	if len(f.trailers) > 0 {
+		fmt.Fprintf(&b, "\nTrailers:\n")
+		writeHeaders(&b, f.trailers)
+	}
+	if st := grpcStatusLine(f.headers, f.trailers); st != "" {
+		fmt.Fprintf(&b, "\n%s\n", st)
 	}
 	fmt.Fprintf(&b, "\n%s #%d end\n", strings.Repeat("-", 52), reqID)
 	emitText(b.String())
@@ -848,245 +906,6 @@ func buildCABundle(proxyCAPEM []byte) (string, error) {
 	return f.Name(), nil
 }
 
-func handleHTTP(w http.ResponseWriter, req *http.Request) {
-	if !matchesFilter(req) {
-		// Proxy transparently without logging.
-		targetURL := *req.URL
-		if targetURL.Scheme == "" {
-			targetURL.Scheme = "http"
-		}
-		if targetURL.Host == "" {
-			targetURL.Host = req.Host
-		}
-		proxyReq, err := http.NewRequest(req.Method, targetURL.String(), req.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		proxyReq.Header = req.Header.Clone()
-		proxyReq.ContentLength = req.ContentLength
-		removeHopByHopHeaders(proxyReq.Header)
-		resp, err := upstreamClient.Do(proxyReq)
-		if err != nil {
-			warnTLSVerification(req.Host, err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-		for k, v := range resp.Header {
-			w.Header()[k] = v
-		}
-		removeHopByHopHeaders(w.Header())
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body) //nolint:errcheck
-		return
-	}
-
-	reqID := logRequest(req)
-
-	// Copy URL struct to avoid mutating req.URL in place.
-	targetURL := *req.URL
-	if targetURL.Scheme == "" {
-		targetURL.Scheme = "http"
-	}
-	if targetURL.Host == "" {
-		targetURL.Host = req.Host
-	}
-
-	proxyReq, err := http.NewRequest(req.Method, targetURL.String(), req.Body)
-	if err != nil {
-		discardReqID(reqID)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	proxyReq.Header = req.Header.Clone()
-	proxyReq.ContentLength = req.ContentLength
-	removeHopByHopHeaders(proxyReq.Header)
-
-	resp, err := upstreamClient.Do(proxyReq)
-	if err != nil {
-		discardReqID(reqID)
-		warnTLSVerification(req.Host, err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	logResponse(resp, reqID)
-
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	removeHopByHopHeaders(w.Header())
-	w.WriteHeader(resp.StatusCode)
-	fl, _ := w.(http.Flusher)
-	copyFlushing(w, resp.Body, fl) //nolint:errcheck
-}
-
-func handleConnect(w http.ResponseWriter, r *http.Request) {
-	if !jsonMode && !tuiMode {
-		emitText(fmt.Sprintf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host))
-	}
-
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		host = r.Host
-	}
-
-	cert, err := generateCert(host)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Check hijacking support before sending 200 so we can still return a proper HTTP error.
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "hijack error for %s: %v\n", host, err)
-		return
-	}
-	defer clientConn.Close()
-
-	// Write the tunnel response directly rather than through ResponseWriter.
-	// net/http would add Date and Transfer-Encoding: chunked, which RFC 9110
-	// §9.3.6 forbids on a 2xx CONNECT response: the client then waits for a
-	// terminating chunk that never arrives and the command hangs.
-	if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		return
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-	}
-	tlsConn := tls.Server(clientConn, tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
-		fmt.Fprintf(os.Stderr, "TLS handshake error for %s: %v\n", host, err)
-		return
-	}
-	defer tlsConn.Close()
-
-	bw := bufio.NewWriterSize(tlsConn, 32*1024)
-	reader := bufio.NewReader(tlsConn)
-
-	for {
-		req, err := http.ReadRequest(reader)
-		if err != nil {
-			if err != io.EOF {
-				fmt.Fprintf(os.Stderr, "Error reading request: %v\n", err)
-			}
-			break
-		}
-
-		req.URL.Scheme = "https"
-		req.URL.Host = r.Host
-		req.RequestURI = ""
-
-		// Handle Expect: 100-continue.
-		// http.ReadRequest does not perform the 100-continue handshake automatically
-		// (unlike net/http.Server). If we try to log or forward the request body
-		// without first sending 100 Continue, the client will never send the body,
-		// causing a deadlock that manifests as an unexpected EOF or timeout.
-		// Fix: send 100 Continue to the client immediately, then strip the header
-		// so http.Transport does not attempt a second 100-continue round-trip to
-		// the upstream.
-		if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
-			if _, err := fmt.Fprint(bw, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
-				break
-			}
-			if err := bw.Flush(); err != nil {
-				break
-			}
-			req.Header.Del("Expect")
-		}
-
-		// Save before stripping so shouldClose can inspect the original value.
-		reqConnHdr := req.Header.Get("Connection")
-
-		shouldLog := matchesFilter(req)
-		var reqID int
-		if shouldLog {
-			reqID = logRequest(req) // logs original headers
-		}
-
-		// WebSocket upgrades require a raw bidirectional tunnel; bypass the
-		// normal hop-by-hop stripping and http.Client round-trip.
-		if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
-			upConn, dialErr := dialUpstreamTLS(r.Host, host)
-			if dialErr != nil {
-				if shouldLog {
-					discardReqID(reqID)
-				}
-				warnTLSVerification(host, dialErr)
-				writeConnError(bw, http.StatusBadGateway, dialErr.Error())
-				bw.Flush() //nolint:errcheck
-				break
-			}
-			spliceWebSocket(upConn, req, tlsConn, bw, reader)
-			upConn.Close()
-			if shouldLog {
-				discardReqID(reqID)
-			}
-			break
-		}
-
-		removeHopByHopHeaders(req.Header) // strip before forwarding upstream
-
-		resp, err := upstreamClient.Do(req)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error making request: %v\n", err)
-			warnTLSVerification(host, err)
-			if shouldLog {
-				discardReqID(reqID)
-			}
-			writeConnError(bw, http.StatusBadGateway, err.Error())
-			bw.Flush() //nolint:errcheck
-			break
-		}
-
-		if shouldLog {
-			logResponse(resp, reqID) // logs original response headers
-		}
-
-		shouldClose := strings.EqualFold(reqConnHdr, "close") ||
-			strings.EqualFold(resp.Header.Get("Connection"), "close")
-
-		removeHopByHopHeaders(resp.Header) // strip before forwarding downstream
-
-		// The transport hands back a response with no known length whenever it
-		// transparently decoded the body -- gunzipping drops Content-Length.
-		// Response.Write would then delimit the body by closing the connection,
-		// but this loop keeps the tunnel open for the next request, so the
-		// client blocks waiting for an EOF that never arrives. Framing it as
-		// chunked delimits the body without giving up keep-alive.
-		if resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 &&
-			req.Method != http.MethodHead && bodyAllowedForStatus(resp.StatusCode) {
-			resp.TransferEncoding = []string{"chunked"}
-		}
-
-		// Flush as the body is written: buffering here would hold a streaming
-		// response until the stream ended.
-		if err := resp.Write(flushWriter{w: bw, flush: bw.Flush}); err != nil {
-			resp.Body.Close()
-			break
-		}
-		if err := bw.Flush(); err != nil {
-			resp.Body.Close()
-			break
-		}
-		resp.Body.Close()
-
-		if shouldClose {
-			break
-		}
-	}
-}
-
 // subprocessEnv builds the environment for the wrapped command: it points the
 // command at httpmon and at the generated CA bundle.
 //
@@ -1131,6 +950,8 @@ var caBundleEnvVars = []string{
 	"GIT_SSL_CAINFO",      // git, whose libcurl ignores SSL_CERT_FILE
 	"CARGO_HTTP_CAINFO",   // cargo
 	"DENO_CERT",           // Deno
+	// gRPC C-core (Python grpcio, Ruby, PHP…), which ships its own roots.
+	"GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
 }
 
 // isLoopbackHost reports whether a listen address only accepts local
@@ -1246,6 +1067,7 @@ func run() int {
 	harPath = *harFlag
 	certTTL = *certTTLFlag
 	upstreamClient = newUpstreamClient(insecureUpstream)
+	h2cClient = newH2CClient()
 
 	if recordMode {
 		if err := openRecordFile(*recordFlag); err != nil {
