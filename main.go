@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -89,14 +90,13 @@ func init() {
 // settings. httpmon only injects its own address into the *subprocess*
 // environment, so reading the environment here picks up the outer proxy rather
 // than looping back into httpmon.
+//
+// Every upstream path -- proxied requests, replay and WebSocket tunnels --
+// resolves its proxy through upstreamProxyFor, so none of them can bypass it.
 func newUpstreamClient(insecure bool) *http.Client {
-	proxy := http.ProxyFromEnvironment
-	if upstreamProxy != nil {
-		proxy = http.ProxyURL(upstreamProxy)
-	}
 	return &http.Client{
 		Transport: &http.Transport{
-			Proxy:               proxy,
+			Proxy:               func(r *http.Request) (*url.URL, error) { return upstreamProxyFor(r.URL) },
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec // opt-in via --insecure-upstream
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
@@ -106,6 +106,116 @@ func newUpstreamClient(insecure bool) *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// upstreamProxyFor returns the proxy httpmon's own traffic to u goes through,
+// or nil to connect directly: --upstream-proxy when set, else the environment.
+func upstreamProxyFor(u *url.URL) (*url.URL, error) {
+	if upstreamProxy != nil {
+		return upstreamProxy, nil
+	}
+	return http.ProxyFromEnvironment(&http.Request{URL: u})
+}
+
+// upstreamDialTimeout bounds connecting to an upstream or proxy and completing
+// the TLS handshake, matching what the upstream transport allows.
+const upstreamDialTimeout = 30 * time.Second
+
+// dialUpstreamTLS opens a TLS connection to hostport for a WebSocket splice,
+// tunnelling through the upstream proxy when one applies. The splice needs a
+// raw connection, which the shared http.Transport cannot hand out, but it must
+// follow the same route and verification policy as every other request.
+func dialUpstreamTLS(hostport, serverName string) (net.Conn, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify: insecureUpstream, //nolint:gosec // opt-in via --insecure-upstream
+		ServerName:         serverName,
+	}
+	d := &net.Dialer{Timeout: upstreamDialTimeout}
+
+	p, err := upstreamProxyFor(&url.URL{Scheme: "https", Host: hostport})
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return tls.DialWithDialer(d, "tcp", hostport, cfg)
+	}
+
+	raw, err := dialProxyTunnel(d, p, hostport)
+	if err != nil {
+		return nil, err
+	}
+	tc := tls.Client(raw, cfg)
+	raw.SetDeadline(time.Now().Add(upstreamDialTimeout)) //nolint:errcheck
+	if err := tc.Handshake(); err != nil {
+		raw.Close() //nolint:errcheck
+		return nil, err
+	}
+	raw.SetDeadline(time.Time{}) //nolint:errcheck
+	return tc, nil
+}
+
+// dialProxyTunnel connects to proxy p and asks it, with CONNECT, for a tunnel
+// to target.
+func dialProxyTunnel(d *net.Dialer, p *url.URL, target string) (net.Conn, error) {
+	var (
+		conn net.Conn
+		err  error
+	)
+	switch p.Scheme {
+	case "http", "":
+		conn, err = d.Dial("tcp", hostPortDefault(p, "80"))
+	case "https":
+		conn, err = tls.DialWithDialer(d, "tcp", hostPortDefault(p, "443"), &tls.Config{ServerName: p.Hostname()})
+	default:
+		return nil, fmt.Errorf("upstream proxy scheme %q is not supported for WebSocket tunnels", p.Scheme)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: target},
+		Host:   target,
+		Header: make(http.Header),
+	}
+	if p.User != nil {
+		pass, _ := p.User.Password()
+		cred := base64.StdEncoding.EncodeToString([]byte(p.User.Username() + ":" + pass))
+		req.Header.Set("Proxy-Authorization", "Basic "+cred)
+	}
+
+	conn.SetDeadline(time.Now().Add(upstreamDialTimeout)) //nolint:errcheck
+	if err := req.Write(conn); err != nil {
+		conn.Close() //nolint:errcheck
+		return nil, err
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close() //nolint:errcheck
+		return nil, err
+	}
+	resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		conn.Close() //nolint:errcheck
+		return nil, fmt.Errorf("upstream proxy refused CONNECT %s: %s", target, resp.Status)
+	}
+	// The server speaks first only after our TLS ClientHello, so anything
+	// already buffered here would be lost; treat it as a protocol error.
+	if br.Buffered() > 0 {
+		conn.Close() //nolint:errcheck
+		return nil, fmt.Errorf("upstream proxy sent unexpected data after CONNECT %s", target)
+	}
+	conn.SetDeadline(time.Time{}) //nolint:errcheck
+	return conn, nil
+}
+
+func hostPortDefault(u *url.URL, port string) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	return net.JoinHostPort(u.Hostname(), port)
 }
 
 // ---- cleanup ----
@@ -932,10 +1042,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		// WebSocket upgrades require a raw bidirectional tunnel; bypass the
 		// normal hop-by-hop stripping and http.Client round-trip.
 		if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
-			upConn, dialErr := tls.Dial("tcp", r.Host, &tls.Config{
-				InsecureSkipVerify: insecureUpstream, //nolint:gosec // opt-in via --insecure-upstream
-				ServerName:         host,
-			})
+			upConn, dialErr := dialUpstreamTLS(r.Host, host)
 			if dialErr != nil {
 				if shouldLog {
 					discardReqID(reqID)
