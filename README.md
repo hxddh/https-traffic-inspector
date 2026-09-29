@@ -129,11 +129,19 @@ httpmon handles proxy configuration automatically for common tools:
 
 | Tool | What is injected |
 |------|------------------|
-| **curl** | `-x http://127.0.0.1:<port> --cacert <ca>` |
-| **aws** | `AWS_CA_BUNDLE` |
-| **Python requests** | `REQUESTS_CA_BUNDLE` |
-| **Node.js** | `NODE_EXTRA_CA_CERTS` |
+| **curl** | `-x http://127.0.0.1:<port> --cacert <ca>` (plus `CURL_CA_BUNDLE` for curl run from scripts) |
+| **aws** / boto3 | `AWS_CA_BUNDLE` |
+| **Python requests** / **pip** | `REQUESTS_CA_BUNDLE`, `PIP_CERT` |
+| **Node.js** | `NODE_EXTRA_CA_CERTS`, and `NODE_USE_ENV_PROXY=1` so the built-in `fetch` uses the proxy |
+| **git** | `GIT_SSL_CAINFO` |
+| **cargo** / **Deno** | `CARGO_HTTP_CAINFO` / `DENO_CERT` |
 | Any HTTP-proxy-aware tool | `HTTP_PROXY`, `HTTPS_PROXY`, `SSL_CERT_FILE` |
+
+These override any inherited value of the same name, which would otherwise
+point the tool at a bundle that lacks httpmon's CA. JVM tools read a
+truststore rather than a PEM file and are not configured automatically.
+`NODE_USE_ENV_PROXY` needs Node 22.21 or 24; older Node versions ignore it,
+and their built-in `fetch` bypasses httpmon.
 
 httpmon also clears `NO_PROXY` for the wrapped command. A host named in an
 inherited no-proxy list would otherwise skip httpmon and go uncaptured with no

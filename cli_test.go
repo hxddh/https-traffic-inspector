@@ -767,7 +767,7 @@ func TestSubprocessEnv_ClearsNoProxy(t *testing.T) {
 		"NO_PROXY=proxy.golang.org,pypi.org",
 		"no_proxy=proxy.golang.org,pypi.org",
 	}
-	env := subprocessEnv(base, "http://localhost:8080", "/tmp/ca.crt", "curl")
+	env := subprocessEnv(base, "http://localhost:8080", "/tmp/ca.crt")
 
 	// Later entries win in os/exec, so check the effective value of each key.
 	effective := map[string]string{}
@@ -789,21 +789,36 @@ func TestSubprocessEnv_ClearsNoProxy(t *testing.T) {
 	}
 }
 
-func TestSubprocessEnv_InjectsCABundleAndAWS(t *testing.T) {
-	for _, tc := range []struct {
-		cmdName string
-		wantAWS bool
-	}{{"curl", false}, {"aws", true}} {
-		env := subprocessEnv(nil, "http://localhost:1", "/tmp/ca.crt", tc.cmdName)
-		joined := strings.Join(env, "\n")
-		for _, k := range []string{"REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"} {
-			if !strings.Contains(joined, k+"=/tmp/ca.crt") {
-				t.Errorf("%s: %s not set to the CA bundle", tc.cmdName, k)
-			}
+// Regression: git and Node were not wired up. git's libcurl ignores
+// SSL_CERT_FILE and failed verification; Node's built-in fetch ignores the
+// proxy variables and bypassed httpmon entirely, capturing nothing. Inherited
+// values must be overridden too, or they point at a bundle without httpmon's CA.
+func TestSubprocessEnv_InjectsCABundleForEachTool(t *testing.T) {
+	base := []string{
+		"GIT_SSL_CAINFO=/etc/corp-ca.pem",
+		"CURL_CA_BUNDLE=/etc/corp-ca.pem",
+		"AWS_CA_BUNDLE=/etc/corp-ca.pem",
+	}
+	env := subprocessEnv(base, "http://localhost:1", "/tmp/ca.crt")
+
+	// Later entries win in os/exec, so check the effective value of each key.
+	effective := map[string]string{}
+	for _, kv := range env {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			effective[kv[:i]] = kv[i+1:]
 		}
-		if got := strings.Contains(joined, "AWS_CA_BUNDLE=/tmp/ca.crt"); got != tc.wantAWS {
-			t.Errorf("%s: AWS_CA_BUNDLE present = %v, want %v", tc.cmdName, got, tc.wantAWS)
+	}
+	for _, k := range []string{
+		"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT", "AWS_CA_BUNDLE",
+		"NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+		"CARGO_HTTP_CAINFO", "DENO_CERT",
+	} {
+		if effective[k] != "/tmp/ca.crt" {
+			t.Errorf("%s = %q, want the httpmon CA bundle", k, effective[k])
 		}
+	}
+	if effective["NODE_USE_ENV_PROXY"] != "1" {
+		t.Errorf("NODE_USE_ENV_PROXY = %q, want 1 so Node's fetch uses the proxy", effective["NODE_USE_ENV_PROXY"])
 	}
 }
 

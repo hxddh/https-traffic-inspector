@@ -1014,22 +1014,41 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 // npm) are exactly the ones such lists tend to name. httpmon's own upstream
 // client still applies the real NO_PROXY, so where the traffic ultimately goes
 // is unchanged; it just passes through httpmon on the way.
-func subprocessEnv(base []string, proxyURL, caCertPath, cmdName string) []string {
-	env := append(append([]string{}, base...),
+//
+// Most tools read SSL_CERT_FILE, but several keep their own variable and
+// ignore it, failing verification or — worse — silently bypassing httpmon.
+// Each variable here overrides an inherited value of the same name, which
+// would otherwise point the tool at a bundle without httpmon's CA.
+func subprocessEnv(base []string, proxyURL, caCertPath string) []string {
+	env := append([]string{}, base...)
+	env = append(env,
 		"HTTP_PROXY="+proxyURL,
 		"HTTPS_PROXY="+proxyURL,
 		"http_proxy="+proxyURL,
 		"https_proxy="+proxyURL,
 		"NO_PROXY=",
 		"no_proxy=",
-		"REQUESTS_CA_BUNDLE="+caCertPath,
-		"SSL_CERT_FILE="+caCertPath,
-		"NODE_EXTRA_CA_CERTS="+caCertPath,
+		// Node's built-in fetch ignores the proxy variables unless told
+		// otherwise, so its requests went straight past httpmon.
+		"NODE_USE_ENV_PROXY=1",
 	)
-	if cmdName == "aws" {
-		env = append(env, "AWS_CA_BUNDLE="+caCertPath)
+	for _, k := range caBundleEnvVars {
+		env = append(env, k+"="+caCertPath)
 	}
 	return env
+}
+
+// caBundleEnvVars name every variable httpmon sets to its CA bundle.
+var caBundleEnvVars = []string{
+	"SSL_CERT_FILE",       // OpenSSL-based tools, Go, Ruby, Python ssl
+	"REQUESTS_CA_BUNDLE",  // Python requests
+	"PIP_CERT",            // pip, which otherwise prefers its vendored certifi
+	"AWS_CA_BUNDLE",       // botocore (aws CLI, boto3), which ignores the above
+	"NODE_EXTRA_CA_CERTS", // Node.js
+	"CURL_CA_BUNDLE",      // curl run from scripts, where -x/--cacert are not injected
+	"GIT_SSL_CAINFO",      // git, whose libcurl ignores SSL_CERT_FILE
+	"CARGO_HTTP_CAINFO",   // cargo
+	"DENO_CERT",           // Deno
 }
 
 // isLoopbackHost reports whether a listen address only accepts local
@@ -1262,7 +1281,7 @@ func run() int {
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 
-	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath, cmdName)
+	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath)
 
 	if tuiMode {
 		// In TUI mode the subprocess output is captured and shown after the UI exits.
