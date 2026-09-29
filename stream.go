@@ -84,7 +84,10 @@ func (s *bodySampler) fire() {
 func sampleBody(bodyp *io.ReadCloser, h http.Header, onDone func(bodyView)) {
 	limit := captureLimitFor(h)
 
-	if bodyp == nil || *bodyp == nil {
+	// http.NoBody must stay as it is. Wrapped, it no longer reads as empty to
+	// the transport, which then forwards a Content-Length: 0 POST or PUT as
+	// Transfer-Encoding: chunked -- a request S3 and others reject.
+	if bodyp == nil || *bodyp == nil || *bodyp == http.NoBody {
 		onDone(bodyView{})
 		return
 	}
