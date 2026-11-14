@@ -407,6 +407,7 @@ type Writer struct {
 	size    int64
 	lastSeg int
 	nextID  int
+	retryAt int64 // after a rotation that could not rename, try again at this size
 	// Dropped counts segments removed to stay under max.
 	Dropped int
 	buf     bytes.Buffer
@@ -483,7 +484,7 @@ func (w *Writer) Write(e *exchange.Exchange) error {
 	if _, err := w.idx.Write(en.appendLine(nil)); err != nil {
 		return err
 	}
-	if w.segMax > 0 && w.size >= w.segMax {
+	if w.segMax > 0 && w.size >= w.segMax && w.size >= w.retryAt {
 		return w.rotate()
 	}
 	return nil
@@ -491,17 +492,31 @@ func (w *Writer) Write(e *exchange.Exchange) error {
 
 // rotate closes the current segment under the next number, opens a new one,
 // and removes the oldest segments while the session is over its limit.
+//
+// On Windows a file another process has open -- httpmon ui or query
+// --follow reading the session -- cannot be renamed or removed. Then the
+// current segment keeps growing for now, and rotation is tried again later;
+// a segment that cannot be removed yet is removed by a later rotation.
 func (w *Writer) rotate() error {
 	w.f.Close()   //nolint:errcheck
 	w.idx.Close() //nolint:errcheck
-	w.lastSeg++
-	if err := os.Rename(filepath.Join(w.dir, Current), filepath.Join(w.dir, segFile(w.lastSeg))); err != nil {
-		return err
+	next := w.lastSeg + 1
+	renamed := os.Rename(filepath.Join(w.dir, Current), filepath.Join(w.dir, segFile(next))) == nil
+	if renamed {
+		w.lastSeg = next
+		if err := os.Rename(filepath.Join(w.dir, CurrentIndex), filepath.Join(w.dir, segIndex(next))); err != nil {
+			// The rotated segment is indexed again when read.
+			os.Remove(filepath.Join(w.dir, CurrentIndex)) //nolint:errcheck
+		}
 	}
-	os.Rename(filepath.Join(w.dir, CurrentIndex), filepath.Join(w.dir, segIndex(w.lastSeg))) //nolint:errcheck
 	if err := w.openCurrent(); err != nil {
 		return err
 	}
+	if !renamed {
+		w.retryAt = w.size + w.segMax/4
+		return nil
+	}
+	w.retryAt = 0
 	segs, _ := Segments(w.dir)
 	var total int64
 	sizes := make([]int64, len(segs))
@@ -512,7 +527,9 @@ func (w *Writer) rotate() error {
 		}
 	}
 	for i := 0; i < len(segs)-1 && total > w.max; i++ {
-		os.Remove(segs[i])           //nolint:errcheck
+		if os.Remove(segs[i]) != nil {
+			continue // in use; a later rotation removes it
+		}
 		os.Remove(indexFor(segs[i])) //nolint:errcheck
 		total -= sizes[i]
 		w.Dropped++

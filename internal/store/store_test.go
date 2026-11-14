@@ -131,6 +131,7 @@ func TestRotation(t *testing.T) {
 	if !IsSegmentOf(dir, fi) {
 		t.Error("a rotated segment is not recognised")
 	}
+	s.Close() // Windows removes no file that is open
 	if err := RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
