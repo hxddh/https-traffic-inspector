@@ -16,6 +16,9 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
 )
 
 // tuiEntry holds one HTTP transaction displayed in the TUI. Every string in
@@ -190,11 +193,20 @@ func (tuiSink) responseBody(id int, f *responseFacts, v bodyView) {
 	if len(f.trailers) > 0 {
 		trailers = displayFlat(f.trailers)
 	}
-	tuiSend(tuiRespBodyMsg{reqID: id, body: truncateForDisplay(v), trailers: trailers, grpcLine: grpcStatusLine(f.headers, f.trailers)})
+	tuiSend(tuiRespBodyMsg{reqID: id, body: truncateForDisplay(v), trailers: trailers, grpcLine: body.GRPCStatusLine(f.headers, f.trailers)})
 }
 
-func (tuiSink) failed(id int, _ *requestFacts, err string, dur time.Duration) {
-	tuiSend(tuiFailMsg{reqID: id, err: err, duration: dur})
+func (tuiSink) failed(id int, _ *requestFacts, err *exchange.Error, dur time.Duration) {
+	tuiSend(tuiFailMsg{reqID: id, err: err.Kind + ": " + err.Message, duration: dur})
+}
+
+func (tuiSink) exchange(*exchange.Exchange) {} // shown as it unfolded
+func (tuiSink) start(runInfo)               {}
+
+// end has nothing to draw on: the UI has closed by then. The digest is
+// printed after it, with the notices.
+func (tuiSink) end(d *exchange.Digest) {
+	fmt.Fprintln(os.Stderr, textsafe.Line(d.String()))
 }
 
 func (tuiSink) wsMessage(id int, m wsMessage) {
@@ -230,7 +242,7 @@ func printTUINotices(w io.Writer) {
 	tuiNoticesMu.Lock()
 	defer tuiNoticesMu.Unlock()
 	for _, n := range tuiNotices {
-		fmt.Fprintf(w, "httpmon: %s\n", sanitizeLine(n)) //nolint:errcheck // stderr
+		fmt.Fprintf(w, "httpmon: %s\n", textsafe.Line(n)) //nolint:errcheck // stderr
 	}
 }
 
@@ -676,8 +688,8 @@ func renderEntryDetail(e *tuiEntry, color bool) string {
 	}
 	var b strings.Builder
 	b.WriteString(c(colCyan, fmt.Sprintf("━━ REQUEST #%d ━━", e.id)) + "\n")
-	fmt.Fprintf(&b, "%s %s\n", sanitizeLine(e.method), sanitizeLine(e.rawURL))
-	fmt.Fprintf(&b, "Host: %s    Time: %s\n", sanitizeLine(e.host), e.startTime.Format("15:04:05"))
+	fmt.Fprintf(&b, "%s %s\n", textsafe.Line(e.method), textsafe.Line(e.rawURL))
+	fmt.Fprintf(&b, "Host: %s    Time: %s\n", textsafe.Line(e.host), e.startTime.Format("15:04:05"))
 
 	writeMap := func(title string, h map[string]string) {
 		if len(h) == 0 {
@@ -685,32 +697,32 @@ func renderEntryDetail(e *tuiEntry, color bool) string {
 		}
 		b.WriteString("\n" + title + ":\n")
 		for _, k := range sortedKeys(h) {
-			fmt.Fprintf(&b, "  %s: %s\n", sanitizeLine(k), sanitizeLine(h[k]))
+			fmt.Fprintf(&b, "  %s: %s\n", textsafe.Line(k), textsafe.Line(h[k]))
 		}
 	}
 	writeMap("Request Headers", e.reqHeaders)
 	if e.reqBody != "" {
-		b.WriteString("\nRequest Body:\n" + sanitizeTerminal(e.reqBody) + "\n")
+		b.WriteString("\nRequest Body:\n" + textsafe.Terminal(e.reqBody) + "\n")
 	}
 
 	switch {
 	case e.failed != "":
 		b.WriteString("\n" + c(colRed, fmt.Sprintf("━━ FAILED (%v) ━━", e.duration.Round(time.Millisecond))) + "\n")
-		b.WriteString(sanitizeTerminal(e.failed) + "\n")
+		b.WriteString(textsafe.Terminal(e.failed) + "\n")
 		return b.String()
 	case e.pending:
 		b.WriteString("\n" + c(colYellow, "⏳ waiting for response…") + "\n")
 		return b.String()
 	}
 
-	b.WriteString("\n" + c(colGreen, fmt.Sprintf("━━ RESPONSE: %s  (%v) ━━", sanitizeLine(e.statusText), e.duration.Round(time.Millisecond))) + "\n")
+	b.WriteString("\n" + c(colGreen, fmt.Sprintf("━━ RESPONSE: %s  (%v) ━━", textsafe.Line(e.statusText), e.duration.Round(time.Millisecond))) + "\n")
 	writeMap("Response Headers", e.respHeaders)
 	if e.respBody != "" {
-		b.WriteString("\nResponse Body:\n" + sanitizeTerminal(e.respBody) + "\n")
+		b.WriteString("\nResponse Body:\n" + textsafe.Terminal(e.respBody) + "\n")
 	}
 	writeMap("Response Trailers", e.respTrailer)
 	if e.grpcLine != "" {
-		b.WriteString("\n" + sanitizeLine(e.grpcLine) + "\n")
+		b.WriteString("\n" + textsafe.Line(e.grpcLine) + "\n")
 	}
 	if e.ws {
 		b.WriteString("\n" + c(colCyan, fmt.Sprintf("━━ WEBSOCKET: %d messages ━━", e.wsCount)) + "\n")
@@ -718,7 +730,7 @@ func renderEntryDetail(e *tuiEntry, color bool) string {
 			fmt.Fprintf(&b, "(%d earlier messages not shown)\n", hidden)
 		}
 		for _, l := range e.wsLines {
-			b.WriteString(sanitizeTerminal(l) + "\n")
+			b.WriteString(textsafe.Terminal(l) + "\n")
 		}
 		if e.wsClosed != "" {
 			b.WriteString(c(colDim, "closed: "+e.wsClosed) + "\n")
@@ -762,10 +774,10 @@ func (m tuiModel) View() string {
 	// ── Header bar
 	title := fmt.Sprintf("httpmon  proxy :%s", proxyPort)
 	if filterPattern != "" {
-		title += fmt.Sprintf("  filter:%q", sanitizeLine(filterPattern))
+		title += fmt.Sprintf("  filter:%q", textsafe.Line(filterPattern))
 	}
 	if m.filter != "" {
-		title += fmt.Sprintf("  search:%q", sanitizeLine(m.filter))
+		title += fmt.Sprintf("  search:%q", textsafe.Line(m.filter))
 	}
 	right := fmt.Sprintf("%d requests ", len(m.entries))
 	if m.filter != "" {
@@ -810,13 +822,13 @@ func (m tuiModel) View() string {
 			statusStr = fmt.Sprintf("%d", e.status)
 			durStr = e.duration.Round(time.Millisecond).String()
 		}
-		urlStr := truncateDisplay(sanitizeLine(e.host+e.path), urlW)
+		urlStr := truncateDisplay(textsafe.Line(e.host+e.path), urlW)
 		pad := urlW - lipgloss.Width(urlStr)
 		if pad < 0 {
 			pad = 0
 		}
 		line := fmt.Sprintf(" %-5d %-8s %-6s %s%s %s",
-			e.id, sanitizeLine(e.method), statusStr, urlStr, strings.Repeat(" ", pad), durStr)
+			e.id, textsafe.Line(e.method), statusStr, urlStr, strings.Repeat(" ", pad), durStr)
 		line = truncateDisplay(line, m.width)
 		switch {
 		case i == m.cursor:
@@ -856,16 +868,16 @@ func (m tuiModel) View() string {
 	}
 	switch {
 	case m.searching:
-		hint = " search: " + sanitizeLine(m.input) + "█   [enter] apply  [esc] clear"
+		hint = " search: " + textsafe.Line(m.input) + "█   [enter] apply  [esc] clear"
 	case m.flash != "":
-		hint = " " + sanitizeLine(m.flash)
+		hint = " " + textsafe.Line(m.flash)
 	case m.doneMsg != "":
 		hint = m.doneMsg
 	}
 	if m.notice != "" && !m.searching {
-		warn := fmt.Sprintf("  ⚠ %s", sanitizeLine(m.notice))
+		warn := fmt.Sprintf("  ⚠ %s", textsafe.Line(m.notice))
 		if m.notices > 1 {
-			warn = fmt.Sprintf("  ⚠ (%d) %s", m.notices, sanitizeLine(m.notice))
+			warn = fmt.Sprintf("  ⚠ (%d) %s", m.notices, textsafe.Line(m.notice))
 		}
 		hint = truncateDisplay(hint, m.width/2) + styleWarn.Render(truncateDisplay(warn, m.width-lipgloss.Width(truncateDisplay(hint, m.width/2))))
 		b.WriteString(hint)

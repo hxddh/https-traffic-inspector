@@ -1,4 +1,4 @@
-package main
+package body
 
 import (
 	"encoding/binary"
@@ -9,21 +9,21 @@ import (
 	"strings"
 )
 
-// isGRPCContentType reports whether ct is a gRPC content type
+// IsGRPC reports whether ct is a gRPC content type
 // (application/grpc, optionally with a +proto, +json… suffix).
-func isGRPCContentType(ct string) bool {
+func IsGRPC(ct string) bool {
 	ct = strings.ToLower(strings.TrimSpace(ct))
 	return ct == "application/grpc" || strings.HasPrefix(ct, "application/grpc+") ||
 		strings.HasPrefix(ct, "application/grpc;")
 }
 
-// grpcSummary describes a gRPC body. Messages are length-prefixed binary
+// GRPCSummary describes a gRPC body. Messages are length-prefixed binary
 // (usually protobuf), so printing them would show noise; the framing, though,
 // says how many messages went by and how large they were.
 //
 // Each message is a 1-byte compressed flag and a 4-byte big-endian length,
 // followed by that many bytes.
-func grpcSummary(raw []byte, incomplete bool) string {
+func GRPCSummary(raw []byte, incomplete bool) string {
 	var msgs, compressed int
 	var payload int64
 	rest := raw
@@ -69,11 +69,11 @@ var grpcCodeNames = []string{
 	"INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED",
 }
 
-// grpcStatusLine summarises a gRPC call's outcome, which lives in the
+// GRPCStatusLine summarises a gRPC call's outcome, which lives in the
 // trailers -- or in the headers of a trailers-only response, the form an error
 // without a body takes. It returns "" for anything that is not gRPC.
-func grpcStatusLine(headers, trailers http.Header) string {
-	if !isGRPCContentType(headers.Get("Content-Type")) {
+func GRPCStatusLine(headers, trailers http.Header) string {
+	if !IsGRPC(headers.Get("Content-Type")) {
 		return ""
 	}
 	src := trailers
@@ -97,4 +97,21 @@ func grpcStatusLine(headers, trailers http.Header) string {
 		line += " — " + msg
 	}
 	return line
+}
+
+// GRPCStatus returns a call's status code, from the trailers or, for a
+// trailers-only response, the headers.
+func GRPCStatus(headers, trailers http.Header) string {
+	if s := trailers.Get("Grpc-Status"); s != "" {
+		return s
+	}
+	return headers.Get("Grpc-Status")
+}
+
+// GRPCCodeName names a gRPC status code.
+func GRPCCodeName(code int) string {
+	if code >= 0 && code < len(grpcCodeNames) {
+		return grpcCodeNames[code]
+	}
+	return ""
 }

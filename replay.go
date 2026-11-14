@@ -1,43 +1,24 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
 )
-
-// recordedExchange is one request/response pair in the v1 record format,
-// written by httpmon 1.x. Replay still reads it.
-type recordedExchange struct {
-	ID          int               `json:"id"`
-	Time        string            `json:"time"`
-	Method      string            `json:"method"`
-	URL         string            `json:"url"`
-	ReqHeaders  map[string]string `json:"req_headers"`
-	ReqBody     string            `json:"req_body,omitempty"`
-	Status      int               `json:"status"`
-	StatusText  string            `json:"status_text"`
-	RespHeaders map[string]string `json:"resp_headers"`
-	RespBody    string            `json:"resp_body,omitempty"`
-	// RespTrailers holds trailers sent after the body, where gRPC puts its status.
-	RespTrailers map[string]string `json:"resp_trailers,omitempty"`
-	DurationMs   int64             `json:"duration_ms"`
-
-	// Set when the stored body is only a prefix: it exceeded --max-capture,
-	// or the stream was cut off before it ended.
-	ReqBodyTruncated  bool `json:"req_body_truncated,omitempty"`
-	RespBodyTruncated bool `json:"resp_body_truncated,omitempty"`
-}
 
 // replayResult is the outcome of replaying a single recorded exchange.
 type replayResult struct {
 	ID             int    `json:"id"`
+	Session        string `json:"session,omitempty"`
 	Method         string `json:"method"`
 	URL            string `json:"url"`
 	RecordedStatus int    `json:"recorded_status"`
@@ -65,25 +46,23 @@ func (r replayResult) Differs() bool {
 // reproduce faithfully; sending an approximation would make the server see a
 // different request and report a difference that is not real.
 const (
-	grpcReplaySkip      = "gRPC call: the v1 recording holds a summary of its binary body, not the bytes"
-	placeholderSkip     = "request body is binary: the v1 recording holds a placeholder, not the bytes"
-	truncatedReqSkip    = "request body was only partly recorded"
-	encodedReqSkip      = "request body was compressed: the v1 recording holds the decoded text"
 	websocketReplaySkip = "WebSocket connection"
 	failedReplaySkip    = "the recorded exchange got no response"
+	truncatedReqSkip    = "request body was only partly recorded"
+	noRawSkip           = "the record has no raw bytes for the request body (made with --format json, not --record?)"
 	redactedReplaySkip  = "credentials were masked by --redact"
 )
 
-// replayFile reads an NDJSON recording and replays each exchange.
-// If targetBase is non-empty it is used as the URL prefix (scheme+host),
-// replacing the original host. Results go to httpmon's output.
+// replayFile reads a record and replays each exchange. If targetBase is
+// non-empty it replaces the scheme and host of every URL. Results go to
+// httpmon's output.
 //
 // Exit codes: 0 = clean, 1 = read/parse failure, 2 = differences found while
 // failOnDiff is set (so CI can gate on it).
 func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff bool) int {
 	f, err := os.Open(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "replay: cannot open %s: %v\n", path, err)
+		fmt.Fprintf(os.Stderr, "httpmon replay: %v\n", err)
 		return 1
 	}
 	defer f.Close()
@@ -93,49 +72,25 @@ func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff 
 	// behind an egress proxy, must still be replayable.
 	client := newUpstreamClient(insecureUpstream)
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 256*1024*1024)
-
+	rd := exchange.NewReader(f)
 	n, errs, diffs, skipped := 0, 0, 0, 0
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+	for {
+		e, err := rd.Next()
+		if errors.Is(err, io.EOF) {
+			break
 		}
-
-		var probe struct {
-			V int `json:"v"`
-		}
-		if err := json.Unmarshal(line, &probe); err != nil {
-			fmt.Fprintf(os.Stderr, "replay: malformed line: %v\n", err)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon replay: %v\n", err)
 			errs++
+			if strings.Contains(err.Error(), "record version") {
+				break // a whole file of another version; one message is enough
+			}
 			continue
 		}
-
-		var res replayResult
-		if probe.V >= 2 {
-			var ex recordV2
-			if err := json.Unmarshal(line, &ex); err != nil {
-				fmt.Fprintf(os.Stderr, "replay: malformed line: %v\n", err)
-				errs++
-				continue
-			}
-			if n > 0 && delayBetween > 0 {
-				time.Sleep(delayBetween)
-			}
-			res = replayV2(client, &ex, targetBase)
-		} else {
-			var ex recordedExchange
-			if err := json.Unmarshal(line, &ex); err != nil {
-				fmt.Fprintf(os.Stderr, "replay: malformed line: %v\n", err)
-				errs++
-				continue
-			}
-			if n > 0 && delayBetween > 0 {
-				time.Sleep(delayBetween)
-			}
-			res = replayOne(client, &ex, targetBase)
+		if n > 0 && delayBetween > 0 {
+			time.Sleep(delayBetween)
 		}
+		res := replayExchange(client, e, targetBase)
 		if res.Differs() {
 			diffs++
 		}
@@ -143,10 +98,6 @@ func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff 
 			skipped++
 		}
 		n++
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "replay: read error: %v\n", err)
-		return 1
 	}
 	if !jsonMode {
 		emitText(fmt.Sprintf("\n%s replayed %d request(s), %d error(s), %d diff(s), %d skipped\n",
@@ -181,103 +132,32 @@ func rebase(u, targetBase string) string {
 	return strings.TrimRight(targetBase, "/") + rest
 }
 
-func replayHeading(id, seq int, session, method, origURL, statusText, replayURL string) {
-	if jsonMode {
-		return
-	}
-	label := fmt.Sprintf("── REPLAY #%d ──", id)
-	if session != "" {
-		label = fmt.Sprintf("── REPLAY #%d (session %s) ──", seq, session)
-	}
-	var b strings.Builder
-	b.WriteString("\n" + paint(colCyan, label) + "\n")
-	fmt.Fprintf(&b, "Original:  %s %s  →  %s\n", sanitizeLine(method), sanitizeLine(origURL), sanitizeLine(statusText))
-	fmt.Fprintf(&b, "Replaying: %s %s\n", sanitizeLine(method), sanitizeLine(replayURL))
-	emitText(b.String())
-}
-
-// replayOne re-issues a single v1 exchange and reports how the response
-// compares.
-func replayOne(client *http.Client, ex *recordedExchange, targetBase string) replayResult {
-	res := replayResult{ID: ex.ID, Method: ex.Method, RecordedStatus: ex.Status}
-	replayURL := rebase(ex.URL, targetBase)
+// replayExchange re-sends one recorded exchange byte for byte and compares
+// the response after removing its Content-Encoding.
+func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string) replayResult {
+	res := replayResult{ID: e.ID, Session: e.Session, Method: e.Method, RecordedStatus: e.Status}
+	replayURL := rebase(e.URL, targetBase)
 	res.URL = replayURL
-	replayHeading(ex.ID, 0, "", ex.Method, ex.URL, ex.StatusText, replayURL)
-
-	reqHeader := make(http.Header, len(ex.ReqHeaders))
-	for k, v := range ex.ReqHeaders {
-		reqHeader.Set(k, v)
+	if !jsonMode {
+		var b strings.Builder
+		fmt.Fprintf(&b, "\n%s\n", paint(colCyan, fmt.Sprintf("── REPLAY #%d (session %s) ──", e.ID, textsafe.Line(e.Session))))
+		fmt.Fprintf(&b, "Original:  %s %s  →  %d %s\n", textsafe.Line(e.Method), textsafe.Line(e.URL), e.Status, textsafe.Line(e.StatusText))
+		fmt.Fprintf(&b, "Replaying: %s %s\n", textsafe.Line(e.Method), textsafe.Line(replayURL))
+		emitText(b.String())
 	}
+
+	reqHeader := e.Request.Headers.HTTP()
+	rb := e.Request.Body
 	switch {
-	case isGRPCContentType(reqHeader.Get("Content-Type")):
-		res.Skipped = grpcReplaySkip
-	case ex.ReqBodyTruncated:
-		res.Skipped = truncatedReqSkip
-	case len(splitEncodings(reqHeader.Get("Content-Encoding"))) > 0 && ex.ReqBody != "":
-		res.Skipped = encodedReqSkip
-	case isBodyPlaceholder(ex.ReqBody):
-		res.Skipped = placeholderSkip
-	}
-	if res.Skipped != "" {
-		emitReplayResult(res, "")
-		return res
-	}
-
-	resp, dur, err := sendReplay(client, ex.Method, replayURL, reqHeader, []byte(ex.ReqBody))
-	res.DurationMs = dur.Milliseconds()
-	if err != nil {
-		res.Err = err.Error()
-		emitReplayResult(res, "")
-		return res
-	}
-	defer resp.Body.Close()
-	raw, overflow := readCapped(resp.Body)
-
-	res.ActualStatus = resp.StatusCode
-	res.StatusMatch = resp.StatusCode == ex.Status
-
-	// v1 stored the display view of the body, so compare like with like: a
-	// binary body is a placeholder on both sides, a compressed one decoded.
-	newBody := strings.TrimSpace(decodeBody(resp.Header, raw, overflow).Text)
-	if ex.RespBodyTruncated {
-		// Only a prefix was recorded, so only a prefix can be compared.
-		res.BodyMatch = strings.HasPrefix(newBody, strings.TrimSpace(ex.RespBody))
-	} else {
-		res.BodyMatch = strings.TrimSpace(ex.RespBody) == newBody
-	}
-
-	emitReplayResult(res, newBody)
-	return res
-}
-
-// isBodyPlaceholder recognises the stand-ins v1 recorded for bodies it did
-// not store: "[binary data, 300+ bytes]", "[gzip, 12+ bytes]", "[gRPC: …]".
-func isBodyPlaceholder(s string) bool {
-	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
-		return false
-	}
-	return strings.HasPrefix(s, "[binary data, ") || strings.HasPrefix(s, "[gRPC: ") ||
-		(strings.Contains(s, ", ") && strings.HasSuffix(s, "+ bytes]"))
-}
-
-// replayV2 re-issues a single v2 exchange. The recording holds the request's
-// bytes, so the request is reproduced exactly, and the response is compared
-// byte for byte after removing its Content-Encoding.
-func replayV2(client *http.Client, ex *recordV2, targetBase string) replayResult {
-	res := replayResult{ID: ex.Seq, Method: ex.Method, RecordedStatus: ex.Status}
-	replayURL := rebase(ex.URL, targetBase)
-	res.URL = replayURL
-	replayHeading(ex.Seq, ex.Seq, ex.Session, ex.Method, ex.URL, ex.StatusText, replayURL)
-
-	reqHeader := ex.ReqHeaders.header()
-	switch {
-	case ex.Kind == "websocket":
+	case e.Kind == "websocket":
 		res.Skipped = websocketReplaySkip
-	case ex.Error != "":
+	case e.Error != nil:
 		res.Skipped = failedReplaySkip
-	case ex.ReqBody != nil && ex.ReqBody.Truncated:
+	case rb != nil && rb.Size > 0 && rb.Raw == nil:
+		res.Skipped = noRawSkip
+	case rb != nil && rb.Raw != nil && rb.Raw.Truncated:
 		res.Skipped = truncatedReqSkip
-	case ex.Redacted && (ex.ReqHeaders.hasSensitive() || redactedURL(ex.URL)):
+	case e.Redacted && (hasSensitiveHeader(reqHeader) || strings.Contains(e.URL, "…")):
 		res.Skipped = redactedReplaySkip
 	}
 	if res.Skipped != "" {
@@ -285,24 +165,24 @@ func replayV2(client *http.Client, ex *recordV2, targetBase string) replayResult
 		return res
 	}
 
-	var body []byte
-	if ex.ReqBody != nil {
-		b, err := decodeBytes(ex.ReqBody.Encoding, ex.ReqBody.Data)
+	var reqBody []byte
+	if rb != nil && rb.Raw != nil {
+		b, err := rb.Raw.Bytes()
 		if err != nil {
 			res.Err = "request body: " + err.Error()
 			emitReplayResult(res, "")
 			return res
 		}
-		body = b
+		reqBody = b
 	}
 
-	grpc := isGRPCContentType(reqHeader.Get("Content-Type"))
+	grpc := body.IsGRPC(reqHeader.Get("Content-Type"))
 	c := client
 	if grpc && strings.HasPrefix(replayURL, "http://") {
 		// A cleartext gRPC server speaks only HTTP/2.
 		c = h2cClient
 	}
-	resp, dur, err := sendReplay(c, ex.Method, replayURL, reqHeader, body)
+	resp, dur, err := sendReplay(c, e.Method, replayURL, reqHeader, reqBody)
 	res.DurationMs = dur.Milliseconds()
 	if err != nil {
 		res.Err = err.Error()
@@ -313,24 +193,23 @@ func replayV2(client *http.Client, ex *recordV2, targetBase string) replayResult
 	raw, overflow := readCapped(resp.Body)
 
 	res.ActualStatus = resp.StatusCode
-	res.StatusMatch = resp.StatusCode == ex.Status
-	if grpc {
-		recHeaders, recTrailers := ex.RespHeaders.header(), ex.RespTrailers.header()
-		res.RecordedGRPCStatus = grpcStatus(recHeaders, recTrailers)
-		res.ActualGRPCStatus = grpcStatus(resp.Header, resp.Trailer)
+	res.StatusMatch = resp.StatusCode == e.Status
+	if grpc && e.Response != nil {
+		res.RecordedGRPCStatus = body.GRPCStatus(e.Response.Headers.HTTP(), e.Response.Trailers.HTTP())
+		res.ActualGRPCStatus = body.GRPCStatus(resp.Header, resp.Trailer)
 		res.StatusMatch = res.StatusMatch && res.RecordedGRPCStatus == res.ActualGRPCStatus
 	}
 
 	var recorded []byte
 	recTruncated := false
-	if ex.RespBody != nil {
-		rb, err := decodeBytes(ex.RespBody.Encoding, ex.RespBody.Data)
+	if e.Response != nil && e.Response.Body != nil && e.Response.Body.Raw != nil {
+		rr, err := e.Response.Body.Raw.Bytes()
 		if err != nil {
 			res.Err = "recorded response body: " + err.Error()
 			emitReplayResult(res, "")
 			return res
 		}
-		recorded, recTruncated = decodeContent(ex.RespHeaders.header().Get("Content-Encoding"), rb, ex.RespBody.Truncated)
+		recorded, recTruncated = decodeContent(e.Response.Body.ContentEncoding, rr, e.Response.Body.Raw.Truncated)
 	}
 	actual, _ := decodeContent(resp.Header.Get("Content-Encoding"), raw, overflow)
 	if recTruncated {
@@ -343,12 +222,21 @@ func replayV2(client *http.Client, ex *recordV2, targetBase string) replayResult
 	return res
 }
 
+func hasSensitiveHeader(h http.Header) bool {
+	for k := range h {
+		if textsafe.IsSensitiveHeader(k) {
+			return true
+		}
+	}
+	return false
+}
+
 // sendReplay sends one replayed request. Hop-by-hop headers and framing are
 // left to the transport, as they would be for any new request.
-func sendReplay(client *http.Client, method, u string, h http.Header, body []byte) (*http.Response, time.Duration, error) {
+func sendReplay(client *http.Client, method, u string, h http.Header, reqBody []byte) (*http.Response, time.Duration, error) {
 	var r io.Reader
-	if len(body) > 0 {
-		r = bytes.NewReader(body)
+	if len(reqBody) > 0 {
+		r = bytes.NewReader(reqBody)
 	}
 	req, err := http.NewRequest(method, u, r)
 	if err != nil {
@@ -381,30 +269,14 @@ func readCapped(r io.Reader) ([]byte, bool) {
 // decodeContent removes a Content-Encoding from raw. A body that cannot be
 // decoded is returned as it is.
 func decodeContent(encoding string, raw []byte, truncated bool) ([]byte, bool) {
-	if len(splitEncodings(encoding)) == 0 {
+	if len(body.SplitEncodings(encoding)) == 0 {
 		return raw, truncated
 	}
-	res, err := decompressBody(encoding, raw)
+	res, err := body.Decompress(encoding, raw)
 	if err != nil {
 		return raw, truncated
 	}
 	return res.Data, truncated || res.Truncated
-}
-
-// decodeForCompare decompresses a replayed response body so it can be compared
-// against a recording that stores bodies already decoded.
-func decodeForCompare(h http.Header, body []byte) string {
-	b, _ := decodeContent(h.Get("Content-Encoding"), body, false)
-	return string(b)
-}
-
-// grpcStatus returns a gRPC call's status code, from the trailers or, for a
-// trailers-only response, the headers.
-func grpcStatus(headers, trailers http.Header) string {
-	if s := trailers.Get("Grpc-Status"); s != "" {
-		return s
-	}
-	return headers.Get("Grpc-Status")
 }
 
 // emitReplayResult renders one replay outcome, as coloured text or NDJSON.
@@ -419,7 +291,7 @@ func emitReplayResult(res replayResult, newBody string) {
 	case res.Skipped != "":
 		fmt.Fprintf(&b, "  %s: %s\n", paint(colYellow, "SKIP"), res.Skipped)
 	case res.Err != "":
-		fmt.Fprintf(&b, "  %s: %s\n", paint(colRed, "FAIL"), sanitizeLine(res.Err))
+		fmt.Fprintf(&b, "  %s: %s\n", paint(colRed, "FAIL"), textsafe.Line(res.Err))
 	default:
 		statusIcon := paint(colGreen, "✓")
 		if !res.StatusMatch {
@@ -438,7 +310,7 @@ func emitReplayResult(res replayResult, newBody string) {
 			if len(r) > 200 {
 				newBody = string(r[:200]) + "…"
 			}
-			fmt.Fprintf(&b, "    now: %s\n", sanitizeLine(newBody))
+			fmt.Fprintf(&b, "    now: %s\n", textsafe.Line(newBody))
 		}
 	}
 	emitText(b.String())

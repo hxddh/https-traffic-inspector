@@ -3,6 +3,8 @@ package main
 import (
 	"sync"
 	"time"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
 )
 
 // capturedRequest and capturedResponse are the two halves of an exchange as
@@ -16,9 +18,11 @@ type capturedResponse struct {
 	facts responseFacts
 	body  bodyView
 	// err is set when the exchange failed and facts holds only the duration.
-	err string
-	// ws holds the messages of an upgraded WebSocket connection.
-	ws []wsMessage
+	err *exchange.Error
+	// ws holds the messages of an upgraded WebSocket connection, and
+	// wsDropped how many more were not kept.
+	ws        []wsMessage
+	wsDropped int
 }
 
 // exchangeJoiner pairs the two halves of each exchange by request ID.
@@ -80,8 +84,8 @@ func (j *exchangeJoiner) addResponse(id int, rs capturedResponse) {
 
 // addFailure records that an exchange got no response. It completes once the
 // request half arrives, so a failed exchange is recorded like any other.
-func (j *exchangeJoiner) addFailure(id int, msg string, dur time.Duration) {
-	j.addResponse(id, capturedResponse{facts: responseFacts{duration: dur}, err: msg})
+func (j *exchangeJoiner) addFailure(id int, info *exchange.Error, dur time.Duration) {
+	j.addResponse(id, capturedResponse{facts: responseFacts{duration: dur}, err: info})
 }
 
 // drop abandons an exchange that will never complete, such as one whose
@@ -106,10 +110,14 @@ func (j *exchangeJoiner) pending() int {
 	return len(j.reqs) + len(j.resps) + len(j.dropped)
 }
 
-// completeExchange hands a finished exchange to each capture that wants it.
+// completeExchange hands a finished exchange to the active output, the
+// digest and --fail-on, and to each capture that wants it.
 func completeExchange(id int, r capturedRequest, rs capturedResponse) {
+	e := buildExchange(id, r, rs, false)
+	runStats.add(e)
+	currentSink().exchange(e)
 	if recordMode {
-		writeRecord(id, r, rs)
+		writeRecord(buildExchange(id, r, rs, true))
 	}
 	if harMode {
 		addHAREntry(r, rs)

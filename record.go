@@ -8,138 +8,145 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"strings"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
 )
 
-// ---- record format v2 ----
+// ---- exchange records ----
 //
-// One JSON object per line, each a complete exchange. Unlike v1, which stored
-// the human-readable view of each body (and so a placeholder for anything
-// binary), v2 stores what crossed the wire:
-//
-//   - headers as an ordered list of [name, value] pairs, so repeated headers
-//     such as Set-Cookie survive;
-//   - bodies as their raw bytes -- UTF-8 text verbatim, anything else base64 --
-//     with the decoded text alongside when the body was compressed;
-//   - a session id and sequence number, unique across appended runs;
-//   - failed exchanges, with the error, and WebSocket messages.
+// One shape serves both --format json and --record: an exchange.Exchange,
+// request and response together. The JSON output carries bodies rendered for
+// reading -- a JSON value, text, decoded gRPC -- cut to --max-body; a record
+// carries the same plus each body's raw bytes, which replay needs.
 
-const recordVersion = 2
+// recordSession identifies this run's records in a file appended to by
+// several runs.
+var recordSession = newSessionID()
 
-type recordV2 struct {
-	V       int    `json:"v"`
-	Session string `json:"session"`
-	Seq     int    `json:"seq"`
-	Time    string `json:"time"`
-	Kind    string `json:"kind"` // "http" or "websocket"
-
-	Method     string     `json:"method"`
-	URL        string     `json:"url"`
-	Proto      string     `json:"proto,omitempty"`
-	ReqHeaders headerList `json:"req_headers"`
-	ReqBody    *recBody   `json:"req_body,omitempty"`
-
-	Status       int        `json:"status,omitempty"`
-	StatusText   string     `json:"status_text,omitempty"`
-	RespProto    string     `json:"resp_proto,omitempty"`
-	RespHeaders  headerList `json:"resp_headers,omitempty"`
-	RespBody     *recBody   `json:"resp_body,omitempty"`
-	RespTrailers headerList `json:"resp_trailers,omitempty"`
-
-	DurationMs float64 `json:"duration_ms"`
-	// Error is set, and the response fields are empty, when no response came.
-	Error string `json:"error,omitempty"`
-
-	WSMessages []recWSMessage `json:"ws_messages,omitempty"`
-	WSDropped  int            `json:"ws_dropped,omitempty"`
-
-	// Redacted marks a recording made with --redact: credentials in headers
-	// and the URL are masked, so requests that carried them cannot be replayed.
-	Redacted bool `json:"redacted,omitempty"`
+func newSessionID() string {
+	var b [4]byte
+	rand.Read(b[:]) //nolint:errcheck // never fails
+	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
 }
 
-// headerList is an ordered list of [name, value] pairs.
-type headerList [][2]string
-
-// recBody is a body as it crossed the wire.
-type recBody struct {
-	Encoding  string `json:"encoding"` // "utf8" or "base64"
-	Data      string `json:"data"`
-	Size      int64  `json:"size"` // bytes on the wire; more than Data holds when truncated
-	Truncated bool   `json:"truncated,omitempty"`
-	// Decoded is the text with its Content-Encoding removed, when the body
-	// was compressed and decodes to text.
-	Decoded string `json:"decoded,omitempty"`
+func millis(d time.Duration) float64 {
+	return math.Round(float64(d)/float64(time.Microsecond)) / 1000
 }
 
-type recWSMessage struct {
-	From        string `json:"from"` // "client" or "server"
-	Time        string `json:"time"`
-	Type        string `json:"type"`
-	Size        int64  `json:"size"`
-	Encoding    string `json:"encoding,omitempty"`
-	Data        string `json:"data,omitempty"`
-	Truncated   bool   `json:"truncated,omitempty"`
-	CloseCode   int    `json:"close_code,omitempty"`
-	CloseReason string `json:"close_reason,omitempty"`
-}
-
-// toHeaderList orders h by name, keeping each name's values in order.
-func toHeaderList(h http.Header) headerList {
-	if len(h) == 0 {
-		return nil
+// buildExchange turns a completed exchange into its record. forRecord selects
+// the --record form: masked only under --redact, and with raw bytes; otherwise
+// it is the displayed form, masked unless --show-secrets.
+func buildExchange(id int, r capturedRequest, rs capturedResponse, forRecord bool) *exchange.Exchange {
+	headers, url := displayHeaders, displayURL
+	if forRecord {
+		headers, url = captureHeaders, captureURL
 	}
-	out := make(headerList, 0, len(h))
-	for _, k := range sortedKeys(h) {
-		for _, v := range h[k] {
-			out = append(out, [2]string{k, v})
+	e := &exchange.Exchange{
+		V:          exchange.Version,
+		Session:    recordSession,
+		ID:         id,
+		Time:       exchange.FormatTime(r.facts.startTime),
+		Kind:       "http",
+		Method:     r.facts.method,
+		URL:        url(r.facts.rawURL),
+		DurationMs: millis(rs.facts.totalDuration()),
+		Request: exchange.Message{
+			Proto:   r.facts.proto,
+			Headers: exchange.FromHTTP(headers(r.facts.headers)),
+		},
+		Redacted: forRecord && redactCaptures,
+	}
+	e.Request.Body, _ = renderBody(r.facts.headers, r.body, forRecord)
+	if rs.err != nil {
+		e.Error = rs.err
+		return e
+	}
+
+	f := rs.facts
+	e.Status = f.status
+	e.StatusText = statusText(f.statusText)
+	resp := &exchange.Message{
+		Proto:   f.proto,
+		Headers: exchange.FromHTTP(headers(f.headers)),
+	}
+	if len(f.trailers) > 0 {
+		resp.Trailers = exchange.FromHTTP(headers(f.trailers))
+	}
+	var hint string
+	resp.Body, hint = renderBody(f.headers, rs.body, forRecord)
+	if f.status >= 400 {
+		e.Hint = hint
+	}
+	e.Response = resp
+
+	if body.IsGRPC(f.headers.Get("Content-Type")) {
+		if code := body.GRPCStatus(f.headers, f.trailers); code != "" {
+			n, _ := strconv.Atoi(code)
+			msg := f.trailers.Get("Grpc-Message")
+			if msg == "" {
+				msg = f.headers.Get("Grpc-Message")
+			}
+			e.GRPC = &exchange.GRPCStatus{Code: n, Name: body.GRPCCodeName(n), Message: msg}
 		}
 	}
-	return out
-}
 
-func (l headerList) header() http.Header {
-	h := make(http.Header, len(l))
-	for _, kv := range l {
-		h.Add(kv[0], kv[1])
-	}
-	return h
-}
-
-// encodeBytes stores b as UTF-8 text when it is, and base64 otherwise.
-func encodeBytes(b []byte) (encoding, data string) {
-	if utf8.Valid(b) {
-		return "utf8", string(b)
-	}
-	return "base64", base64.StdEncoding.EncodeToString(b)
-}
-
-func decodeBytes(encoding, data string) ([]byte, error) {
-	if encoding == "base64" {
-		return base64.StdEncoding.DecodeString(data)
-	}
-	return []byte(data), nil
-}
-
-func newRecBody(h http.Header, v bodyView) *recBody {
-	if v.Size == 0 && len(v.Raw) == 0 {
-		return nil
-	}
-	b := &recBody{Size: v.Size, Truncated: v.RawTruncated}
-	b.Encoding, b.Data = encodeBytes(v.Raw)
-	if len(splitEncodings(h.Get("Content-Encoding"))) > 0 {
-		if dec, err := decompressBody(h.Get("Content-Encoding"), v.Raw); err == nil &&
-			utf8.Valid(dec.Data) && isPrintableContentType(h.Get("Content-Type")) {
-			b.Decoded = string(dec.Data)
+	if f.upgraded {
+		e.Kind = "websocket"
+		e.WebSocket = &exchange.WebSocket{Messages: []exchange.WSMessage{}, Dropped: rs.wsDropped}
+		for _, m := range rs.ws {
+			e.WebSocket.Messages = append(e.WebSocket.Messages, wsRecord(m, forRecord))
 		}
 	}
-	return b
+	return e
 }
 
-// recordFile is the open file used by the proxy when --record is active.
+// statusText strips the code from "404 Not Found".
+func statusText(s string) string {
+	if len(s) > 4 && s[3] == ' ' {
+		return s[4:]
+	}
+	return s
+}
+
+// renderBody renders a captured body; a record also keeps the raw bytes.
+func renderBody(h http.Header, v bodyView, forRecord bool) (*body.Rendered, string) {
+	r, hint := body.Render(h, v.Raw, v.RawTruncated, v.Size, displayMaxBody)
+	if r != nil && forRecord {
+		r.Raw = body.NewRaw(v.Raw, v.RawTruncated)
+	}
+	return r, hint
+}
+
+func wsRecord(m wsMessage, forRecord bool) exchange.WSMessage {
+	rm := exchange.WSMessage{
+		From: m.sender(), Time: exchange.FormatTime(m.at), Type: m.typeName(), Size: m.size,
+		Compressed: m.compressed, Truncated: m.truncated,
+		CloseCode: m.closeCode, CloseReason: m.closeReason,
+	}
+	if m.opcode == wsClose || len(m.data) == 0 {
+		return rm
+	}
+	data := m.data
+	if !forRecord && len(data) > displayMaxBody {
+		data, rm.Truncated = data[:displayMaxBody], true
+	}
+	if utf8.Valid(data) {
+		s := string(data)
+		rm.Text = &s
+	} else {
+		rm.Base64 = base64.StdEncoding.EncodeToString(data)
+	}
+	return rm
+}
+
+// ---- --record ----
+
 var (
 	recordFile    *os.File
 	recordEncoder *json.Encoder
@@ -147,17 +154,7 @@ var (
 	// json.Encoder is not safe for concurrent use, so unguarded writes could
 	// interleave two records on one line.
 	recordMu sync.Mutex
-
-	// recordSession identifies this run's records in a file appended to by
-	// several runs.
-	recordSession = newSessionID()
 )
-
-func newSessionID() string {
-	var b [4]byte
-	rand.Read(b[:]) //nolint:errcheck // never fails
-	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
-}
 
 // openRecordFile opens (or creates) the NDJSON recording file.
 func openRecordFile(path string) error {
@@ -169,59 +166,12 @@ func openRecordFile(path string) error {
 	}
 	recordFile = f
 	recordEncoder = json.NewEncoder(f)
+	recordEncoder.SetEscapeHTML(false)
 	return nil
 }
 
-func millis(d time.Duration) float64 {
-	return math.Round(float64(d)/float64(time.Microsecond)) / 1000
-}
-
-// buildRecord turns a completed exchange into a v2 record.
-func buildRecord(id int, r capturedRequest, rs capturedResponse) recordV2 {
-	e := recordV2{
-		V:          recordVersion,
-		Session:    recordSession,
-		Seq:        id,
-		Time:       r.facts.startTime.UTC().Format("2006-01-02T15:04:05.000Z07:00"),
-		Kind:       "http",
-		Method:     r.facts.method,
-		URL:        captureURL(r.facts.rawURL),
-		Proto:      r.facts.proto,
-		ReqHeaders: toHeaderList(captureHeaders(r.facts.headers)),
-		ReqBody:    newRecBody(r.facts.headers, r.body),
-		DurationMs: millis(rs.facts.totalDuration()),
-		Redacted:   redactCaptures,
-	}
-	if rs.err != "" {
-		e.Error = rs.err
-		return e
-	}
-	e.Status = rs.facts.status
-	e.StatusText = rs.facts.statusText
-	e.RespProto = rs.facts.proto
-	e.RespHeaders = toHeaderList(captureHeaders(rs.facts.headers))
-	e.RespBody = newRecBody(rs.facts.headers, rs.body)
-	e.RespTrailers = toHeaderList(captureHeaders(rs.facts.trailers))
-	if rs.facts.upgraded {
-		e.Kind = "websocket"
-		for _, m := range rs.ws {
-			rm := recWSMessage{
-				From: m.sender(), Time: m.at.UTC().Format("2006-01-02T15:04:05.000Z07:00"),
-				Type: m.typeName(), Size: m.size, Truncated: m.truncated,
-				CloseCode: m.closeCode, CloseReason: m.closeReason,
-			}
-			if m.opcode != wsClose && len(m.data) > 0 {
-				rm.Encoding, rm.Data = encodeBytes(m.data)
-			}
-			e.WSMessages = append(e.WSMessages, rm)
-		}
-	}
-	return e
-}
-
 // writeRecord appends one completed exchange to the recording.
-func writeRecord(id int, r capturedRequest, rs capturedResponse) {
-	e := buildRecord(id, r, rs)
+func writeRecord(e *exchange.Exchange) {
 	recordMu.Lock()
 	defer recordMu.Unlock()
 	if recordEncoder != nil {
@@ -229,17 +179,40 @@ func writeRecord(id int, r capturedRequest, rs capturedResponse) {
 	}
 }
 
-// isSensitiveHeaderList reports whether any header in l carries credentials.
-func (l headerList) hasSensitive() bool {
-	for _, kv := range l {
-		if isSensitiveHeader(kv[0]) {
-			return true
-		}
-	}
-	return false
+// ---- run statistics ----
+
+// started counts the exchanges that were logged, so the digest can report
+// the ones that never finished.
+var started atomic.Int64
+
+// stats feeds the end-of-run digest and --fail-on.
+type stats struct {
+	mu     sync.Mutex
+	digest exchange.Digest
+	failOn *exchange.FailOn
 }
 
-// redactedURL reports whether u had a credential masked by --redact.
-func redactedURL(u string) bool {
-	return strings.Contains(u, "…(") || strings.Contains(u, ":…@")
+var runStats = &stats{}
+
+func (s *stats) add(e *exchange.Exchange) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.digest.Add(e)
+	if s.failOn.Match(e) {
+		s.digest.Matched = append(s.digest.Matched, e.ID)
+	}
+}
+
+// final returns the digest for the end of the run.
+func (s *stats) final() *exchange.Digest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.digest
+	if n := int(started.Load()) - d.Total; n > 0 {
+		d.Incomplete = n
+	}
+	if d.ByClass == nil {
+		d.ByClass = map[string]int{}
+	}
+	return &d
 }

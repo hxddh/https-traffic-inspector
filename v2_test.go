@@ -17,31 +17,12 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
 	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
 // ---- terminal safety ----
-
-func TestSanitizeTerminal(t *testing.T) {
-	for _, tc := range []struct{ in, want string }{
-		{"plain text\nline two\ttab", "plain text\nline two\ttab"},
-		{"clip \x1b]52;c;ZXZpbA==\x07", `clip \x1b]52;c;ZXZpbA==\x07`},
-		{"clear \x1b[2J", `clear \x1b[2J`},
-		{"crlf\r\nok", "crlf\nok"},
-		{"over\rwrite", `over\rwrite`},
-		{"c1 \u009b31m", `c1 \u009b31m`},
-		{"bidi \u202egnp.exe", `bidi \u202egnp.exe`},
-		{"bad \xff utf8", `bad \xff utf8`},
-		{"unicode ünïcødé 日本", "unicode ünïcødé 日本"},
-	} {
-		if got := sanitizeTerminal(tc.in); got != tc.want {
-			t.Errorf("sanitizeTerminal(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-	if got := sanitizeLine("a\nb\tc"); got != `a\nb\tc` {
-		t.Errorf("sanitizeLine kept a line break: %q", got)
-	}
-}
 
 // Regression: response bodies were written to the terminal as they came, so a
 // server could write the user's clipboard (OSC 52) or clear the screen.
@@ -155,48 +136,6 @@ func TestForward_UpstreamSeesTheClientsHeaders(t *testing.T) {
 
 // ---- credential masking ----
 
-func TestMaskHeaders(t *testing.T) {
-	h := http.Header{
-		"Authorization": {"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload"},
-		"Cookie":        {"session=abcdef0123456789abcdef; theme=dark"},
-		"Set-Cookie":    {"sid=0123456789abcdef0123; Path=/; HttpOnly"},
-		"X-Api-Key":     {"short"},
-		"Accept":        {"*/*"},
-	}
-	m := maskHeaders(h)
-	if got := m.Get("Authorization"); got != "Bearer eyJh…(44 chars)" {
-		t.Errorf("Authorization = %q", got)
-	}
-	if got := m.Get("Cookie"); got != "session=abcd…(22 chars); theme=…(4 chars)" {
-		t.Errorf("Cookie = %q", got)
-	}
-	if got := m.Get("Set-Cookie"); got != "sid=0123…(20 chars); Path=/; HttpOnly" {
-		t.Errorf("Set-Cookie = %q", got)
-	}
-	if got := m.Get("X-Api-Key"); got != "…(5 chars)" {
-		t.Errorf("X-Api-Key = %q", got)
-	}
-	if got := m.Get("Accept"); got != "*/*" {
-		t.Errorf("Accept was changed: %q", got)
-	}
-	if h.Get("Authorization") == m.Get("Authorization") {
-		t.Error("maskHeaders modified its input")
-	}
-}
-
-func TestMaskURL(t *testing.T) {
-	for _, tc := range []struct{ in, want string }{
-		{"https://h/p?a=1&access_token=abcdefghijklmnopqrstuvwxyz&b=2", "https://h/p?a=1&access_token=abcd…(26 chars)&b=2"},
-		{"https://s3/k?X-Amz-Signature=0123456789abcdef0123&X-Amz-Date=1", "https://s3/k?X-Amz-Signature=0123…(20 chars)&X-Amz-Date=1"},
-		{"https://user:hunter2@h/p", "https://user:…@h/p"},
-		{"https://h/p?q=search#frag", "https://h/p?q=search#frag"},
-	} {
-		if got := maskURL(tc.in); got != tc.want {
-			t.Errorf("maskURL(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
 func TestTextOutput_MasksCredentialsUnlessShown(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer upstream.Close()
@@ -246,18 +185,19 @@ func TestFailure_ReportedInEveryOutput(t *testing.T) {
 		t.Fatalf("status = %d, want 502", rr.Code)
 	}
 
-	var failure jsonFailure
-	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
-		if strings.Contains(line, `"error"`) {
-			json.Unmarshal([]byte(line), &failure) //nolint:errcheck
-		}
+	var failure exchange.Exchange
+	if err := json.Unmarshal(bytes.TrimSpace([]byte(out.String())), &failure); err != nil {
+		t.Fatalf("JSON output is not one exchange: %v\n%s", err, out.String())
 	}
-	if failure.ReqID == 0 || failure.Error == "" {
-		t.Errorf("JSON output has no failure object:\n%s", out.String())
+	if failure.Error == nil || failure.Error.Kind != exchange.KindRefused || failure.Response != nil {
+		t.Errorf("exchange = %+v, want error kind refused and no response", failure)
+	}
+	if strings.Contains(failure.Error.Message, ":80/") {
+		t.Errorf("error message names the dialled address, not the URL: %q", failure.Error.Message)
 	}
 
-	recs := readRecords(t, recPath)
-	if len(recs) != 1 || recs[0].Error == "" || recs[0].Status != 0 {
+	recs := readRecordFile(t, recPath)
+	if len(recs) != 1 || recs[0].Error == nil || recs[0].Status != 0 {
 		t.Errorf("record = %+v, want one entry with an error and no status", recs)
 	}
 	entries := mem.entries()
@@ -326,19 +266,14 @@ func TestRecordReplay_BinaryBodiesRoundTrip(t *testing.T) {
 		handleHTTP(httptest.NewRecorder(), req)
 	}()
 
-	recs := readRecords(t, recPath)
+	recs := readRecordFile(t, recPath)
 	if len(recs) != 1 {
 		t.Fatalf("recorded %d exchanges", len(recs))
 	}
-	if rb := recs[0].ReqBody; rb == nil || rb.Encoding != "base64" || rb.Size != 300 {
-		t.Errorf("req_body = %+v, want 300 bytes in base64", rb)
+	if rb := recs[0].Request.Body; rb == nil || rb.Raw == nil || rb.Raw.Encoding != "base64" || rb.Size != 300 {
+		t.Errorf("request body = %+v, want 300 bytes in base64", rb)
 	}
-	var cookies []string
-	for _, kv := range recs[0].RespHeaders {
-		if kv[0] == "Set-Cookie" {
-			cookies = append(cookies, kv[1])
-		}
-	}
+	cookies := recs[0].Response.Headers["Set-Cookie"]
 	if len(cookies) != 2 {
 		t.Errorf("Set-Cookie headers = %q, want both kept separately", cookies)
 	}
@@ -352,41 +287,28 @@ func TestRecordReplay_BinaryBodiesRoundTrip(t *testing.T) {
 	}
 }
 
-func TestReplayV1_SkipsWhatItCannotReproduce(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(bytes.Repeat([]byte{1, 2, 3}, 10)) //nolint:errcheck
-	}))
-	defer upstream.Close()
-	out := captureText(t)
-
-	path := writeRecording(t,
-		recordedExchange{ID: 1, Method: "POST", URL: upstream.URL + "/a", Status: 200,
-			ReqHeaders: map[string]string{"Content-Type": "application/octet-stream"}, ReqBody: "[binary data, 300+ bytes]"},
-		recordedExchange{ID: 2, Method: "POST", URL: upstream.URL + "/b", Status: 200,
-			ReqBody: "partial", ReqBodyTruncated: true},
-		// A binary response recorded by v1 compares equal when unchanged.
-		recordedExchange{ID: 3, Method: "GET", URL: upstream.URL + "/c", Status: 200,
-			RespBody: "[binary data, 30+ bytes]"},
-	)
-	if code := replayFile(path, "", 0, true); code != 0 {
-		t.Fatalf("replay exit = %d, want 0; output:\n%s", code, out.String())
-	}
-	text := out.String()
-	if strings.Count(text, "SKIP") != 2 {
-		t.Errorf("want 2 skipped exchanges; output:\n%s", text)
+// Without backward compatibility, a record of another version is refused
+// with a message that says so, not replayed half-understood.
+func TestReplay_RejectsOtherRecordVersions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.ndjson")
+	os.WriteFile(path, []byte(`{"v":2,"session":"s","seq":1,"method":"GET","url":"http://x/"}`+"\n"), 0o600) //nolint:errcheck
+	captureText(t)
+	if code := replayFile(path, "", 0, false); code != 1 {
+		t.Errorf("exit = %d, want 1", code)
 	}
 }
 
-func TestReplayV2_SkipsWebSocketsFailuresAndRedacted(t *testing.T) {
+func TestReplay_SkipsWebSocketsFailuresAndRedacted(t *testing.T) {
 	out := captureText(t)
-	lines := []recordV2{
-		{V: 2, Session: "s", Seq: 1, Kind: "websocket", Method: "GET", URL: "http://127.0.0.1:1/ws", Status: 101},
-		{V: 2, Session: "s", Seq: 2, Kind: "http", Method: "GET", URL: "http://127.0.0.1:1/x", Error: "refused"},
-		{V: 2, Session: "s", Seq: 3, Kind: "http", Method: "GET", URL: "http://127.0.0.1:1/y", Status: 200,
-			Redacted: true, ReqHeaders: headerList{{"Authorization", "Bearer abcd…(40 chars)"}}},
+	lines := []*exchange.Exchange{
+		{V: 3, Session: "s", ID: 1, Kind: "websocket", Method: "GET", URL: "http://127.0.0.1:1/ws", Status: 101},
+		{V: 3, Session: "s", ID: 2, Kind: "http", Method: "GET", URL: "http://127.0.0.1:1/x", Error: &exchange.Error{Kind: "refused"}},
+		{V: 3, Session: "s", ID: 3, Kind: "http", Method: "GET", URL: "http://127.0.0.1:1/y", Status: 200,
+			Redacted: true, Request: exchange.Message{Headers: exchange.Headers{"Authorization": {"Bearer abcd…(40 chars)"}}}},
+		{V: 3, Session: "s", ID: 4, Kind: "http", Method: "POST", URL: "http://127.0.0.1:1/z", Status: 200,
+			Request: exchange.Message{Body: &body.Rendered{Size: 10, Raw: &body.Raw{Encoding: "utf8", Data: "part", Truncated: true}}}},
 	}
-	path := filepath.Join(t.TempDir(), "v2.ndjson")
+	path := filepath.Join(t.TempDir(), "v3.ndjson")
 	var b bytes.Buffer
 	for _, l := range lines {
 		json.NewEncoder(&b).Encode(l) //nolint:errcheck
@@ -395,8 +317,8 @@ func TestReplayV2_SkipsWebSocketsFailuresAndRedacted(t *testing.T) {
 	if code := replayFile(path, "", 0, true); code != 0 {
 		t.Fatalf("exit = %d; output:\n%s", code, out.String())
 	}
-	if n := strings.Count(out.String(), "SKIP"); n != 3 {
-		t.Errorf("skipped %d, want 3; output:\n%s", n, out.String())
+	if n := strings.Count(out.String(), "SKIP"); n != 4 {
+		t.Errorf("skipped %d, want 4; output:\n%s", n, out.String())
 	}
 }
 
@@ -777,7 +699,7 @@ func TestBinary_OutputLeavesStdoutToTheCommand(t *testing.T) {
 		if stdout.String() != `{"from":"upstream"}` {
 			t.Errorf("%s: stdout = %q, want only curl's output", format, stdout.String())
 		}
-		if !strings.Contains(stderr.String(), `"req_id":1`) && !strings.Contains(stderr.String(), "RESPONSE #1") {
+		if e := stderr.String(); !strings.Contains(e, `"id":1`) && !strings.Contains(e, "RESPONSE #1") {
 			t.Errorf("%s: stderr lacks httpmon's output:\n%s", format, stderr.String())
 		}
 	}
@@ -794,7 +716,7 @@ func TestBinary_OutputLeavesStdoutToTheCommand(t *testing.T) {
 			t.Errorf("-o file has a non-JSON line: %q", line)
 		}
 	}
-	if !bytes.Contains(data, []byte(`"req_id":1`)) {
+	if !bytes.Contains(data, []byte(`"id":1`)) {
 		t.Errorf("-o file lacks the response:\n%s", data)
 	}
 }

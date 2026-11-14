@@ -258,41 +258,6 @@ func TestRemoveHopByHop_KeepsTETrailers(t *testing.T) {
 	}
 }
 
-func TestGRPCSummary(t *testing.T) {
-	two := append(grpcFrame([]byte("abc")), grpcFrame([]byte("de"))...)
-	for _, tc := range []struct {
-		raw        []byte
-		incomplete bool
-		want       string
-	}{
-		{grpcFrame([]byte("abc")), false, "[gRPC: 1 message, 3 payload bytes]"},
-		{two, false, "[gRPC: 2 messages, 5 payload bytes]"},
-		{two[:9], false, "[gRPC: 1+ messages, 3+ payload bytes]"},  // cut inside the second header
-		{two[:14], false, "[gRPC: 2+ messages, 5+ payload bytes]"}, // cut inside the second payload
-		{grpcFrame([]byte("abc")), true, "[gRPC: 1+ messages, 3+ payload bytes]"},
-		{append([]byte{1, 0, 0, 0, 1}, 'x'), false, "[gRPC: 1 message, 1 payload bytes, 1 compressed]"},
-	} {
-		if got := grpcSummary(tc.raw, tc.incomplete); got != tc.want {
-			t.Errorf("grpcSummary(%v, %v) = %q, want %q", tc.raw, tc.incomplete, got, tc.want)
-		}
-	}
-}
-
-func TestGRPCStatusLine(t *testing.T) {
-	grpcHdr := http.Header{"Content-Type": {"application/grpc+proto"}}
-	if got := grpcStatusLine(grpcHdr, http.Header{"Grpc-Status": {"0"}}); got != "gRPC status: 0 OK" {
-		t.Errorf("got %q", got)
-	}
-	// Trailers-only: an error without a body puts its status in the headers.
-	only := http.Header{"Content-Type": {"application/grpc"}, "Grpc-Status": {"16"}, "Grpc-Message": {"bad%20token"}}
-	if got := grpcStatusLine(only, nil); got != "gRPC status: 16 UNAUTHENTICATED — bad token" {
-		t.Errorf("got %q", got)
-	}
-	if got := grpcStatusLine(http.Header{"Content-Type": {"application/json"}}, nil); got != "" {
-		t.Errorf("non-gRPC got %q", got)
-	}
-}
-
 // Regression: over HTTP/2 an empty body is not http.NoBody, so the v1.2.2
 // fix did not apply and a "content-length: 0" POST from curl --http2 reached
 // the upstream as Transfer-Encoding: chunked again.

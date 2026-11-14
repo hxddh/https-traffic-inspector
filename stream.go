@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
 )
 
 // bodySampler wraps a body so its content can be logged without holding up
@@ -113,7 +115,9 @@ func sampleBody(bodyp *io.ReadCloser, h http.Header, length int64, onDone func(b
 // captureLimitFor reports how many bytes of a body to retain. Recording, HAR
 // export and decompression all need more than the display limit.
 func captureLimitFor(h http.Header) int {
-	if recordMode || harMode || len(splitEncodings(h.Get("Content-Encoding"))) > 0 {
+	// The summary and JSON outputs render from the whole body: a JSON body is
+	// parsed and cut by structure, and an error body is searched for a code.
+	if recordMode || harMode || jsonMode || summaryMode || len(body.SplitEncodings(h.Get("Content-Encoding"))) > 0 {
 		return captureMaxBody
 	}
 	return displayMaxBody
@@ -127,12 +131,12 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 		return bodyView{}
 	}
 
-	if isGRPCContentType(h.Get("Content-Type")) {
-		return bodyView{Text: grpcSummary(raw, incomplete), Truncated: incomplete}
+	if body.IsGRPC(h.Get("Content-Type")) {
+		return bodyView{Text: body.GRPCSummary(raw, incomplete), Truncated: incomplete}
 	}
 
 	enc := h.Get("Content-Encoding")
-	compressed := len(splitEncodings(enc)) > 0
+	compressed := len(body.SplitEncodings(enc)) > 0
 
 	if !compressed {
 		if looksLikeText(h.Get("Content-Type"), raw, incomplete) {
@@ -141,7 +145,9 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 		return bodyView{Text: binaryPlaceholder(raw)}
 	}
 
-	res, err := decompressBody(enc, raw)
+	// This view is only shown, never stored, so decoding stops just past what
+	// can be shown: the rest would be thrown away.
+	res, err := body.DecompressLimit(enc, raw, displayMaxBody+utf8.UTFMax)
 	if err == nil && isPrintableContentType(h.Get("Content-Type")) {
 		return bodyView{Text: string(res.Data), Truncated: res.Truncated || incomplete}
 	}

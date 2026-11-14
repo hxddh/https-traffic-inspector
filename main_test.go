@@ -3,14 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/flate"
 	"compress/gzip"
-	"compress/zlib"
-	crand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 
 	"fmt"
 	"io"
@@ -25,7 +21,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
 )
 
 // ---- generateCert ----
@@ -428,73 +424,41 @@ func TestHandleHTTP_ViaProxyClient(t *testing.T) {
 
 // ---- JSON logging ----
 
-func TestLogRequest_JSONMode(t *testing.T) {
-	saved := jsonMode
-	jsonMode = true
-	defer func() { jsonMode = saved }()
+// --format json writes one object per exchange, request and response
+// together, with a JSON body embedded as a value.
+func TestJSONOutput_OneObjectPerExchange(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"id":42}`) //nolint:errcheck
+	}))
+	defer upstream.Close()
+	out := captureJSON(t)
 
-	var buf bytes.Buffer
-	jsonEnc = json.NewEncoder(&buf)
+	req := httptest.NewRequest(http.MethodPost, upstream.URL+"/api?foo=bar", strings.NewReader(`{"name":"x"}`))
+	req.RequestURI = ""
+	req.Header.Set("Content-Type", "application/json")
+	handleHTTP(httptest.NewRecorder(), req)
 
-	req, _ := http.NewRequest("GET", "https://example.com/api?foo=bar", nil)
-	req.Host = "example.com"
-	req.Proto = "HTTP/1.1"
-
-	reqID := logRequest(req)
-	if reqID <= 0 {
-		t.Errorf("reqID = %d, want > 0", reqID)
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want one object for the exchange:\n%s", len(lines), out.String())
 	}
-
-	var entry jsonRequest
-	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
-		t.Fatalf("invalid JSON: %v\nraw: %s", err, buf.String())
+	var e exchange.Exchange
+	if err := json.Unmarshal([]byte(lines[0]), &e); err != nil {
+		t.Fatal(err)
 	}
-	if entry.Method != "GET" {
-		t.Errorf("Method = %q, want GET", entry.Method)
+	if e.V != 3 || e.Method != "POST" || e.Status != 201 || !strings.Contains(e.URL, "foo=bar") {
+		t.Errorf("exchange = %+v", e)
 	}
-	if !strings.Contains(entry.URL, "foo=bar") {
-		t.Errorf("URL %q missing query string", entry.URL)
+	if m, _ := e.Response.Body.JSON.(map[string]any); m["id"] == nil {
+		t.Errorf("response body = %+v, want the JSON value", e.Response.Body)
 	}
-	if entry.ID != reqID {
-		t.Errorf("JSON id %d != returned reqID %d", entry.ID, reqID)
+	if m, _ := e.Request.Body.JSON.(map[string]any); m["name"] != "x" {
+		t.Errorf("request body = %+v, want the JSON value", e.Request.Body)
 	}
-}
-
-func TestLogResponse_JSONCorrelation(t *testing.T) {
-	saved := jsonMode
-	jsonMode = true
-	defer func() { jsonMode = saved }()
-
-	var buf bytes.Buffer
-	jsonEnc = json.NewEncoder(&buf)
-
-	resp := &http.Response{
-		StatusCode: 201,
-		Status:     "201 Created",
-		Proto:      "HTTP/1.1",
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(`{"id":42}`)),
-	}
-	resp.Header.Set("Content-Type", "application/json")
-
-	logResponse(resp, 7)
-	// The JSON record is emitted once the body has streamed, which is what the
-	// proxy triggers by forwarding it.
-	io.Copy(io.Discard, resp.Body) //nolint:errcheck
-	resp.Body.Close()              //nolint:errcheck
-
-	var entry jsonResponse
-	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
-		t.Fatalf("invalid JSON: %v\nraw: %s", err, buf.String())
-	}
-	if entry.ReqID != 7 {
-		t.Errorf("req_id = %d, want 7", entry.ReqID)
-	}
-	if entry.Status != 201 {
-		t.Errorf("status = %d, want 201", entry.Status)
-	}
-	if !strings.Contains(entry.Body, "42") {
-		t.Errorf("body %q missing expected content", entry.Body)
+	if e.Response.Body.Raw != nil {
+		t.Error("output carries raw bytes; only records should")
 	}
 }
 
@@ -609,18 +573,18 @@ func TestRecord_WriteAndRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var ex recordV2
+	var ex exchange.Exchange
 	if err := json.Unmarshal(bytes.TrimSpace(data), &ex); err != nil {
 		t.Fatalf("invalid NDJSON: %v\nraw: %s", err, data)
 	}
-	if ex.V != 2 || ex.Session == "" {
-		t.Errorf("v = %d, session = %q; want a v2 record with a session", ex.V, ex.Session)
+	if ex.V != 3 || ex.Session == "" {
+		t.Errorf("v = %d, session = %q; want a v3 record with a session", ex.V, ex.Session)
 	}
 	if ex.Status != http.StatusOK {
 		t.Errorf("recorded status = %d, want 200", ex.Status)
 	}
-	if ex.RespBody == nil || !strings.Contains(ex.RespBody.Data, "hello") {
-		t.Errorf("recorded body %+v missing expected content", ex.RespBody)
+	if b := ex.Response.Body; b == nil || b.Raw == nil || !strings.Contains(b.Raw.Data, "hello") {
+		t.Errorf("recorded body %+v missing expected content", b)
 	}
 	if ex.DurationMs < 0 {
 		t.Errorf("recorded duration_ms = %v, want >= 0", ex.DurationMs)
@@ -655,7 +619,7 @@ func TestReplay_StatusAndBodyDiff(t *testing.T) {
 	}
 	replayPath := f.Name()
 	defer os.Remove(replayPath)
-	json.NewEncoder(f).Encode(ex) //nolint:errcheck
+	json.NewEncoder(f).Encode(ex.v3()) //nolint:errcheck
 	f.Close()
 
 	// Replay with target override.
@@ -933,175 +897,19 @@ func TestRecord_LargeBodyFullyStored(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var ex recordV2
+	var ex exchange.Exchange
 	if err := json.Unmarshal(bytes.TrimSpace(data), &ex); err != nil {
 		t.Fatalf("invalid NDJSON: %v\nraw: %s", err, data)
 	}
-	if ex.ReqBody == nil || len(ex.ReqBody.Data) != bodySize || ex.ReqBody.Size != int64(bodySize) {
-		t.Errorf("recorded req body = %d bytes (size %d), want %d", len(ex.ReqBody.Data), ex.ReqBody.Size, bodySize)
+	if b := ex.Request.Body; b == nil || b.Raw == nil || len(b.Raw.Data) != bodySize || b.Size != int64(bodySize) {
+		t.Errorf("recorded req body = %+v, want %d bytes", b, bodySize)
 	}
-	if ex.RespBody == nil || len(ex.RespBody.Data) != bodySize {
-		t.Errorf("recorded resp body len = %d, want %d", len(ex.RespBody.Data), bodySize)
-	}
-}
-
-// ---- decompressBody ----
-
-func TestDecompressBody_Gzip(t *testing.T) {
-	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
-	w.Write([]byte(`{"hello":"world"}`)) //nolint:errcheck
-	w.Close()
-
-	got, err := decompressBody("gzip", buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got.Data) != `{"hello":"world"}` {
-		t.Errorf("got %q", got.Data)
-	}
-	if got.Truncated {
-		t.Error("did not expect Truncated for a complete stream")
+	if b := ex.Response.Body; b == nil || b.Raw == nil || len(b.Raw.Data) != bodySize {
+		t.Errorf("recorded resp body = %+v, want %d bytes", b, bodySize)
 	}
 }
 
-func TestDecompressBody_Deflate(t *testing.T) {
-	var buf bytes.Buffer
-	w, _ := flate.NewWriter(&buf, flate.DefaultCompression)
-	w.Write([]byte("deflated text")) //nolint:errcheck
-	w.Close()
-
-	got, err := decompressBody("deflate", buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got.Data) != "deflated text" {
-		t.Errorf("got %q", got.Data)
-	}
-}
-
-// Servers commonly send zlib-wrapped data under "deflate" despite the raw
-// deflate wording in older specs; both must decode.
-func TestDecompressBody_DeflateZlibWrapped(t *testing.T) {
-	var buf bytes.Buffer
-	w := zlib.NewWriter(&buf)
-	w.Write([]byte("zlib wrapped")) //nolint:errcheck
-	w.Close()
-
-	got, err := decompressBody("deflate", buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got.Data) != "zlib wrapped" {
-		t.Errorf("got %q", got.Data)
-	}
-}
-
-func TestDecompressBody_Brotli(t *testing.T) {
-	var buf bytes.Buffer
-	w := brotli.NewWriter(&buf)
-	w.Write([]byte(`{"br":true}`)) //nolint:errcheck
-	w.Close()
-
-	got, err := decompressBody("br", buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got.Data) != `{"br":true}` {
-		t.Errorf("got %q", got.Data)
-	}
-}
-
-func TestDecompressBody_Zstd(t *testing.T) {
-	var buf bytes.Buffer
-	w, err := zstd.NewWriter(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.Write([]byte(`{"zstd":true}`)) //nolint:errcheck
-	w.Close()
-
-	got, err := decompressBody("zstd", buf.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got.Data) != `{"zstd":true}` {
-		t.Errorf("got %q", got.Data)
-	}
-}
-
-// A Content-Encoding list is applied left to right, so it must be decoded
-// right to left.
-func TestDecompressBody_Chained(t *testing.T) {
-	var inner bytes.Buffer
-	gz := gzip.NewWriter(&inner)
-	gz.Write([]byte("chained payload")) //nolint:errcheck
-	gz.Close()
-
-	var outer bytes.Buffer
-	br := brotli.NewWriter(&outer)
-	br.Write(inner.Bytes()) //nolint:errcheck
-	br.Close()
-
-	got, err := decompressBody("gzip, br", outer.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got.Data) != "chained payload" {
-		t.Errorf("got %q", got.Data)
-	}
-}
-
-func TestDecompressBody_Identity(t *testing.T) {
-	for _, enc := range []string{"", "identity", " identity "} {
-		got, err := decompressBody(enc, []byte("plain"))
-		if err != nil {
-			t.Fatalf("enc=%q: %v", enc, err)
-		}
-		if string(got.Data) != "plain" {
-			t.Errorf("enc=%q: got %q", enc, got.Data)
-		}
-	}
-}
-
-// An encoding httpmon cannot decode must report an error rather than returning
-// the still-compressed bytes, which callers would print as garbage.
-func TestDecompressBody_UnknownReturnsError(t *testing.T) {
-	_, err := decompressBody("snappy", []byte("raw"))
-	if !errors.Is(err, errUnsupportedEncoding) {
-		t.Fatalf("got err=%v, want errUnsupportedEncoding", err)
-	}
-}
-
-// Only a prefix of a large compressed body is captured, so decoding hits an
-// unexpected EOF. The bytes decoded before that point are still useful.
-func TestDecompressBody_TruncatedKeepsPrefix(t *testing.T) {
-	payload := make([]byte, 4<<20)
-	if _, err := crand.Read(payload); err != nil { // incompressible
-		t.Fatal(err)
-	}
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	zw.Write(payload) //nolint:errcheck
-	zw.Close()
-	if buf.Len() <= 1<<20 {
-		t.Fatalf("compressed size %d too small to truncate", buf.Len())
-	}
-
-	got, err := decompressBody("gzip", buf.Bytes()[:1<<20])
-	if err != nil {
-		t.Fatalf("truncated stream should not error: %v", err)
-	}
-	if !got.Truncated {
-		t.Error("expected Truncated=true")
-	}
-	if len(got.Data) == 0 {
-		t.Fatal("expected the successfully decoded prefix to be kept")
-	}
-	if !bytes.Equal(got.Data, payload[:len(got.Data)]) {
-		t.Error("decoded prefix does not match the original payload")
-	}
-}
+// ---- body.Decompress ----
 
 // Regression: an unsupported encoding once fell through to a nil error with the
 // raw bytes, so brotli responses were printed as binary garbage.
@@ -1166,20 +974,17 @@ func TestLogResponse_GzipBodyDecoded(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
 
-	// The JSON log should contain the decompressed body, not "[gzip, ...]".
-	lines := strings.Split(strings.TrimSpace(logBuf.String()), "\n")
-	if len(lines) < 2 {
-		t.Fatalf("expected 2 JSON lines, got %d: %s", len(lines), logBuf.String())
+	// The exchange carries the decompressed body, as a JSON value.
+	var e exchange.Exchange
+	if err := json.Unmarshal(bytes.TrimSpace(logBuf.Bytes()), &e); err != nil {
+		t.Fatalf("unmarshal exchange: %v\nraw: %s", err, logBuf.String())
 	}
-	var respEntry jsonResponse
-	if err := json.Unmarshal([]byte(lines[1]), &respEntry); err != nil {
-		t.Fatalf("unmarshal response: %v\nraw: %s", err, lines[1])
+	b := e.Response.Body
+	if b == nil || b.JSON == nil {
+		t.Fatalf("body = %+v; want the decompressed JSON as a value", b)
 	}
-	if !strings.Contains(respEntry.Body, "status") {
-		t.Errorf("body = %q; want decompressed JSON containing 'status'", respEntry.Body)
-	}
-	if strings.Contains(respEntry.Body, "gzip") {
-		t.Errorf("body = %q; should not contain 'gzip' (raw placeholder)", respEntry.Body)
+	if m, _ := b.JSON.(map[string]any); m["status"] == nil {
+		t.Errorf("body JSON = %v; want the field 'status'", b.JSON)
 	}
 }
 

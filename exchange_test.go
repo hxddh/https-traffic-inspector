@@ -1,8 +1,7 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
 )
 
 // Regression: a record was written only when the response finished after the
@@ -63,10 +64,10 @@ func TestRecord_ResponseBeforeRequestFinishes(t *testing.T) {
 	resp.Body.Close()              //nolint:errcheck
 
 	// The request half lands once the upload is abandoned or finishes.
-	var recs []recordV2
+	var recs []*exchange.Exchange
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		recs = readRecords(t, recPath)
+		recs = readRecordFile(t, recPath)
 		if len(recs) > 0 {
 			break
 		}
@@ -75,7 +76,7 @@ func TestRecord_ResponseBeforeRequestFinishes(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("recorded %d exchanges, want 1", len(recs))
 	}
-	if recs[0].Status != http.StatusRequestEntityTooLarge || recs[0].RespBody == nil || recs[0].RespBody.Data != "too large" {
+	if recs[0].Status != http.StatusRequestEntityTooLarge || recs[0].Response.Body == nil || recs[0].Response.Body.Raw.Data != "too large" {
 		t.Errorf("record = %+v", recs[0])
 	}
 	if n := captures.pending(); n != 0 {
@@ -83,24 +84,25 @@ func TestRecord_ResponseBeforeRequestFinishes(t *testing.T) {
 	}
 }
 
-func readRecords(t *testing.T, path string) []recordV2 {
+func readRecordFile(t *testing.T, path string) []*exchange.Exchange {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	var out []recordV2
-	sc := bufio.NewScanner(f)
-	sc.Buffer(nil, 64<<20)
-	for sc.Scan() {
-		var e recordV2
-		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
-			t.Fatalf("bad record line %q: %v", sc.Text(), err)
+	var out []*exchange.Exchange
+	rd := exchange.NewReader(f)
+	for {
+		e, err := rd.Next()
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("bad record: %v", err)
 		}
 		out = append(out, e)
 	}
-	return out
 }
 
 // Regression: when an upstream request failed, the pending entry was deleted

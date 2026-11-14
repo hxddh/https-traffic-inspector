@@ -2,15 +2,20 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
 )
 
 // Regression: the wrapped command can hold the whole response -- its
@@ -132,28 +137,49 @@ func TestConnect_NonHTTPClientProtocolIsRelayed(t *testing.T) {
 	}
 }
 
-// A recorded gRPC call holds a summary of its binary body, so replaying it
-// would send that text to the server and report a spurious difference.
-func TestReplay_SkipsGRPCCalls(t *testing.T) {
-	var hits atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+// A v3 record keeps a gRPC call's bytes, so replay re-sends it and compares
+// its grpc-status as well as the body.
+func TestReplay_GRPCCallFromRecord(t *testing.T) {
+	var got [][]byte
+	target := newH2TLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = append(got, b)
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Trailer", "Grpc-Status")
+		w.Write(grpcFrame([]byte("reply"))) //nolint:errcheck
+		w.Header().Set("Grpc-Status", "0")
 	}))
 	defer target.Close()
+	useInsecureUpstream(t)
+	saved := insecureUpstream
+	insecureUpstream = true
+	defer func() { insecureUpstream = saved }()
 
-	path := writeRecording(t, recordedExchange{
-		ID: 1, Method: "POST", URL: target.URL + "/pkg.Svc/Call",
-		ReqHeaders: map[string]string{"Content-Type": "application/grpc"},
-		ReqBody:    "[gRPC: 1 message, 3 payload bytes]",
-		Status:     200, StatusText: "200 OK", RespBody: "[gRPC: 1 message, 2 payload bytes]",
-	})
+	reqFrame := grpcFrame([]byte("request"))
+	e := &exchange.Exchange{
+		V: 3, Session: "s", ID: 1, Kind: "http", Method: "POST", URL: target.URL + "/pkg.Svc/Call", Status: 200,
+		Request: exchange.Message{
+			Headers: exchange.Headers{"Content-Type": {"application/grpc"}, "Te": {"trailers"}},
+			Body:    &body.Rendered{Size: int64(len(reqFrame)), Raw: body.NewRaw(reqFrame, false)},
+		},
+		Response: &exchange.Message{
+			Headers:  exchange.Headers{"Content-Type": {"application/grpc"}},
+			Trailers: exchange.Headers{"Grpc-Status": {"0"}},
+			Body:     &body.Rendered{Size: 10, Raw: body.NewRaw(grpcFrame([]byte("reply")), false)},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "grpc.ndjson")
+	data, _ := json.Marshal(e)
+	os.WriteFile(path, append(data, '\n'), 0o600) //nolint:errcheck
+
+	out := captureText(t)
 	if code := replayFile(path, "", 0, true); code != 0 {
-		t.Errorf("code = %d, want 0: a skipped call is not a difference", code)
+		t.Fatalf("exit = %d, want 0; output:\n%s", code, out.String())
 	}
-	if n := hits.Load(); n != 0 {
-		t.Errorf("server received %d requests, want 0", n)
+	if len(got) != 1 || !bytes.Equal(got[0], reqFrame) {
+		t.Errorf("server received %q, want the recorded frame", got)
 	}
-	if !strings.Contains(grpcReplaySkip, "gRPC") {
-		t.Error("skip reason should name gRPC")
+	if !strings.Contains(out.String(), "gRPC:    recorded=0  actual=0") {
+		t.Errorf("gRPC status not compared; output:\n%s", out.String())
 	}
 }
