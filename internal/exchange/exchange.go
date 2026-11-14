@@ -238,10 +238,16 @@ type Pending struct {
 	Method    string  `json:"method"`
 	URL       string  `json:"url"`
 	WaitingMs float64 `json:"waiting_ms"`
+	// Status is set when the response had started -- its headers arrived --
+	// but its body had not ended: a stream, or a stalled download.
+	Status int `json:"status,omitempty"`
 }
 
 // SummaryLine renders p like a completed exchange's line.
 func (p Pending) SummaryLine() string {
+	if p.Status != 0 {
+		return fmt.Sprintf("#%d %s %s → %d … body still open after %s", p.ID, p.Method, ShortURL(p.URL), p.Status, formatMs(p.WaitingMs))
+	}
 	return fmt.Sprintf("#%d %s %s → … no response after %s", p.ID, p.Method, ShortURL(p.URL), formatMs(p.WaitingMs))
 }
 

@@ -99,6 +99,9 @@ func PairKey(e *Exchange) string {
 
 // Diff compares runs a and b.
 func Diff(a, b []*Exchange, opt DiffOptions) ([]Change, Counts) {
+	// A record lists exchanges as they completed, which for concurrent
+	// requests varies from run to run; pair them in the order they started.
+	a, b = initiationOrder(a), initiationOrder(b)
 	byKey := map[string][]*Exchange{}
 	for _, e := range a {
 		k := PairKey(e)
@@ -144,6 +147,26 @@ func Diff(a, b []*Exchange, opt DiffOptions) ([]Change, Counts) {
 		n.Gone++
 	}
 	return changes, n
+}
+
+// initiationOrder sorts a run's exchanges by session, in the order sessions
+// appear, and then by id, which is assigned when a request starts.
+func initiationOrder(es []*Exchange) []*Exchange {
+	session := map[string]int{}
+	for _, e := range es {
+		if _, ok := session[e.Session]; !ok {
+			session[e.Session] = len(session)
+		}
+	}
+	out := append([]*Exchange(nil), es...)
+	sort.SliceStable(out, func(i, j int) bool {
+		si, sj := session[out[i].Session], session[out[j].Session]
+		if si != sj {
+			return si < sj
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 func side(e *Exchange) *Side {
@@ -235,7 +258,12 @@ func bodyDiff(a, b *body.Rendered, ignore []string) string {
 		return ""
 	}
 	if !aWhole || !bWhole {
-		// Only prefixes were kept: compare what both have.
+		// Only prefixes were kept. Bodies of different known sizes differ
+		// whatever their prefixes say; otherwise compare what both have.
+		as, bs := sizeOf(a, ab), sizeOf(b, bb)
+		if a != nil && b != nil && a.Size > 0 && b.Size > 0 && as != bs {
+			return fmt.Sprintf("%d ⇒ %d bytes", as, bs)
+		}
 		n := min(len(ab), len(bb))
 		if bytes.Equal(ab[:n], bb[:n]) {
 			return ""

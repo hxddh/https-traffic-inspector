@@ -30,13 +30,31 @@ var (
 
 	// unfinished holds logged exchanges that have not completed, so the end
 	// of the run can name the ones still waiting.
-	unfinished   = make(map[int]exchange.Pending)
+	unfinished   = make(map[int]unfinishedReq)
 	unfinishedMu sync.Mutex
 )
 
-func trackUnfinished(id int, method, url string) {
+// unfinishedReq is an exchange in flight. It keeps its own start time:
+// reqStartTimes loses it when the response head arrives, and an exchange
+// whose body is still streaming is unfinished too.
+type unfinishedReq struct {
+	pending exchange.Pending
+	start   time.Time
+}
+
+func trackUnfinished(id int, method, url string, start time.Time) {
 	unfinishedMu.Lock()
-	unfinished[id] = exchange.Pending{ID: id, Method: method, URL: url}
+	unfinished[id] = unfinishedReq{pending: exchange.Pending{ID: id, Method: method, URL: url}, start: start}
+	unfinishedMu.Unlock()
+}
+
+// markResponding records that an unfinished exchange's response has started.
+func markResponding(id, status int) {
+	unfinishedMu.Lock()
+	if u, ok := unfinished[id]; ok {
+		u.pending.Status = status
+		unfinished[id] = u
+	}
 	unfinishedMu.Unlock()
 }
 
@@ -49,28 +67,17 @@ func untrack(id int) {
 // unfinishedExchanges lists, in id order, the exchanges still waiting.
 func unfinishedExchanges() []exchange.Pending {
 	unfinishedMu.Lock()
-	ids := make([]int, 0, len(unfinished))
-	for id := range unfinished {
-		ids = append(ids, id)
-	}
-	unfinishedMu.Unlock()
-	sort.Ints(ids)
-	out := make([]exchange.Pending, 0, len(ids))
-	reqStartMu.Lock()
-	unfinishedMu.Lock()
-	for _, id := range ids {
-		p, ok := unfinished[id]
-		if !ok {
-			continue
-		}
-		if start, ok := reqStartTimes[id]; ok {
-			p.WaitingMs = millis(time.Since(start))
+	defer unfinishedMu.Unlock()
+	out := make([]exchange.Pending, 0, len(unfinished))
+	for _, u := range unfinished {
+		p := u.pending
+		if !u.start.IsZero() {
+			p.WaitingMs = millis(time.Since(u.start))
 		}
 		p.URL = displayURL(p.URL)
 		out = append(out, p)
 	}
-	unfinishedMu.Unlock()
-	reqStartMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -158,7 +165,7 @@ func logRequestFacts(req *http.Request) (int, *requestFacts) {
 		headers:   req.Header.Clone(),
 		startTime: startTime,
 	}
-	trackUnfinished(reqID, f.method, f.rawURL)
+	trackUnfinished(reqID, f.method, f.rawURL, startTime)
 	currentSink().requestHead(reqID, f)
 
 	// Sample the body alongside delivery instead of reading a prefix up front.
@@ -221,6 +228,7 @@ func logResponse(resp *http.Response, reqID int) {
 		upgraded:      resp.StatusCode == http.StatusSwitchingProtocols,
 	}
 	f.start = time.Now().Add(-f.duration)
+	markResponding(reqID, f.status)
 	currentSink().responseHead(reqID, f)
 
 	// Sample alongside delivery. Reading a prefix first would withhold an SSE

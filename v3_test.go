@@ -58,7 +58,7 @@ func useStats(t *testing.T, failOn string) {
 	runStats = &stats{}
 	unfinishedMu.Lock()
 	savedUnfinished := unfinished
-	unfinished = make(map[int]exchange.Pending)
+	unfinished = make(map[int]unfinishedReq)
 	unfinishedMu.Unlock()
 	if failOn != "" {
 		f, err := exchange.ParseFailOn(failOn)
@@ -416,10 +416,7 @@ func TestSummary_BinaryBodySizeWithoutKeepingIt(t *testing.T) {
 func TestFinishRun_NamesUnfinishedExchanges(t *testing.T) {
 	out := useSummary(t)
 	useStats(t, "incomplete")
-	reqStartMu.Lock()
-	reqStartTimes[424242] = time.Now().Add(-2 * time.Second)
-	reqStartMu.Unlock()
-	trackUnfinished(424242, "GET", "http://h/hang")
+	trackUnfinished(424242, "GET", "http://h/hang", time.Now().Add(-2*time.Second))
 	defer untrack(424242)
 
 	if code := finishRun(0); code != exitFailOn {
@@ -456,5 +453,20 @@ func TestDiffCommand_ExitCodes(t *testing.T) {
 	}
 	if _, code := run(a, filepath.Join(t.TempDir(), "missing")); code != exitDiffTrouble {
 		t.Errorf("missing file: exit %d", code)
+	}
+}
+
+// Regression: an exchange whose response had started but whose body was still
+// open was reported as "no response after 0ms": its start time had already
+// been consumed when the response head arrived.
+func TestFinishRun_OpenBodyIsNotNoResponse(t *testing.T) {
+	out := useSummary(t)
+	useStats(t, "")
+	trackUnfinished(424243, "GET", "http://h/events", time.Now().Add(-3*time.Second))
+	markResponding(424243, 200)
+	defer untrack(424243)
+	finishRun(0)
+	if !strings.Contains(out.String(), "#424243 GET h/events → 200 … body still open after 3.0s") {
+		t.Errorf("output:\n%s", out.String())
 	}
 }

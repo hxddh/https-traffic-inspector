@@ -121,3 +121,36 @@ func TestPending(t *testing.T) {
 		t.Error("incomplete matched without being asked for")
 	}
 }
+
+// Regression: bodies kept only as prefixes were compared by prefix alone, so
+// a download that grew from 2 MB to 5 MB with the same first megabyte read as
+// unchanged.
+func TestDiff_TruncatedBodiesOfDifferentSizesDiffer(t *testing.T) {
+	prefix := strings.Repeat("x", 100)
+	mk := func(size int64) *Exchange {
+		e := ex(1, "GET", "https://h/f", 200, "", 10)
+		e.Response.Body = &body.Rendered{Size: size, Raw: &body.Raw{Encoding: "utf8", Data: prefix, Truncated: true}}
+		return e
+	}
+	changes, n := Diff([]*Exchange{mk(2 << 20)}, []*Exchange{mk(5 << 20)}, DefaultDiffOptions)
+	if !n.Differs() || len(changes) != 1 || changes[0].Detail != "2097152 ⇒ 5242880 bytes" {
+		t.Errorf("changes = %+v", changes)
+	}
+	if _, n := Diff([]*Exchange{mk(2 << 20)}, []*Exchange{mk(2 << 20)}, DefaultDiffOptions); n.Differs() {
+		t.Error("equal sizes and prefixes reported as different")
+	}
+}
+
+// Regression: records list exchanges as they complete, so two concurrent
+// requests to one endpoint finishing in the other order were paired wrongly
+// and both reported as changed.
+func TestDiff_PairsInInitiationOrder(t *testing.T) {
+	a1 := ex(1, "POST", "https://h/items", 201, `{"name":"a"}`, 10)
+	a2 := ex(2, "POST", "https://h/items", 201, `{"name":"b"}`, 10)
+	b1 := ex(1, "POST", "https://h/items", 201, `{"name":"a"}`, 10)
+	b2 := ex(2, "POST", "https://h/items", 201, `{"name":"b"}`, 10)
+	// The second run's file has them in completion order: #2 first.
+	if _, n := Diff([]*Exchange{a1, a2}, []*Exchange{b2, b1}, DefaultDiffOptions); n.Differs() {
+		t.Errorf("completion order produced a difference: %+v", n)
+	}
+}
