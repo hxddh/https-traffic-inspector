@@ -10,12 +10,15 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
 // ---- httpmon query ----
@@ -31,6 +34,8 @@ type queryFilter struct {
 	method string
 	url    string
 	errors bool
+	grep   *regexp.Regexp
+	rule   bool
 }
 
 func (q *queryFilter) match(e *exchange.Exchange) bool {
@@ -45,8 +50,65 @@ func (q *queryFilter) match(e *exchange.Exchange) bool {
 		return false
 	case q.status != nil && !q.status.Match(e):
 		return false
+	case q.rule && e.Rule == "":
+		return false
+	case q.grep != nil && !grepExchange(e, q.grep):
+		return false
 	}
 	return true
+}
+
+// grepExchange searches an exchange's URL, headers and decoded bodies.
+func grepExchange(e *exchange.Exchange, re *regexp.Regexp) bool {
+	if re.MatchString(e.URL) {
+		return true
+	}
+	headers := func(h exchange.Headers) bool {
+		for k, vs := range h {
+			for _, v := range vs {
+				if re.MatchString(k + ": " + v) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	bodyMatch := func(h exchange.Headers, b *body.Rendered) bool {
+		if b == nil {
+			return false
+		}
+		if b.Raw != nil {
+			if raw, err := b.Raw.Bytes(); err == nil {
+				dec, _ := decodeContent(h.HTTP().Get("Content-Encoding"), raw, b.Raw.Truncated)
+				return re.Match(dec)
+			}
+		}
+		if b.Text != nil {
+			return re.MatchString(*b.Text)
+		}
+		if b.JSON != nil {
+			j, _ := json.Marshal(b.JSON)
+			return re.Match(j)
+		}
+		return false
+	}
+	if headers(e.Request.Headers) || bodyMatch(e.Request.Headers, e.Request.Body) {
+		return true
+	}
+	if r := e.Response; r != nil && (headers(r.Headers) || bodyMatch(r.Headers, r.Body)) {
+		return true
+	}
+	if e.Error != nil && re.MatchString(e.Error.Message) {
+		return true
+	}
+	if e.WebSocket != nil {
+		for _, m := range e.WebSocket.Messages {
+			if m.Text != nil && re.MatchString(*m.Text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func cmdQuery(args []string) int {
@@ -59,17 +121,23 @@ func cmdQuery(args []string) int {
 	fs.StringVar(&q.method, "method", "", "only this method")
 	fs.StringVar(&q.url, "url", "", "only URLs containing this text (case-insensitive)")
 	fs.BoolVar(&q.errors, "error", false, "only exchanges that got no response")
+	fs.BoolVar(&q.rule, "rule", false, "only exchanges a --mock, --fault or --map rule touched")
+	grep := fs.String("grep", "", "only exchanges whose URL, headers or decoded bodies match this regular expression ((?i) for any case)")
+	live := fs.Bool("live", false, "also list the session's exchanges still in flight")
 	bodyFlag := fs.String("body", "", "print one exchange's decoded body in full: request or response (needs --id)")
-	format := fs.String("format", "summary", "output format: summary | json | text (default text with --id)")
+	format := fs.String("format", "summary", "output format: summary | json | text | curl | har (default text with --id)")
 	maxBody := fs.Int("max-body", 4000, "approximate max bytes of each body shown")
-	follow := fs.Bool("follow", false, "keep reading as exchanges are appended to the record")
+	follow := fs.Bool("follow", false, "keep reading as exchanges are added to the session")
 	show := fs.Bool("show-secrets", false, "show credentials instead of masking them")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage: httpmon query <record> [filters] [options]
+		fmt.Fprint(os.Stderr, `Usage: httpmon query <session> [filters] [options]
 
-Reads a --record file ("-" for stdin). Without filters it lists every
-exchange, one line each; --id N shows one exchange in full, and
---id N --body response prints its decoded body.
+Reads a session: a name (see "httpmon sessions"), a session directory, an
+exchanges file, or "-" for stdin. Without filters it lists every exchange,
+one line each; --id N shows one exchange in full, and --id N --body response
+prints its decoded body. --format curl prints commands that send the
+requests again; --format har writes a HAR file for a browser's developer
+tools.
 
 Options:
 `)
@@ -91,6 +159,14 @@ Options:
 		}
 		q.status = f
 	}
+	if *grep != "" {
+		re, err := regexp.Compile(*grep)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon query: --grep: %v\n", err)
+			return 1
+		}
+		q.grep = re
+	}
 	if *bodyFlag != "" && *bodyFlag != "request" && *bodyFlag != "response" {
 		fmt.Fprintf(os.Stderr, "httpmon query: --body must be request or response\n")
 		return 1
@@ -107,9 +183,13 @@ Options:
 		*format = "text"
 	}
 	switch *format {
-	case "summary", "json", "text":
+	case "summary", "json", "text", "curl", "har":
 	default:
-		fmt.Fprintf(os.Stderr, "httpmon query: unknown --format %q (want summary, json or text)\n", *format)
+		fmt.Fprintf(os.Stderr, "httpmon query: unknown --format %q (want summary, json, text, curl or har)\n", *format)
+		return 1
+	}
+	if *format == "har" && *follow {
+		fmt.Fprintf(os.Stderr, "httpmon query: --format har cannot be used with --follow\n")
 		return 1
 	}
 	if *maxBody <= 0 {
@@ -120,8 +200,13 @@ Options:
 	showSecrets = *show
 
 	var in io.Reader = os.Stdin
-	if pos[0] != "-" {
-		f, err := os.Open(pos[0])
+	path, err := session.Resolve(pos[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
+		return 1
+	}
+	if path != "-" {
+		f, err := os.Open(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
 			return 1
@@ -140,6 +225,7 @@ Options:
 	defer signal.Stop(stop)
 
 	var digest exchange.Digest
+	var har []*exchange.Exchange
 	matched, bad := 0, 0
 	err = readRecords(in, *follow, stop, func(e *exchange.Exchange) bool {
 		if !q.match(e) {
@@ -149,6 +235,15 @@ Options:
 		if *bodyFlag != "" {
 			bad += writeBody(w, e, *bodyFlag)
 			return false
+		}
+		switch *format {
+		case "curl":
+			emitText(curlForExchange(e) + "\n\n")
+			return true
+		case "har":
+			maskForExport(e)
+			har = append(har, e)
+			return true
 		}
 		prepareForDisplay(e)
 		digest.Add(e)
@@ -175,6 +270,16 @@ Options:
 			return 1
 		}
 		return 0
+	}
+	if *format == "har" {
+		if err := exchange.WriteHAR(w, version, har); err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if *live {
+		writeLive(pos[0], *format == "json")
 	}
 	if *format == "summary" && !*follow && matched != 1 {
 		emitText(textsafe.Line(digest.String()) + "\n")
@@ -234,6 +339,70 @@ func readRecords(r io.Reader, follow bool, stop <-chan os.Signal, fn func(*excha
 			return nil
 		}
 	}
+}
+
+// curlForExchange is a curl command that sends e's request again.
+func curlForExchange(e *exchange.Exchange) string {
+	maskForExport(e)
+	var data []byte
+	whole := true
+	if b := e.Request.Body; b != nil {
+		switch {
+		case b.Raw != nil:
+			data, _ = b.Raw.Bytes()
+			whole = !b.Raw.Truncated
+		case b.Text != nil:
+			data, whole = []byte(*b.Text), !b.Truncated
+		case b.Size > 0:
+			data, whole = []byte{0}, false
+		}
+	}
+	head := "# #" + strconv.Itoa(e.ID) + " " + textsafe.Line(e.SummaryLine())
+	return head + "\n" + curlFor(e.Method, e.URL, e.Request.Headers.HTTP(), data, whole)
+}
+
+// maskForExport masks credentials, unless --show-secrets, keeping raw bytes.
+func maskForExport(e *exchange.Exchange) {
+	e.URL = displayURL(e.URL)
+	e.Request.Headers = exchange.FromHTTP(displayHeaders(e.Request.Headers.HTTP()))
+	if e.Response != nil {
+		e.Response.Headers = exchange.FromHTTP(displayHeaders(e.Response.Headers.HTTP()))
+		if len(e.Response.Trailers) > 0 {
+			e.Response.Trailers = exchange.FromHTTP(displayHeaders(e.Response.Trailers.HTTP()))
+		}
+	}
+}
+
+// writeLive lists a running session's exchanges still in flight.
+func writeLive(arg string, asJSON bool) {
+	dir, err := session.ResolveDir(arg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon query: --live: %v\n", err)
+		return
+	}
+	var m session.Meta
+	_ = session.ReadJSON(dir, session.MetaFile, &m)
+	var l session.Live
+	if !m.Running() || session.ReadJSON(dir, session.LiveFile, &l) != nil {
+		if !asJSON {
+			emitText("── session not running; nothing in flight\n")
+		}
+		return
+	}
+	for _, p := range l.InFlight {
+		if asJSON {
+			emitJSON(struct {
+				Event string `json:"event"`
+				exchange.Pending
+			}{"in_flight", p})
+			continue
+		}
+		emitText(textsafe.Line(p.SummaryLine()) + "\n")
+	}
+	if asJSON {
+		return
+	}
+	emitText(fmt.Sprintf("── running; %d in flight (as of %s)\n", len(l.InFlight), l.Updated.Format("15:04:05")))
 }
 
 // prepareForDisplay masks credentials, re-renders bodies from their raw bytes
@@ -315,7 +484,7 @@ func writeBody(w io.Writer, e *exchange.Exchange, which string) int {
 		data, _ = json.Marshal(b.JSON)
 		truncated = b.Truncated
 	default:
-		fmt.Fprintf(os.Stderr, "httpmon query: exchange #%d's %s body was not kept (record it with --record)\n", e.ID, which)
+		fmt.Fprintf(os.Stderr, "httpmon query: exchange #%d's %s body was not kept (sessions keep bodies; --format json output does not)\n", e.ID, which)
 		return 1
 	}
 	if isTerminal(w) {

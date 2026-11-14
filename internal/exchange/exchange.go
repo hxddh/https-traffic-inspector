@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 )
 
 // Version is the schema version written in every record.
@@ -45,6 +45,10 @@ type Exchange struct {
 	// Redacted marks a record made with --redact: credentials in headers and
 	// the URL are masked, so requests that carried them cannot be replayed.
 	Redacted bool `json:"redacted,omitempty"`
+
+	// Rule names the --mock, --fault or --map rule that touched the
+	// exchange, as written: "mock: GET */v1/orders => 500".
+	Rule string `json:"rule,omitempty"`
 
 	// Hint is a short error description found in a 4xx/5xx body, for the
 	// summary line. It is not part of the record.
@@ -136,6 +140,12 @@ func FormatTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05
 func (e *Exchange) SummaryLine() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "#%d %s %s → ", e.ID, e.Method, ShortURL(e.URL))
+	defer func() {
+		if e.Rule != "" {
+			kind, _, _ := strings.Cut(e.Rule, ":")
+			fmt.Fprintf(&b, " [%s]", kind)
+		}
+	}()
 	dur := formatMs(e.DurationMs)
 	switch {
 	case e.Error != nil:

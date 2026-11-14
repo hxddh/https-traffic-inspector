@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
 // ---- forwarding ----
@@ -69,6 +69,15 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 		reqID, facts = logRequestFacts(req)
 	}
 
+	host := req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
+	rule := applyRules(w, req, stripDefaultPort(host, req.URL.Scheme), reqID, facts)
+	if rule.done {
+		return
+	}
+
 	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), req.Body)
 	if err != nil {
 		if req.Body != nil {
@@ -82,6 +91,11 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 	}
 	if keepHost && req.Host != "" {
 		proxyReq.Host = req.Host
+	}
+	if m := rule.mapTo; m != nil {
+		// Mapped: the request goes to, and names, the other host.
+		proxyReq.URL.Scheme, proxyReq.URL.Host, proxyReq.Host = m.scheme, m.host, m.host
+		client = upstreamClient
 	}
 	proxyReq.Header = req.Header.Clone()
 	proxyReq.ContentLength = req.ContentLength
@@ -124,6 +138,12 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 	// Flush as the body is written: buffering here would hold a streaming
 	// response until the stream ended.
 	fl, _ := w.(http.Flusher)
+	if rule.reset > 0 {
+		// A "reset after" fault: part of the body, then a dropped connection.
+		copyFlushing(w, io.LimitReader(resp.Body, rule.reset), fl) //nolint:errcheck
+		resp.Body.Close()                                          //nolint:errcheck
+		panic(http.ErrAbortHandler)
+	}
 	copyFlushing(w, resp.Body, fl) //nolint:errcheck
 
 	// Trailers are known only once the body has been read. gRPC carries its

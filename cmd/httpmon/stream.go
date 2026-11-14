@@ -8,7 +8,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 )
 
 // bodySampler wraps a body so its content can be logged without holding up
@@ -130,14 +130,14 @@ func sampleBodyFor(bodyp *io.ReadCloser, h http.Header, length int64, limit int,
 // times the memory of the text output for parallel downloads, although it
 // shows no body at all.
 //
-//   - --record and --har store the bytes: up to --max-capture.
+//   - sessions store the bytes: up to --max-capture.
 //   - Text and the TUI show a prefix: --max-body, or --max-capture for a
 //     compressed body, which must be decoded from its start.
 //   - The summary only reads an error response's JSON for its code.
 //   - JSON parses JSON and gRPC bodies, shows a prefix of text, and gives
 //     only the size of anything else.
 func captureLimitFor(h http.Header, status int, isRequest bool) int {
-	if recordMode || harMode {
+	if recordMode {
 		return captureMaxBody
 	}
 	ct := h.Get("Content-Type")

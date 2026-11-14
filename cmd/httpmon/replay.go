@@ -10,9 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
 // replayResult is the outcome of replaying a single recorded exchange.
@@ -59,7 +60,12 @@ const (
 //
 // Exit codes: 0 = clean, 1 = read/parse failure, 2 = differences found while
 // failOnDiff is set (so CI can gate on it).
-func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff bool) int {
+func replayFile(arg, targetBase string, delayBetween time.Duration, failOnDiff bool) int {
+	path, err := session.Resolve(arg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon replay: %v\n", err)
+		return 1
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon replay: %v\n", err)

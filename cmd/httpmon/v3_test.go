@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
 // Regression: body text started at the first column like httpmon's own
@@ -354,15 +354,15 @@ func TestBuildVersion(t *testing.T) {
 // body, so parallel downloads used nearly seven times the memory of the text
 // output although the summary shows no body.
 func TestCaptureLimit_KeepsOnlyWhatOutputsUse(t *testing.T) {
-	saved := []bool{summaryMode, jsonMode, recordMode, harMode, tuiMode}
+	saved := []bool{summaryMode, jsonMode, recordMode, tuiMode}
 	defer func() {
-		summaryMode, jsonMode, recordMode, harMode, tuiMode = saved[0], saved[1], saved[2], saved[3], saved[4]
+		summaryMode, jsonMode, recordMode, tuiMode = saved[0], saved[1], saved[2], saved[3]
 	}()
 	bin := http.Header{"Content-Type": {"application/octet-stream"}}
 	js := http.Header{"Content-Type": {"application/json"}}
 	txt := http.Header{"Content-Type": {"text/plain"}}
 
-	summaryMode, jsonMode, recordMode, harMode, tuiMode = true, false, false, false, false
+	summaryMode, jsonMode, recordMode, tuiMode = true, false, false, false
 	for _, tc := range []struct {
 		h      http.Header
 		status int

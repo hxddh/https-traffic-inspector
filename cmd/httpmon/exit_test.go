@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
 // Regression: the wrapped command can hold the whole response -- its

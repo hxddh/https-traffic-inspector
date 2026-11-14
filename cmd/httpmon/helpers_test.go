@@ -1,27 +1,59 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
+	"os"
 	"testing"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
-// useMemoryHAR routes HAR entries to memory for the duration of a test.
-func useMemoryHAR(t *testing.T) *harWriter {
+// memRecorder keeps a test's session records in memory.
+type memRecorder struct{ buf bytes.Buffer }
+
+// useMemoryHAR records exchanges to memory for the duration of a test; its
+// entries are read back as HAR, the form most tests check.
+func useMemoryHAR(t *testing.T) *memRecorder {
 	t.Helper()
-	saved, savedHM, savedCaptures := har, harMode, captures
-	har, harMode, captures = &harWriter{keep: true}, true, newExchangeJoiner()
-	t.Cleanup(func() { har, harMode, captures = saved, savedHM, savedCaptures })
-	return har
+	m := &memRecorder{}
+	recordMu.Lock()
+	savedEnc, savedMode, savedCaptures := recordEncoder, recordMode, captures
+	recordEncoder, recordMode, captures = json.NewEncoder(&m.buf), true, newExchangeJoiner()
+	recordMu.Unlock()
+	t.Cleanup(func() {
+		recordMu.Lock()
+		recordEncoder, recordMode, captures = savedEnc, savedMode, savedCaptures
+		recordMu.Unlock()
+	})
+	return m
 }
 
-// entries returns the HAR entries written so far.
-func (w *harWriter) entries() []harEntry {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return append([]harEntry(nil), w.kept...)
+// exchanges returns the records written so far.
+func (m *memRecorder) exchanges() []*exchange.Exchange {
+	recordMu.Lock()
+	data := append([]byte(nil), m.buf.Bytes()...)
+	recordMu.Unlock()
+	var out []*exchange.Exchange
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for {
+		var e exchange.Exchange
+		if dec.Decode(&e) != nil {
+			return out
+		}
+		out = append(out, &e)
+	}
+}
+
+// entries returns the records written so far, as HAR entries.
+func (m *memRecorder) entries() []exchange.HAREntry {
+	var out []exchange.HAREntry
+	for _, e := range m.exchanges() {
+		out = append(out, exchange.ToHAR(e))
+	}
+	return out
 }
 
 // harFile is the shape of a HAR file, for reading one back.
@@ -32,21 +64,21 @@ type harFile struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
 		} `json:"creator"`
-		Entries []harEntry `json:"entries"`
+		Entries []exchange.HAREntry `json:"entries"`
 	} `json:"log"`
 }
 
-// writeHARForTest writes entries to a HAR file the way a run does.
-func writeHARForTest(path string, entries ...harEntry) error {
-	saved := har
-	defer func() { har = saved }()
-	if err := openHARFile(path); err != nil {
+// writeHARForTest writes entries to a HAR file as query --format har does.
+func writeHARForTest(path string, entries ...exchange.HAREntry) error {
+	var h exchange.HARLog
+	h.Log.Version = "1.2"
+	h.Log.Creator = map[string]string{"name": "httpmon", "version": version}
+	h.Log.Entries = append([]exchange.HAREntry{}, entries...)
+	b, err := json.Marshal(h)
+	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		har.add(e)
-	}
-	return closeHAR()
+	return os.WriteFile(path, b, 0o600)
 }
 
 // recordedExchange describes a recorded exchange compactly for tests;

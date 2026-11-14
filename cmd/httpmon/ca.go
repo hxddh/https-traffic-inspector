@@ -181,19 +181,21 @@ func buildCABundle(proxyCAPEM []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	name := f.Name()
+	f.Close() //nolint:errcheck
+	return name, writeCABundle(name, proxyCAPEM)
+}
 
+// writeCABundle writes the system roots followed by httpmon's CA to path.
+func writeCABundle(path string, proxyCAPEM []byte) error {
+	var data []byte
 	if sysCA := systemCABundle(); sysCA != "" {
-		data, err := os.ReadFile(sysCA)
-		if err == nil {
-			f.Write(data) //nolint:errcheck
+		if b, err := os.ReadFile(sysCA); err == nil {
+			data = append(b, '\n')
 		}
 	}
-
-	if _, err := f.Write(proxyCAPEM); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
+	data = append(data, proxyCAPEM...)
+	return os.WriteFile(path, data, 0o600)
 }
 
 // caCommonName names the CA after the machine and the day it was made, so a

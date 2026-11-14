@@ -27,8 +27,6 @@ var (
 	summaryMode      bool
 	tuiMode          bool
 	recordMode       bool
-	harMode          bool
-	harPath          string
 	insecureUpstream bool
 	upstreamProxy    *url.URL  // --upstream-proxy; nil means use the environment
 	displayMaxBody   = 1000    // --max-body: bytes of body shown in text/JSON/TUI output
@@ -320,19 +318,3 @@ func mergeCABundle(userCA, ours string) (string, error) {
 // exitDrainTimeout bounds how long httpmon waits, once the wrapped command
 // has exited, for exchanges still in flight to be logged and recorded.
 const exitDrainTimeout = 3 * time.Second
-
-// finishHAR completes the HAR file when --har is active, promoting a write
-// failure to a non-zero exit code so a silent loss of captured traffic is
-// impossible.
-func finishHAR(exitCode int) int {
-	if !harMode {
-		return exitCode
-	}
-	if err := closeHAR(); err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: failed to write HAR file %s: %v\n", harPath, err)
-		if exitCode == 0 {
-			return 1
-		}
-	}
-	return exitCode
-}

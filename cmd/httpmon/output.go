@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
 // ---- output channel ----
@@ -85,7 +85,7 @@ func paint(code, s string) string {
 // ---- sinks ----
 
 // sink renders exchange events. Exactly one is active, chosen by --format and
-// --ui; --record and --har are fed separately, through captures.
+// --ui; sessions are fed separately, through captures.
 //
 // The text and TUI sinks show each exchange as it unfolds, from the events
 // before the last; the summary and JSON sinks report each exchange once, when
@@ -116,9 +116,10 @@ type sink interface {
 type runInfo struct {
 	Version string   `json:"version"`
 	Proxy   string   `json:"proxy"`
-	Command []string `json:"command"`
+	Command []string `json:"command,omitempty"`
 	Filter  string   `json:"filter,omitempty"`
 	CA      string   `json:"ca_bundle"`
+	Session string   `json:"session,omitempty"`
 }
 
 var (
@@ -274,7 +275,12 @@ func (textSink) notice(msg string) {
 	fmt.Fprintf(os.Stderr, "httpmon: %s\n", textsafe.Line(msg))
 }
 
-func (textSink) start(info runInfo) { printBanner(info) }
+func (textSink) start(info runInfo) {
+	if len(info.Command) == 0 {
+		return // httpmon proxy prints its own banner
+	}
+	printBanner(info)
+}
 
 func (textSink) end(d *exchange.Digest) {
 	emitText("\n" + textsafe.Line(d.String()) + "\n")
@@ -291,7 +297,12 @@ func printBanner(info runInfo) {
 	if insecureUpstream {
 		b.WriteString("httpmon: upstream TLS verification DISABLED (--insecure-upstream)\n")
 	}
-	fmt.Fprintf(&b, "httpmon: running %s\n", strings.Join(info.Command, " "))
+	if len(info.Command) > 0 {
+		fmt.Fprintf(&b, "httpmon: running %s\n", strings.Join(info.Command, " "))
+	}
+	if info.Session != "" {
+		fmt.Fprintf(&b, "httpmon: session %s\n", info.Session)
+	}
 	fmt.Fprint(os.Stderr, b.String())
 }
 
@@ -344,6 +355,9 @@ func (summarySink) notice(msg string) {
 }
 
 func (summarySink) start(info runInfo) {
+	if len(info.Command) == 0 {
+		return // httpmon proxy prints its own banner
+	}
 	fmt.Fprintf(os.Stderr, "httpmon %s: running %s\n", info.Version, strings.Join(info.Command, " "))
 }
 

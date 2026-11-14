@@ -8,9 +8,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
 // ---- httpmon diff ----
@@ -47,7 +48,7 @@ func cmdDiff(args []string) int {
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: httpmon diff <before> <after> [options]
 
-Compares two --record files exchange by exchange. Exchanges are paired by
+Compares two sessions (names, directories or exchanges files) exchange by exchange. Exchanges are paired by
 method, path and query parameter names, in order. Reported:
 
   +  an exchange only in <after>        -  an exchange only in <before>
@@ -128,7 +129,11 @@ Options:
 // readExchanges reads a whole record, recovering each error response's hint
 // from its raw bytes: the hint is not stored, and an outcome such as
 // "500 db_timeout" is more telling than "500".
-func readExchanges(path string) ([]*exchange.Exchange, error) {
+func readExchanges(arg string) ([]*exchange.Exchange, error) {
+	path, err := session.Resolve(arg)
+	if err != nil {
+		return nil, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

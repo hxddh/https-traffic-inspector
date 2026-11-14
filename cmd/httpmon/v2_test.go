@@ -17,8 +17,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
@@ -173,7 +173,6 @@ func TestFailure_ReportedInEveryOutput(t *testing.T) {
 	dead.Close()
 
 	out := captureJSON(t)
-	mem := useMemoryHAR(t)
 	recPath := filepath.Join(t.TempDir(), "rec.ndjson")
 	useRecord(t, recPath)
 
@@ -200,7 +199,10 @@ func TestFailure_ReportedInEveryOutput(t *testing.T) {
 	if len(recs) != 1 || recs[0].Error == nil || recs[0].Status != 0 {
 		t.Errorf("record = %+v, want one entry with an error and no status", recs)
 	}
-	entries := mem.entries()
+	var entries []exchange.HAREntry
+	for _, r := range recs {
+		entries = append(entries, exchange.ToHAR(r))
+	}
 	if len(entries) != 1 || entries[0].Response.Error == "" || entries[0].Response.Status != 0 {
 		t.Errorf("HAR = %+v, want one entry with status 0 and _error", entries)
 	}
@@ -324,39 +326,14 @@ func TestReplay_SkipsWebSocketsFailuresAndRedacted(t *testing.T) {
 
 // ---- HAR ----
 
-func TestHAR_PrivateAndStreamed(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.har")
-	os.WriteFile(path, []byte("old"), 0o644) //nolint:errcheck
-	saved := har
-	defer func() { har = saved }()
-	if err := openHARFile(path); err != nil {
-		t.Fatal(err)
-	}
-	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
-		t.Errorf("HAR mode = %v, want 0600: it holds credentials", fi.Mode().Perm())
-	}
-	har.add(harEntry{Request: harRequest{Method: "GET", URL: "https://example.com/"}})
-	// On disk before the run ends, so a killed run keeps what it captured.
-	if data, _ := os.ReadFile(path); !bytes.Contains(data, []byte("https://example.com/")) {
-		t.Error("entry not written until close")
-	}
-	if err := closeHAR(); err != nil {
-		t.Fatal(err)
-	}
-	var hf harFile
-	data, _ := os.ReadFile(path)
-	if err := json.Unmarshal(data, &hf); err != nil || len(hf.Log.Entries) != 1 {
-		t.Fatalf("HAR invalid (%v) or wrong entry count: %s", err, data)
-	}
-}
-
 func TestHAR_BinaryBodyIsBase64(t *testing.T) {
-	e := buildHAREntry(
-		capturedRequest{facts: requestFacts{method: "GET", rawURL: "http://h/", headers: http.Header{}}},
-		capturedResponse{
-			facts: responseFacts{status: 200, statusText: "200 OK", headers: http.Header{"Content-Type": {"image/png"}}},
-			body:  bodyView{Raw: []byte{0x89, 'P', 'N', 'G', 0xff}, Size: 5},
-		})
+	e := exchange.ToHAR(&exchange.Exchange{
+		Method: "GET", URL: "http://h/", Status: 200, StatusText: "OK",
+		Response: &exchange.Message{
+			Headers: exchange.Headers{"Content-Type": {"image/png"}},
+			Body:    &body.Rendered{Size: 5, ContentType: "image/png", Raw: body.NewRaw([]byte{0x89, 'P', 'N', 'G', 0xff}, false)},
+		},
+	})
 	if e.Response.Content.Encoding != "base64" || e.Response.Content.Text != "iVBOR/8=" {
 		t.Errorf("content = %+v, want base64 of the bytes", e.Response.Content)
 	}

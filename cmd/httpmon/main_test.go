@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
 // ---- generateCert ----
@@ -1132,32 +1132,32 @@ func TestHAR_BasicCapture(t *testing.T) {
 }
 
 func TestHAR_WriteFile(t *testing.T) {
-	entries := []harEntry{
+	entries := []exchange.HAREntry{
 		{
 			StartedDateTime: time.Now().UTC().Format(time.RFC3339Nano),
 			Time:            42.0,
-			Request: harRequest{
+			Request: exchange.HARRequest{
 				Method:      "GET",
 				URL:         "https://example.com/",
 				HTTPVersion: "HTTP/1.1",
-				Headers:     []harNameValue{},
-				QueryString: []harNameValue{},
-				Cookies:     []harNameValue{},
+				Headers:     []exchange.HARNameValue{},
+				QueryString: []exchange.HARNameValue{},
+				Cookies:     []exchange.HARNameValue{},
 				HeadersSize: -1,
 				BodySize:    -1,
 			},
-			Response: harResponse{
+			Response: exchange.HARResponse{
 				Status:      200,
 				StatusText:  "OK",
 				HTTPVersion: "HTTP/1.1",
-				Headers:     []harNameValue{},
-				Cookies:     []harNameValue{},
-				Content:     harContent{Size: 2, MimeType: "text/plain", Text: "hi"},
+				Headers:     []exchange.HARNameValue{},
+				Cookies:     []exchange.HARNameValue{},
+				Content:     exchange.HARContent{Size: 2, MimeType: "text/plain", Text: "hi"},
 				RedirectURL: "",
 				HeadersSize: -1,
 				BodySize:    2,
 			},
-			Timings: harTimings{Wait: 42.0},
+			Timings: exchange.HARTimings{Wait: 42.0},
 		},
 	}
 

@@ -13,8 +13,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
 // ---- exchange records ----
@@ -60,6 +60,7 @@ func buildExchange(id int, r capturedRequest, rs capturedResponse, forRecord boo
 			Headers: exchange.FromHTTP(headers(r.facts.headers)),
 		},
 		Redacted: forRecord && redactCaptures,
+		Rule:     ruleLabel(id),
 	}
 	e.Request.Body, _ = renderBody(r.facts.headers, r.body, forRecord)
 	if rs.err != nil {

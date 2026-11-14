@@ -1,4 +1,4 @@
-module github.com/hxddh/https-traffic-inspector/v3
+module github.com/hxddh/https-traffic-inspector/v4
 
 go 1.26.0
 
@@ -14,6 +14,7 @@ require (
 )
 
 require (
+	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
 	github.com/charmbracelet/x/ansi v0.11.6 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.15 // indirect

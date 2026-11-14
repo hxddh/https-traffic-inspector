@@ -4,11 +4,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
 // capturedRequest and capturedResponse are the two halves of an exchange as
-// --record and --har need them, each available once its body has finished.
+// sessions need them, each available once its body has finished.
 type capturedRequest struct {
 	facts requestFacts
 	body  bodyView
@@ -48,7 +48,7 @@ func newExchangeJoiner() *exchangeJoiner {
 	}
 }
 
-// captures joins exchanges for --record and --har.
+// captures joins exchanges for sessions.
 var captures = newExchangeJoiner()
 
 func (j *exchangeJoiner) addRequest(id int, r capturedRequest) {
@@ -120,19 +120,18 @@ func completeExchange(id int, r capturedRequest, rs capturedResponse) {
 	if recordMode {
 		writeRecord(buildExchange(id, r, rs, true))
 	}
-	if harMode {
-		addHAREntry(r, rs)
-	}
+	ruleLabels.Delete(id)
 }
 
 // discardReqID cleans up per-request state when a request was logged but will
 // never be reported as completed or failed.
 func discardReqID(reqID int) {
 	untrack(reqID)
+	ruleLabels.Delete(reqID)
 	reqStartMu.Lock()
 	delete(reqStartTimes, reqID)
 	reqStartMu.Unlock()
-	if recordMode || harMode {
+	if recordMode {
 		captures.drop(reqID)
 	}
 }

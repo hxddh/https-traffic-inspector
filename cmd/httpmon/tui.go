@@ -16,9 +16,9 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
 // tuiEntry holds one HTTP transaction displayed in the TUI. Every string in
@@ -646,25 +646,30 @@ var curlSkipHeaders = map[string]bool{
 
 // curlCommand builds a shell command that reproduces e's request.
 func curlCommand(e *tuiEntry) string {
+	return curlFor(e.method, e.curlURL, e.rawReqHeaders, e.reqBodyRaw, e.reqBodyWhole)
+}
+
+// curlFor builds a shell command that sends a request.
+func curlFor(method, url string, headers http.Header, body []byte, whole bool) string {
 	var b strings.Builder
 	b.WriteString("curl")
-	if e.method != http.MethodGet {
-		b.WriteString(" -X " + shellQuote(e.method))
+	if method != http.MethodGet {
+		b.WriteString(" -X " + shellQuote(method))
 	}
-	b.WriteString(" " + shellQuote(e.curlURL))
-	for _, k := range sortedKeys(e.rawReqHeaders) {
+	b.WriteString(" " + shellQuote(url))
+	for _, k := range sortedKeys(headers) {
 		if curlSkipHeaders[k] {
 			continue
 		}
-		for _, v := range e.rawReqHeaders[k] {
+		for _, v := range headers[k] {
 			b.WriteString(" \\\n  -H " + shellQuote(k+": "+v))
 		}
 	}
-	if len(e.reqBodyRaw) > 0 {
-		if e.reqBodyWhole && utf8.Valid(e.reqBodyRaw) {
-			b.WriteString(" \\\n  --data-binary " + shellQuote(string(e.reqBodyRaw)))
+	if len(body) > 0 {
+		if whole && utf8.Valid(body) {
+			b.WriteString(" \\\n  --data-binary " + shellQuote(string(body)))
 		} else {
-			fmt.Fprintf(&b, "\n# request body (%d+ bytes) omitted: binary or only partly captured", len(e.reqBodyRaw))
+			fmt.Fprintf(&b, "\n# request body (%d+ bytes) omitted: binary or only partly captured", len(body))
 		}
 	}
 	return b.String()

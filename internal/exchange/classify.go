@@ -25,11 +25,13 @@ const (
 	KindReset        = "reset"
 	KindProxy        = "proxy"
 	KindCanceled     = "canceled"
+	// KindInjected is a failure a --fault rule caused on purpose.
+	KindInjected     = "injected"
 	KindOther        = "other"
 )
 
 // Kinds lists every error kind.
-var Kinds = []string{KindDNS, KindRefused, KindTimeout, KindTLSVerify, KindTLSHandshake, KindReset, KindProxy, KindCanceled, KindOther}
+var Kinds = []string{KindDNS, KindRefused, KindTimeout, KindTLSVerify, KindTLSHandshake, KindReset, KindProxy, KindCanceled, KindInjected, KindOther}
 
 // Classify returns the kind of an upstream failure.
 func Classify(err error) string {
@@ -45,7 +47,10 @@ func Classify(err error) string {
 	var recordErr tls.RecordHeaderError
 	var alert tls.AlertError
 	var netErr net.Error
+	var injected *InjectedError
 	switch {
+	case errors.As(err, &injected):
+		return KindInjected
 	case errors.Is(err, context.Canceled):
 		return KindCanceled
 	// The transport prefixes a failure to reach or negotiate with an
@@ -82,3 +87,8 @@ func Describe(err error, displayURL string) *Error {
 	}
 	return &Error{Kind: Classify(err), Message: msg}
 }
+
+// InjectedError is a failure a --fault rule caused.
+type InjectedError struct{ Rule string }
+
+func (e *InjectedError) Error() string { return "injected by " + e.Rule }

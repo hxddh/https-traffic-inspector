@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 )
 
 // ---- diff ----

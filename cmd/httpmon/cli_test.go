@@ -263,11 +263,11 @@ func TestRenderBody_RespectsCaptureLimit(t *testing.T) {
 // short. Reproduces what v1.1.0 shipped.
 func TestRenderBody_UncompressedOverflowIsMarked(t *testing.T) {
 	savedDisplay, savedCapture := displayMaxBody, captureMaxBody
-	savedRecord, savedHAR := recordMode, harMode
-	displayMaxBody, captureMaxBody, recordMode, harMode = 100, 1<<20, false, false
+	savedRecord := recordMode
+	displayMaxBody, captureMaxBody, recordMode = 100, 1<<20, false
 	defer func() {
 		displayMaxBody, captureMaxBody = savedDisplay, savedCapture
-		recordMode, harMode = savedRecord, savedHAR
+		recordMode = savedRecord
 	}()
 
 	h := http.Header{}
@@ -286,9 +286,9 @@ func TestRenderBody_UncompressedOverflowIsMarked(t *testing.T) {
 
 // A body that exactly fills the limit is complete, not truncated.
 func TestRenderBody_ExactFitNotMarked(t *testing.T) {
-	savedDisplay, savedRecord, savedHAR := displayMaxBody, recordMode, harMode
-	displayMaxBody, recordMode, harMode = 100, false, false
-	defer func() { displayMaxBody, recordMode, harMode = savedDisplay, savedRecord, savedHAR }()
+	savedDisplay, savedRecord := displayMaxBody, recordMode
+	displayMaxBody, recordMode = 100, false
+	defer func() { displayMaxBody, recordMode = savedDisplay, savedRecord }()
 
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")

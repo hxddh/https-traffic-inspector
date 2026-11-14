@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
 // ---- httpmon help ----

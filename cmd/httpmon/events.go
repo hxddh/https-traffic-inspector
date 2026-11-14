@@ -8,8 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 )
 
 // ---- exchange events ----
@@ -18,7 +18,7 @@ import (
 // head and a response body -- or, instead of the response, a failure. The two
 // bodies are sampled as they stream, so the request body may finish after the
 // response has started. Each event goes to the active sink; the completed
-// exchange goes to captures for --record and --har.
+// exchange goes to captures for sessions.
 
 var (
 	requestCounter int
@@ -132,7 +132,7 @@ func (f responseFacts) totalDuration() time.Duration {
 // bodyView is a captured body. Text is the human-readable form -- decoded
 // from its Content-Encoding, or a placeholder for binary data -- and carries no
 // truncation marker, which is added only when rendering for display. Raw holds
-// the bytes exactly as they crossed the wire, which --record and --har need to
+// the bytes exactly as they crossed the wire, which sessions need to
 // reproduce the body faithfully.
 type bodyView struct {
 	Text      string
