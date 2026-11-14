@@ -11,7 +11,7 @@ import (
 func FuzzLine(f *testing.F) {
 	f.Add("ok")
 	f.Add("\x1b]0;title\x07red\x1b[31m")
-	f.Add("a\r\nb‮c\x00")
+	f.Add("a\r\nb\u202ec\x00")
 	f.Fuzz(func(t *testing.T, s string) {
 		l := Line(s)
 		if !utf8.ValidString(l) {
