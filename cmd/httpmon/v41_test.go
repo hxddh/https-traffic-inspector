@@ -308,7 +308,14 @@ func TestFollow_AcrossTwoRotations(t *testing.T) {
 	}()
 	time.Sleep(300 * time.Millisecond)
 	// Two rotations before the follower looks again.
-	os.Rename(cur, filepath.Join(dir, "exchanges.000001.ndjson"))                       //nolint:errcheck
+	if err := os.Rename(cur, filepath.Join(dir, "exchanges.000001.ndjson")); err != nil {
+		// Windows renames no file a reader has open: there the writer puts
+		// rotation off while the session is followed (store.Writer.rotate),
+		// so a follower never meets a rotation.
+		os.WriteFile(cur, []byte(line(1)+line(2)+line(3)), 0o600) //nolint:errcheck
+		<-done
+		t.Skipf("this platform cannot rotate a followed file: %v", err)
+	}
 	os.WriteFile(filepath.Join(dir, "exchanges.000002.ndjson"), []byte(line(2)), 0o600) //nolint:errcheck
 	os.WriteFile(cur, []byte(line(3)), 0o600)                                           //nolint:errcheck
 	<-done

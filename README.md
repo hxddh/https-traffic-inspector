@@ -674,6 +674,7 @@ so 3.x record files can still be queried, diffed and replayed by path.
 - **WebSocket over HTTP/2 (RFC 8441) is not supported**; clients fall back to HTTP/1.1, which works.
 - **Cleartext HTTP/2 cannot be sent through `--upstream-proxy`.**
 - **A JVM that does not see `JAVA_TOOL_OPTIONS`** — for example a Gradle daemon already running before httpmon started — is not configured. Stop it first (`./gradlew --stop`).
+- **On Windows, a session being read is not rotated.** Windows cannot rename a file another process has open, so while `httpmon ui` or `query --follow` reads a session, it grows past `--max-session-size` and is rotated once the reader lets go.
 - **Rules match on host, path and request headers**, not on bodies, and do not apply to WebSocket connections.
 - **Bodies are capped.** Output shows about `--max-body` bytes; sessions and decoding keep `--max-capture` bytes, buffered per request. The summary and JSON outputs keep only what they use: the summary only an error response's JSON, JSON output nothing of a binary body.
 - **Masking covers headers and URLs, not bodies.**
