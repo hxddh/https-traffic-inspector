@@ -35,6 +35,7 @@ httpmon query run1 --id 10                    # one exchange, full text
 httpmon query run1 --id 10 --body response    # decoded body, untruncated
 httpmon query run1 --id 10 --format curl      # a curl command that re-sends it
 httpmon query run1 --format har > run1.har    # for browser dev tools
+httpmon query run1 --wait --url /orders       # block until the next matching exchange (exit 4 on timeout)
 ```
 
 A session keeps raw bytes and can be large; `query` controls how much you read.
@@ -46,12 +47,16 @@ httpmon --mock 'GET api.example.com/v1/orders => 503 {"error":"down"}' <command>
 httpmon --fault '*/upload => reset after 1KB' <command>
 httpmon --fault 'api.example.com/* => delay 2s 30%' <command>
 httpmon --map 'api.example.com => localhost:3000' <command>
+httpmon --header '*/api/* => request set X-Debug: 1' <command>
+httpmon --fault 'POST */pay [header X-Test-Fail] => reset' <command>
 httpmon --mock-from run1 <command>      # answer from a recorded session
 httpmon mock run1 --port 8080           # offline mock server from a session
 ```
 
 PATTERN is `host/path` with `*` wildcards. Touched exchanges are marked
-`[mock]`, `[fault]` or `[map]`; `query --rule` lists them.
+`[mock]`, `[fault]`, `[map]` or `[header]`; `query --rule` lists them.
+`[header NAME]` / `[header NAME: VALUE*]` after the pattern narrows a rule to
+requests carrying that header.
 
 ## Did my change work? — compare runs
 
@@ -83,6 +88,11 @@ JSON Schema). JSON bodies are embedded as values and stay valid when shortened;
 `"truncated": true` marks a cut. Failures are `"error": {"kind", "message"}`
 with kind one of dns, refused, timeout, tls_verify, tls_handshake, reset, proxy,
 canceled, injected, other.
+
+## MCP
+
+`httpmon mcp` serves sessions to an MCP client. After triggering an action,
+call `wait_for_exchange` rather than polling `query_exchanges`.
 
 ## Rules
 

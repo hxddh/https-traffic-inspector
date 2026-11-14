@@ -16,10 +16,10 @@ func TestParse_Mock(t *testing.T) {
 	if r.Status != 503 || string(r.Body) != `{"error":"down"}` || r.ContentType != "application/json" {
 		t.Errorf("rule = %+v", r)
 	}
-	if !r.matches("POST", "api.example.com/v1/orders") || r.matches("GET", "api.example.com/v1/orders") {
+	if !r.matches("POST", "api.example.com/v1/orders", nil) || r.matches("GET", "api.example.com/v1/orders", nil) {
 		t.Error("method or pattern mismatch")
 	}
-	if r.matches("POST", "api.example.com/v2/orders") {
+	if r.matches("POST", "api.example.com/v2/orders", nil) {
 		t.Error("matched another path")
 	}
 	if r.Label() != `mock: POST api.example.com/v1/* => 503 {"error":"down"}` {
@@ -44,7 +44,7 @@ func TestParse_HostOnlyPatternMatchesEveryPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.matches("GET", "api.example.com/") || !r.matches("DELETE", "api.example.com/a/b") || r.matches("GET", "other.com/") {
+	if !r.matches("GET", "api.example.com/", nil) || !r.matches("DELETE", "api.example.com/a/b", nil) || r.matches("GET", "other.com/", nil) {
 		t.Error("host-only pattern")
 	}
 }

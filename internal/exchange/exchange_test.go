@@ -32,6 +32,8 @@ func TestSummaryLine(t *testing.T) {
 			"#3 GET h/ws → 101 websocket, 12 messages (4.2s)"},
 		{Exchange{ID: 2, Method: "POST", URL: "https://h/pkg.Svc/Get", Status: 200, DurationMs: 1, GRPC: &GRPCStatus{Code: 5, Name: "NOT_FOUND"}},
 			"#2 POST h/pkg.Svc/Get → 200 grpc NOT_FOUND (1ms, 0 B)"},
+		{Exchange{ID: 4, Method: "GET", URL: "http://h/m", Status: 503, Rule: "header: */* => request set X-A: 1; mock: GET */m => 503"},
+			"#4 GET h/m → 503 (0ms, 0 B) [header] [mock]"},
 	} {
 		if got := tc.e.SummaryLine(); got != tc.want {
 			t.Errorf("SummaryLine() = %q\n               want %q", got, tc.want)

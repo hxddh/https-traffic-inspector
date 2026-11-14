@@ -154,3 +154,38 @@ func TestDiff_PairsInInitiationOrder(t *testing.T) {
 		t.Errorf("completion order produced a difference: %+v", n)
 	}
 }
+
+// A diff of light exchanges loads the full ones only where a body's digest
+// differs, and finds the same changes.
+func TestDiff_SlimWithLoad(t *testing.T) {
+	mk := func(id int, b string) *Exchange {
+		return &Exchange{V: Version, ID: id, Method: "GET", URL: "https://h/items", Status: 200,
+			Response: &Message{Headers: Headers{}, Body: &body.Rendered{Size: int64(len(b)), Raw: body.NewRaw([]byte(b), false)}}}
+	}
+	before := []*Exchange{mk(1, `{"price":1}`), mk(2, `{"same":true}`)}
+	after := []*Exchange{mk(1, `{"price":2}`), mk(2, `{"same":true}`)}
+	full := map[*Exchange]*Exchange{}
+	var slimA, slimB []*Exchange
+	for _, l := range []struct {
+		in  []*Exchange
+		out *[]*Exchange
+	}{{before, &slimA}, {after, &slimB}} {
+		for _, e := range l.in {
+			c := *e
+			c.Response = &Message{Headers: e.Response.Headers, Body: e.Response.Body}
+			Slim(&c)
+			full[&c] = e
+			*l.out = append(*l.out, &c)
+		}
+	}
+	loads := 0
+	opt := DefaultDiffOptions
+	opt.Load = func(e *Exchange) (*Exchange, error) { loads++; return full[e], nil }
+	changes, counts := Diff(slimA, slimB, opt)
+	if counts.Changed != 1 || counts.Unchanged != 1 || len(changes) != 1 || changes[0].Detail != ".price" {
+		t.Errorf("changes = %+v, counts = %+v", changes, counts)
+	}
+	if loads != 2 {
+		t.Errorf("loaded %d exchanges, want 2 (only the pair that differs)", loads)
+	}
+}

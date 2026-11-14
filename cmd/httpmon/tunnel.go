@@ -103,6 +103,7 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 	// Expect: 100-continue; asking the upstream again only adds a round trip.
 	proxyReq.Header.Del("Expect")
 	removeHopByHopHeaders(proxyReq.Header)
+	applyHeaderRules(rule.headers, "request", proxyReq.Header)
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
@@ -119,6 +120,7 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 		http.Error(w, "httpmon: "+info.Kind+": "+info.Message, http.StatusBadGateway)
 		return
 	}
+	applyHeaderRules(rule.headers, "response", resp.Header)
 	if shouldLog {
 		logResponse(resp, reqID)
 	}

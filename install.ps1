@@ -13,6 +13,7 @@ $dir = if ($env:HTTPMON_INSTALL_DIR) { $env:HTTPMON_INSTALL_DIR } else { Join-Pa
 
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
   'AMD64' { 'amd64' }
+  'ARM64' { 'arm64' }
   default { throw "httpmon install: unsupported architecture $($env:PROCESSOR_ARCHITECTURE)" }
 }
 $base = if ($version -eq 'latest') { "https://github.com/$repo/releases/latest/download" } else { "https://github.com/$repo/releases/download/$version" }

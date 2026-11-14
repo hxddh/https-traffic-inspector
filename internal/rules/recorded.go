@@ -27,27 +27,22 @@ type Recorded struct {
 
 // LoadRecorded reads the exchanges of a record that have a response.
 func LoadRecorded(path string, ignoreHost bool) (*Recorded, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+	return LoadRecordedFiles([]string{path}, ignoreHost)
+}
+
+// LoadRecordedFiles reads a session's segments, oldest first.
+func LoadRecordedFiles(paths []string, ignoreHost bool) (*Recorded, error) {
 	r := &Recorded{byKey: map[string][]*exchange.Exchange{}, next: map[string]int{}, ignoreHost: ignoreHost}
-	rd := exchange.NewReader(f)
 	var all []*exchange.Exchange
-	for {
-		e, err := rd.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
+	for i, path := range paths {
+		if err := readResponses(path, i, &all); err != nil {
 			return nil, err
 		}
-		if e.Response != nil && e.Error == nil && e.WebSocket == nil {
-			all = append(all, e)
-		}
 	}
-	sort.SliceStable(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	// Recorded order: the order of the files, then of ids within each.
+	sort.SliceStable(all, func(i, j int) bool {
+		return all[i].Ref < all[j].Ref || all[i].Ref == all[j].Ref && all[i].ID < all[j].ID
+	})
 	for _, e := range all {
 		u, err := url.Parse(e.URL)
 		if err != nil {
@@ -81,6 +76,28 @@ func (r *Recorded) Len() int {
 		n += len(v)
 	}
 	return n
+}
+
+func readResponses(path string, file int, all *[]*exchange.Exchange) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	rd := exchange.NewReader(f)
+	for {
+		e, err := rd.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if e.Response != nil && e.Error == nil && e.WebSocket == nil {
+			e.Ref = file
+			*all = append(*all, e)
+		}
+	}
 }
 
 // Lookup returns the next recorded exchange for a request, or nil.

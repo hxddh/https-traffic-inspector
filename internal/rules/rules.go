@@ -1,12 +1,16 @@
 // Package rules parses and matches httpmon's declarative traffic rules:
 //
-//	mock   [METHOD] PATTERN => STATUS [BODY | @FILE]
-//	fault  [METHOD] PATTERN => delay 2s | reset | reset after 1KB | timeout  [N%]
+//	mock   [METHOD] PATTERN [CONDITION…] => STATUS [BODY | @FILE]
+//	fault  [METHOD] PATTERN [CONDITION…] => delay 2s | reset | reset after 1KB | timeout  [N%]
+//	header [METHOD] PATTERN [CONDITION…] => request|response set NAME: VALUE | remove NAME
 //	map    HOST[:PORT] => [SCHEME://]HOST[:PORT]
 //
 // A PATTERN is a host and path, with * matching any run of characters:
 // "api.example.com/v1/orders", "*/upload", "api.example.com/*". A pattern
-// without a path matches every path of the host.
+// without a path matches every path of the host. A CONDITION requires a
+// request header: "[header X-Test]" that it is present, "[header
+// Authorization: Bearer expired*]" that a value matches; several must all
+// hold.
 package rules
 
 import (
@@ -14,6 +18,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"mime"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,9 +31,10 @@ import (
 
 // Kinds of rule.
 const (
-	KindMock  = "mock"
-	KindFault = "fault"
-	KindMap   = "map"
+	KindMock   = "mock"
+	KindFault  = "fault"
+	KindMap    = "map"
+	KindHeader = "header"
 )
 
 // Fault actions.
@@ -59,7 +65,23 @@ type Rule struct {
 	// map
 	From string // host[:port], lower case
 	To   *url.URL
+
+	// header
+	Dir   string // "request" or "response"
+	Op    string // "set" or "remove"
+	Name  string // canonical
+	Value string
+
+	conds []headerCond
 }
+
+// headerCond requires a request header, and a value when val is set.
+type headerCond struct {
+	name string
+	val  *regexp.Regexp
+}
+
+var condRE = regexp.MustCompile(`\[header\s+([^\]:]+?)\s*(?::\s*([^\]]*))?\]`)
 
 // Label is how an exchange touched by the rule is marked in output.
 func (r *Rule) Label() string { return r.Kind + ": " + r.Source }
@@ -76,15 +98,21 @@ func Parse(kind, text string) (*Rule, error) {
 	switch kind {
 	case KindMap:
 		return r, r.parseMap(lhs, rhs)
-	case KindMock, KindFault:
+	case KindMock, KindFault, KindHeader:
+		var err error
+		if lhs, err = r.parseConds(lhs); err != nil {
+			return nil, fmt.Errorf("%s rule %q: %w", kind, text, err)
+		}
 		if err := r.parseMatch(lhs); err != nil {
 			return nil, fmt.Errorf("%s rule %q: %w", kind, text, err)
 		}
-		var err error
-		if kind == KindMock {
+		switch kind {
+		case KindMock:
 			err = r.parseMock(rhs)
-		} else {
+		case KindFault:
 			err = r.parseFault(rhs)
+		default:
+			err = r.parseHeader(rhs)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("%s rule %q: %w", kind, text, err)
@@ -92,6 +120,68 @@ func Parse(kind, text string) (*Rule, error) {
 		return r, nil
 	}
 	return nil, fmt.Errorf("unknown rule kind %q", kind)
+}
+
+// parseConds takes the header conditions out of a rule's left side.
+func (r *Rule) parseConds(lhs string) (string, error) {
+	for _, m := range condRE.FindAllStringSubmatch(lhs, -1) {
+		c := headerCond{name: http.CanonicalHeaderKey(strings.TrimSpace(m[1]))}
+		if strings.ContainsAny(c.name, " \t") {
+			return "", fmt.Errorf("bad header name %q", m[1])
+		}
+		if v := strings.TrimSpace(m[2]); v != "" {
+			re, err := regexp.Compile("^" + glob(v) + "$")
+			if err != nil {
+				return "", err
+			}
+			c.val = re
+		}
+		r.conds = append(r.conds, c)
+	}
+	rest := strings.TrimSpace(condRE.ReplaceAllString(lhs, ""))
+	if strings.ContainsAny(rest, "[]") {
+		return "", errors.New(`want "[header NAME]" or "[header NAME: VALUE]"`)
+	}
+	return rest, nil
+}
+
+// parseHeader parses "request|response set NAME: VALUE" or "… remove NAME".
+func (r *Rule) parseHeader(rhs string) error {
+	dir, rest, _ := strings.Cut(rhs, " ")
+	op, rest, _ := strings.Cut(strings.TrimSpace(rest), " ")
+	r.Dir, r.Op = strings.ToLower(dir), strings.ToLower(op)
+	if r.Dir != "request" && r.Dir != "response" {
+		return errors.New(`want "request" or "response" after =>`)
+	}
+	rest = strings.TrimSpace(rest)
+	switch r.Op {
+	case "set":
+		name, val, ok := strings.Cut(rest, ":")
+		if !ok || strings.TrimSpace(name) == "" {
+			return errors.New(`want "set NAME: VALUE"`)
+		}
+		r.Name, r.Value = http.CanonicalHeaderKey(strings.TrimSpace(name)), strings.TrimSpace(val)
+	case "remove":
+		if rest == "" || strings.ContainsAny(rest, " :") {
+			return errors.New(`want "remove NAME"`)
+		}
+		r.Name = http.CanonicalHeaderKey(rest)
+	default:
+		return errors.New(`want "set" or "remove"`)
+	}
+	if strings.ContainsAny(r.Name+r.Value, "\r\n") || strings.ContainsAny(r.Name, " \t") {
+		return errors.New("bad header")
+	}
+	return nil
+}
+
+// Apply makes a header rule's change to h.
+func (r *Rule) Apply(h http.Header) {
+	if r.Op == "set" {
+		h.Set(r.Name, r.Value)
+	} else {
+		h.Del(r.Name)
+	}
 }
 
 func (r *Rule) parseMatch(lhs string) error {
@@ -231,13 +321,32 @@ func (r *Rule) parseMap(lhs, rhs string) error {
 	return nil
 }
 
-// matches reports whether the rule's method and pattern match a request.
-// host has no default port; target is host + path.
-func (r *Rule) matches(method, target string) bool {
+// matches reports whether the rule's method, pattern and conditions match a
+// request. host has no default port; target is host + path.
+func (r *Rule) matches(method, target string, h http.Header) bool {
 	if r.method != "" && r.method != method {
 		return false
 	}
-	return r.match.MatchString(target)
+	if !r.match.MatchString(target) {
+		return false
+	}
+	for _, c := range r.conds {
+		vals := h.Values(c.name)
+		if len(vals) == 0 {
+			return false
+		}
+		if c.val == nil {
+			continue
+		}
+		ok := false
+		for _, v := range vals {
+			ok = ok || c.val.MatchString(v)
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // fires decides, for a rule applied to a share of requests, whether this
@@ -255,20 +364,20 @@ type Set struct {
 }
 
 // NewSet parses the given rules.
-func NewSet(mocks, faults, maps []string) (*Set, error) {
-	rs, err := parseAll(mocks, faults, maps)
+func NewSet(mocks, faults, maps []string, headers ...string) (*Set, error) {
+	rs, err := parseAll(mocks, faults, maps, headers)
 	if err != nil {
 		return nil, err
 	}
 	return &Set{fixed: rs}, nil
 }
 
-func parseAll(mocks, faults, maps []string) ([]*Rule, error) {
+func parseAll(mocks, faults, maps, headers []string) ([]*Rule, error) {
 	var out []*Rule
 	for _, l := range []struct {
 		kind  string
 		rules []string
-	}{{KindMock, mocks}, {KindFault, faults}, {KindMap, maps}} {
+	}{{KindMock, mocks}, {KindFault, faults}, {KindMap, maps}, {KindHeader, headers}} {
 		for _, t := range l.rules {
 			r, err := Parse(l.kind, t)
 			if err != nil {
@@ -281,8 +390,8 @@ func parseAll(mocks, faults, maps []string) ([]*Rule, error) {
 }
 
 // Replace sets the rules added at run time.
-func (s *Set) Replace(mocks, faults, maps []string) error {
-	rs, err := parseAll(mocks, faults, maps)
+func (s *Set) Replace(mocks, faults, maps []string, headers ...string) error {
+	rs, err := parseAll(mocks, faults, maps, headers)
 	if err != nil {
 		return err
 	}
@@ -314,11 +423,17 @@ type Decision struct {
 	Mock  *Rule // answer with this instead of forwarding
 	Fault *Rule // apply this fault
 	Map   *Rule // send the request here instead
+	// Headers are every header rule that matches, in order.
+	Headers []*Rule
 }
 
 // Decide matches a request. host is the request's host without a default
-// port, path its path.
-func (s *Set) Decide(method, host, path string) Decision {
+// port, path its path, h its headers (for rules with conditions).
+func (s *Set) Decide(method, host, path string, h ...http.Header) Decision {
+	var hdr http.Header
+	if len(h) > 0 {
+		hdr = h[0]
+	}
 	var d Decision
 	if s == nil {
 		return d
@@ -331,12 +446,16 @@ func (s *Set) Decide(method, host, path string) Decision {
 	for _, r := range s.all() {
 		switch r.Kind {
 		case KindMock:
-			if d.Mock == nil && r.matches(method, target) && r.fires() {
+			if d.Mock == nil && r.matches(method, target, hdr) && r.fires() {
 				d.Mock = r
 			}
 		case KindFault:
-			if d.Fault == nil && r.matches(method, target) && r.fires() {
+			if d.Fault == nil && r.matches(method, target, hdr) && r.fires() {
 				d.Fault = r
+			}
+		case KindHeader:
+			if r.matches(method, target, hdr) {
+				d.Headers = append(d.Headers, r)
 			}
 		case KindMap:
 			if d.Map == nil && (r.From == host || r.From == hostOnly(host)) {

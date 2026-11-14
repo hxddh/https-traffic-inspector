@@ -60,7 +60,15 @@ Expanding details (from the session)
   httpmon query run1 --id 10 --body response  # decoded body, untruncated
   httpmon query run1 --id 10 --format curl    # a command that re-sends it
   httpmon query run1 --format har > run1.har  # for browser dev tools
-  httpmon sessions                            # what sessions exist
+  httpmon sessions                            # what sessions exist (rm, prune to clean up)
+
+  Lookups by id and filters on status, method, URL, error or --rule use the
+  session's index: they stay fast however large a session grows.
+
+Waiting for a request instead of polling
+  httpmon query proxy --wait --url /orders --status 5xx --timeout 30s
+  Blocks until the first new matching exchange, prints it, exits 0; exit 4
+  on timeout. --after ID also accepts ones already recorded above that id.
 
   A session keeps raw bytes and is large: read it through query, not directly.
 
@@ -69,11 +77,14 @@ Testing failure paths: mock and fault rules
   httpmon --fault '*/upload => reset after 1KB' <command>
   httpmon --fault 'api.example.com/* => delay 2s 30%' <command>
   httpmon --map 'api.example.com => localhost:3000' <command>
+  httpmon --header '*/api/* => request set X-Debug: 1' <command>
+  httpmon --fault 'POST */pay [header X-Test-Fail] => reset' <command>
   httpmon --mock-from run1 <command>          # answer from a recorded session
   httpmon mock run1 --port 8080               # serve it as an offline mock server
-  PATTERN is host/path with * wildcards. Exchanges a rule touched are marked
-  [mock], [fault] or [map]; an injected failure has error kind "injected";
-  query --rule lists them.
+  PATTERN is host/path with * wildcards; [header NAME] or [header NAME: VALUE*]
+  conditions narrow a mock, fault or header rule. Exchanges a rule touched are
+  marked [mock], [fault], [map] or [header]; an injected failure has error
+  kind "injected"; query --rule lists them.
 
 After changing code: what did the change do to the requests?
   httpmon --session after <command>
@@ -85,11 +96,13 @@ Traffic from programs httpmon does not start
   httpmon proxy                   # a standing proxy, session "proxy"
   eval "$(httpmon env)"           # route this shell's commands through it
   httpmon query proxy --live      # exchanges so far, and those in flight
+  httpmon ui proxy                # (for a person) the interactive UI, live
 
 MCP
   httpmon mcp serves the sessions to an MCP client: list_sessions,
-  query_exchanges, get_exchange, get_body, in_flight, diff_sessions; with
-  --allow-mutations also add_rule and clear_rules on a running session.
+  query_exchanges, get_exchange, get_body, wait_for_exchange, export_curl,
+  in_flight, diff_sessions; with --allow-mutations also add_rule and
+  clear_rules on a running session, and replay_exchange.
 
 Structured output
   --format json writes one object per exchange (schema: httpmon schema).

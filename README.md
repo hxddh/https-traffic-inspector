@@ -115,6 +115,7 @@ Download from the [Releases](https://github.com/hxddh/https-traffic-inspector/re
 | Linux x86-64 | `httpmon-linux-amd64` |
 | Linux arm64 | `httpmon-linux-arm64` |
 | Windows x86-64 | `httpmon-windows-amd64.exe` |
+| Windows arm64 | `httpmon-windows-arm64.exe` |
 
 ```bash
 chmod +x httpmon-macos-arm64
@@ -152,11 +153,12 @@ go build -o httpmon ./cmd/httpmon
 httpmon [options] <command> [args...]   run a command and show its HTTP(S) traffic
 httpmon proxy  [options]                run a standing proxy for browsers, devices, services
 httpmon env    [--session NAME]         print exports that route a shell through a running proxy
-httpmon query  <session> [filters]      list, search or expand a session's exchanges
+httpmon query  <session> [filters]      list, search, expand or export exchanges; --wait for one
+httpmon ui     <session>                interactive UI on a session, live while it runs
 httpmon diff   <before> <after>         compare two sessions: what changed between runs
 httpmon replay <session> [options]      re-send recorded requests and compare responses
 httpmon mock   <session> [--port N]     serve recorded responses as an offline mock server
-httpmon sessions                        list sessions
+httpmon sessions [rm NAME | prune]      list or remove sessions
 httpmon mcp    [--allow-mutations]      serve sessions to an MCP client over stdio
 httpmon ca     [--dir DIR]              create or show the persistent CA
 httpmon schema                          print the JSON Schema of an exchange record
@@ -175,10 +177,12 @@ with one of those names, write `httpmon -- query …`.
 | `-o`, `--output` | _(stderr)_ | Write httpmon's output to a file; `-` for stdout. |
 | `--session` | _(none)_ | Keep every exchange, with its raw bytes, in this named session (see [Sessions](#sessions)). |
 | `--session-dir` | _(none)_ | Keep the session in this directory instead. |
-| `--append` | `false` | Add to the session's earlier exchanges instead of replacing them. |
+| `--append` | `false` | Add to the session's earlier exchanges instead of replacing them; ids continue from the last run. |
+| `--max-session-size` | `0` (`1GB` for `proxy`) | Keep the session under this size, dropping its oldest exchanges. |
 | `--mock` | _(none)_ | Answer matching requests: `'[METHOD] PATTERN => STATUS [BODY\|@FILE]'`. Repeatable. |
 | `--fault` | _(none)_ | Inject a fault: `'[METHOD] PATTERN => delay 2s\|reset\|reset after 1KB\|timeout [N%]'`. Repeatable. |
 | `--map` | _(none)_ | Send a host's requests elsewhere: `'HOST[:PORT] => [SCHEME://]HOST[:PORT]'`. Repeatable. |
+| `--header` | _(none)_ | Set or remove a header: `'[METHOD] PATTERN => request\|response set NAME: VALUE\|remove NAME'`. Repeatable. |
 | `--mock-from` | _(none)_ | Answer requests from a recorded session where it has a matching response. |
 | `--filter` | _(none)_ | Case-insensitive substring; only matching requests are logged. Non-matching traffic is still proxied. |
 | `--ui` | `false` | Launch the interactive terminal UI. |
@@ -205,6 +209,7 @@ Defaults for most options can be kept in [settings files](#settings-files).
 | `1` | httpmon failed to start. For `query` / `replay`: the session could not be read. For `diff`: the sessions differ. |
 | `2` | `replay --fail-on-diff`: at least one response differed from the recording. For `diff`: a session could not be read. |
 | `3` | `--fail-on`: the command exited 0, but an exchange matched. |
+| `4` | `query --wait`: no matching exchange before the timeout. |
 
 ---
 
@@ -246,9 +251,14 @@ httpmon diff run1 after --ignore .updated_at
 - **Failure paths on demand.** `--mock` and `--fault` make an endpoint fail,
   stall or drop the connection without touching the code or the server, and
   the exchanges they touched are marked `[mock]`, `[fault]` or `[map]`.
-- **MCP.** `httpmon mcp` gives an MCP client tools to list sessions, query and
-  expand exchanges, see what is in flight and diff runs — and, with
-  `--allow-mutations`, to add rules to a running session.
+- **Wait, don't poll.** `httpmon query proxy --wait --url /orders` returns the
+  next matching exchange as soon as it happens (exit 4 on timeout); MCP's
+  `wait_for_exchange` does the same for an MCP client.
+- **MCP.** `httpmon mcp` gives an MCP client tools to list sessions, query,
+  expand and wait for exchanges, export them as curl, see what is in flight and
+  diff runs — and, with `--allow-mutations`, to add rules to a running session
+  and replay requests. Lookups go through the session's index, so they stay
+  fast however large it grows.
 - **Self-describing.** `httpmon help agents` prints a one-screen guide and
   `httpmon schema` the JSON Schema of an exchange.
 
@@ -342,7 +352,21 @@ A session is a directory under httpmon's home (`$HTTPMON_HOME`, else
 exchange in the [exchange format](#exchange-records) with each body's raw
 bytes, the run's metadata, and — while the run lasts — the exchanges still in
 flight. A new run under the same name replaces the exchanges; `--append` adds
-to them. `--session-dir DIR` puts a session anywhere.
+to them, numbering on from the last run. `--session-dir DIR` puts a session anywhere.
+
+Each session keeps an index beside its exchanges, so a lookup by id or a
+filter on status, method, URL, error or rule reads only what it needs (about
+20 ms for one exchange of a 60,000-exchange, 165 MB session). HAR export and
+`diff` stream through a session instead of holding it. `--max-session-size`
+caps a session — `httpmon proxy` keeps at most 1 GB by default — by rotating
+it into segments and dropping the oldest; `httpmon sessions` marks a session
+that has lost exchanges this way with `*`.
+
+```bash
+httpmon sessions                           # name, state, exchanges, size, last change
+httpmon sessions rm old-run                # a running session is never removed
+httpmon sessions prune --older-than 7d     # ended sessions not changed for a week
+```
 
 Every command that reads traffic takes a session name, a session directory, or
 an exchanges file (`-` for stdin).
@@ -359,7 +383,13 @@ httpmon query api-test --id 10 --format curl    # a curl command that sends it a
 httpmon query api-test --format har > api.har   # HAR 1.2 for browser dev tools, Charles, Postman
 httpmon query proxy --follow                    # keep reading while the session grows
 httpmon query proxy --live                      # and list what is still in flight
+httpmon query proxy --wait --status 5xx         # block until the next 5xx, print it
 ```
+
+`--follow` carries on across a session that starts again or rotates. `--wait`
+prints the first matching exchange that happens after it starts (with
+`--after ID`, also ones already recorded above that id) and exits; `--timeout`
+(default 30s) ends the wait with exit code 4.
 
 Bodies are re-rendered from the raw bytes within `--max-body` (default 4000 for
 query), and credentials are masked unless `--show-secrets`. `--body` writes the
@@ -424,6 +454,10 @@ httpmon --fault 'api.example.com/* => delay 2s 30%' npm test
 httpmon --fault '*/download => reset after 64KB' npm test
 httpmon --fault 'GET */slow => timeout' npm test
 httpmon --map 'api.example.com => localhost:3000' npm test
+httpmon --header '*/api/* => response remove Cache-Control' npm start
+httpmon --header 'api.example.com/* => request set X-Debug: 1' npm test
+httpmon --mock 'GET */me [header Authorization: Bearer expired*] => 401' npm test
+httpmon --fault 'POST */pay [header X-Test-Fail] => reset' npm test
 ```
 
 - A **PATTERN** is a host and path with `*` wildcards: `api.example.com/v1/*`,
@@ -438,12 +472,18 @@ httpmon --map 'api.example.com => localhost:3000' npm test
   share of matching requests.
 - **map** sends a host's requests to another host, port or scheme. The URL
   shown is the one the client used.
+- **header** sets or removes a request header before it is sent, or a
+  response header before the client gets it. Every matching header rule
+  applies, in order.
+- **Conditions**: `[header NAME]` (the request has the header) or
+  `[header NAME: VALUE*]` (a value matches) after the pattern narrows a mock,
+  fault or header rule to the requests that carry it; several must all hold.
 - `--mock-from SESSION` answers each request the session has a response for —
   same method, host, path and query parameter names, served in recorded order —
   and forwards the rest. `httpmon mock SESSION` serves the same as an offline
   server on `--port` (default 8080), matching on path alone.
 
-Exchanges a rule touched are marked `[mock]`, `[fault]`, `[map]` or
+Exchanges a rule touched are marked `[mock]`, `[fault]`, `[map]`, `[header]` or
 `[mock-from]` in summary lines, carry `"rule"` in their record, and are listed
 by `query --rule`. A failure a fault caused has error kind `injected`. Rules can
 also be kept in [settings files](#settings-files), and added to a running
@@ -465,6 +505,19 @@ environment httpmon gives a wrapped command — proxy, CA bundles,
 `JAVA_TOOL_OPTIONS` — for `sh`, `fish` or `powershell` (`--unset` undoes it).
 All the capture options apply: `--mock`, `--fault`, `--filter`, `--fail-on`…
 
+### Interactive UI on a session — `httpmon ui`
+
+```bash
+httpmon proxy --ui                 # a standing proxy with the UI in front
+httpmon ui proxy                   # or open it on a running (or ended) session
+```
+
+The same UI as `--ui`, fed from a session: the most recent exchanges
+(`--last`, default 1000), then new ones as they happen while the session runs,
+with the number in flight on the status bar. Search matches rule tags too
+(`[mock]`, `[fault]`…). `r` sends the selected request again and shows the
+outcome; `--read-only` turns that off.
+
 ### MCP server — `httpmon mcp`
 
 ```json
@@ -472,9 +525,11 @@ All the capture options apply: `--mock`, `--fault`, `--filter`, `--fail-on`…
 ```
 
 Tools: `list_sessions`, `query_exchanges` (status, method, URL, grep filters),
-`get_exchange`, `get_body`, `in_flight`, `diff_sessions`. With
+`get_exchange`, `get_body`, `wait_for_exchange` (blocks until a matching
+exchange happens, up to 60 s), `export_curl`, `in_flight`, `diff_sessions`. With
 `--allow-mutations`, also `add_rule` and `clear_rules`, which change the rules
-of a running session within a second. Results are masked unless
+of a running session within a second, and `replay_exchange`, which sends a
+recorded request again. Results are masked unless
 `--show-secrets`, and content from the network is returned as data inside the
 tool result.
 
@@ -486,6 +541,7 @@ format = "summary"
 fail_on = "5xx,error"
 max_body = 2000
 mock = ['GET api.example.com/v1/flags => 200 {"new_ui":true}']
+header = ["*/api/* => response remove Cache-Control"]
 fault = []
 map = ["api.example.com => localhost:3000"]
 ignore = [".updated_at", ".request_id"]   # httpmon diff
@@ -496,7 +552,8 @@ directory or a parent), which overrides the user's `config.toml`, which
 overrides `HTTPMON_FORMAT` / `HTTPMON_FAIL_ON` / `HTTPMON_CA_DIR`. Rule lists
 add up. Unknown keys are an error. A project file comes with whatever is
 checked out, so it cannot set `upstream_proxy`, `insecure_upstream`, `ca_dir`
-or `show_secrets`, and may only `map` to this machine.
+or `show_secrets`, may only `map` to this machine, and its `header` rules may
+not set `Authorization`, `Cookie` or `Proxy-Authorization`.
 
 ### Exchange records
 
@@ -529,7 +586,7 @@ its JSON Schema):
 - A failed exchange has `"error": {"kind": …, "message": …}` and no `response`.
   Kinds: `dns`, `refused`, `timeout`, `tls_verify`, `tls_handshake`, `reset`,
   `proxy`, `canceled`, `injected`, `other`.
-- `"rule"` names the mock, fault or map rule that touched the exchange.
+- `"rule"` names the mock, fault, map or header rules that touched the exchange.
 - gRPC calls have `"grpc": {"code", "name", "message"}`; WebSocket connections
   `"kind": "websocket"` and `"websocket": {"messages": […]}`.
 
@@ -617,7 +674,8 @@ so 3.x record files can still be queried, diffed and replayed by path.
 - **WebSocket over HTTP/2 (RFC 8441) is not supported**; clients fall back to HTTP/1.1, which works.
 - **Cleartext HTTP/2 cannot be sent through `--upstream-proxy`.**
 - **A JVM that does not see `JAVA_TOOL_OPTIONS`** — for example a Gradle daemon already running before httpmon started — is not configured. Stop it first (`./gradlew --stop`).
-- **Rules match on host and path.** A mock or fault cannot match on headers or bodies, and does not apply to WebSocket connections.
+- **On Windows, a session being read is not rotated.** Windows cannot rename a file another process has open, so while `httpmon ui` or `query --follow` reads a session, it grows past `--max-session-size` and is rotated once the reader lets go.
+- **Rules match on host, path and request headers**, not on bodies, and do not apply to WebSocket connections.
 - **Bodies are capped.** Output shows about `--max-body` bytes; sessions and decoding keep `--max-capture` bytes, buffered per request. The summary and JSON outputs keep only what they use: the summary only an error response's JSON, JSON output nothing of a binary body.
 - **Masking covers headers and URLs, not bodies.**
 

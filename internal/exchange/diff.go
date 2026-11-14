@@ -2,6 +2,8 @@ package exchange
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -77,6 +79,34 @@ type DiffOptions struct {
 	// turns the check off.
 	SlowerFactor float64
 	SlowerMinMs  float64
+	// Load reads back the whole of an exchange made light by Slim, to
+	// compare bodies whose digests differ. With it, a diff of two large
+	// sessions holds only their light forms in memory.
+	Load func(*Exchange) (*Exchange, error)
+}
+
+// Slim reduces an exchange to what pairing and outcomes need, with each body
+// replaced by a digest of its content. Ref should say where to Load it from.
+func Slim(e *Exchange) {
+	slimBody := func(r *body.Rendered) *body.Rendered {
+		if r == nil {
+			return nil
+		}
+		b, whole := content(r)
+		sum := sha256.Sum256(b)
+		d := hex.EncodeToString(sum[:16])
+		if !whole {
+			d += "+"
+		}
+		return &body.Rendered{Size: r.Size, Digest: d}
+	}
+	e.Request = Message{Body: slimBody(e.Request.Body)}
+	if e.Response != nil {
+		e.Response = &Message{Body: slimBody(e.Response.Body)}
+	}
+	if e.WebSocket != nil {
+		e.WebSocket = &WebSocket{Dropped: len(e.WebSocket.Messages) + e.WebSocket.Dropped}
+	}
 }
 
 // DefaultDiffOptions report exchanges that became at least twice as slow and
@@ -195,12 +225,31 @@ func compare(a, b *Exchange, opt DiffOptions) []Change {
 	if Outcome(a) != Outcome(b) {
 		out = append(out, mk(ChangeOutcome, Outcome(a)+" ⇒ "+Outcome(b)))
 	}
-	if d := bodyDiff(requestBody(a), requestBody(b), opt.Ignore); d != "" {
-		out = append(out, mk(ChangeRequest, d))
+	// Light exchanges are loaded in full only when a body may differ.
+	var fullA, fullB *Exchange
+	full := func() (*Exchange, *Exchange) {
+		if fullA == nil && opt.Load != nil {
+			fa, errA := opt.Load(a)
+			fb, errB := opt.Load(b)
+			if errA == nil && errB == nil {
+				fullA, fullB = fa, fb
+			}
+		}
+		if fullA == nil {
+			return a, b
+		}
+		return fullA, fullB
+	}
+	if !sameDigest(requestBody(a), requestBody(b)) {
+		fa, fb := full()
+		if d := bodyDiff(requestBody(fa), requestBody(fb), opt.Ignore); d != "" {
+			out = append(out, mk(ChangeRequest, d))
+		}
 	}
 	// A changed outcome already explains a different response body.
-	if a.Error == nil && b.Error == nil && Outcome(a) == Outcome(b) {
-		if d := bodyDiff(responseBody(a), responseBody(b), opt.Ignore); d != "" {
+	if a.Error == nil && b.Error == nil && Outcome(a) == Outcome(b) && !sameDigest(responseBody(a), responseBody(b)) {
+		fa, fb := full()
+		if d := bodyDiff(responseBody(fa), responseBody(fb), opt.Ignore); d != "" {
 			out = append(out, mk(ChangeResponse, d))
 		}
 	}
@@ -212,6 +261,15 @@ func compare(a, b *Exchange, opt DiffOptions) []Change {
 }
 
 func requestBody(e *Exchange) *body.Rendered { return e.Request.Body }
+
+// sameDigest reports whether two light bodies certainly have the same
+// content: identical whole bodies, or both absent.
+func sameDigest(a, b *body.Rendered) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Digest != "" && a.Digest == b.Digest && !strings.HasSuffix(a.Digest, "+")
+}
 
 func responseBody(e *Exchange) *body.Rendered {
 	if e.Response == nil {

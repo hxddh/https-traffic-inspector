@@ -53,6 +53,10 @@ type Exchange struct {
 	// Hint is a short error description found in a 4xx/5xx body, for the
 	// summary line. It is not part of the record.
 	Hint string `json:"-"`
+
+	// Ref locates the exchange in the session it was read from, for
+	// reading it back in full. It is not part of the record.
+	Ref int `json:"-"`
 }
 
 // Message is one side of an exchange.
@@ -164,9 +168,12 @@ func (e *Exchange) SummaryLine() string {
 		}
 		fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(size))
 	}
+	// One tag per rule: "[header] [mock]".
 	if e.Rule != "" {
-		kind, _, _ := strings.Cut(e.Rule, ":")
-		fmt.Fprintf(&b, " [%s]", kind)
+		for _, part := range strings.Split(e.Rule, "; ") {
+			kind, _, _ := strings.Cut(part, ":")
+			fmt.Fprintf(&b, " [%s]", kind)
+		}
 	}
 	return b.String()
 }

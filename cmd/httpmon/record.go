@@ -15,6 +15,8 @@ import (
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 )
 
 // ---- exchange records ----
@@ -170,11 +172,23 @@ func openRecordFile(path string) error {
 	return nil
 }
 
-// writeRecord appends one completed exchange to the recording.
+// recordWriter is the running session, when there is one.
+var recordWriter *store.Writer
+
+// writeRecord appends one completed exchange to the session.
 func writeRecord(e *exchange.Exchange) {
 	recordMu.Lock()
 	defer recordMu.Unlock()
-	if recordEncoder != nil {
+	switch {
+	case recordWriter != nil:
+		if err := recordWriter.Write(e); err != nil {
+			noticef("session: %v", err)
+		}
+		if recordWriter.Dropped != sessionMeta.Dropped {
+			sessionMeta.Dropped = recordWriter.Dropped
+			session.WriteJSON(sessionPath, session.MetaFile, sessionMeta) //nolint:errcheck
+		}
+	case recordEncoder != nil:
 		recordEncoder.Encode(e) //nolint:errcheck
 	}
 }

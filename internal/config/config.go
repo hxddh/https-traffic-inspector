@@ -36,6 +36,7 @@ type Config struct {
 	Mock             []string `toml:"mock"`
 	Fault            []string `toml:"fault"`
 	Map              []string `toml:"map"`
+	Header           []string `toml:"header"`
 	MockFrom         string   `toml:"mock_from"`
 	Ignore           []string `toml:"ignore"` // httpmon diff
 
@@ -93,6 +94,18 @@ func checkProject(f *Config) error {
 		return errors.New("ca_dir may only be set in the user config")
 	case f.ShowSecrets != nil:
 		return errors.New("show_secrets may only be set in the user config")
+	}
+	for _, h := range f.Header {
+		r, err := rules.Parse(rules.KindHeader, h)
+		if err != nil {
+			return err
+		}
+		switch r.Name {
+		case "Authorization", "Cookie", "Proxy-Authorization":
+			if r.Op == "set" {
+				return fmt.Errorf("header %q: a project file may not set %s", h, r.Name)
+			}
+		}
 	}
 	for _, m := range f.Map {
 		// Validate with the parser that routes, so the host checked is the
@@ -161,6 +174,7 @@ func (c *Config) merge(path string, project bool) error {
 	c.Mock = append(c.Mock, f.Mock...)
 	c.Fault = append(c.Fault, f.Fault...)
 	c.Map = append(c.Map, f.Map...)
+	c.Header = append(c.Header, f.Header...)
 	c.Ignore = append(c.Ignore, f.Ignore...)
 	return nil
 }

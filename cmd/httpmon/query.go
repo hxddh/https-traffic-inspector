@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
@@ -28,6 +30,7 @@ import (
 // reader chooses.
 
 type queryFilter struct {
+	after  int // only ids above this (--wait)
 	id     int
 	status *exchange.FailOn // reuses the --fail-on vocabulary: 5xx, 404, error
 	method string
@@ -39,6 +42,8 @@ type queryFilter struct {
 
 func (q *queryFilter) match(e *exchange.Exchange) bool {
 	switch {
+	case q.after > 0 && e.ID <= q.after:
+		return false
 	case q.id != 0 && e.ID != q.id:
 		return false
 	case q.method != "" && !strings.EqualFold(e.Method, q.method):
@@ -128,6 +133,9 @@ func cmdQuery(args []string) int {
 	maxBody := fs.Int("max-body", 4000, "approximate max bytes of each body shown")
 	follow := fs.Bool("follow", false, "keep reading as exchanges are added to the session")
 	show := fs.Bool("show-secrets", false, "show credentials instead of masking them")
+	wait := fs.Bool("wait", false, "wait for the first new exchange that matches the filters, print it and exit (4 on timeout)")
+	timeout := fs.Duration("timeout", 30*time.Second, "how long --wait waits")
+	afterID := fs.Int("after", -1, "with --wait, also consider exchanges after this id that already happened (default: only new ones)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: httpmon query <session> [filters] [options]
 
@@ -187,8 +195,12 @@ Options:
 		fmt.Fprintf(os.Stderr, "httpmon query: unknown --format %q (want summary, json, text, curl or har)\n", *format)
 		return 1
 	}
-	if *format == "har" && *follow {
-		fmt.Fprintf(os.Stderr, "httpmon query: --format har cannot be used with --follow\n")
+	if *format == "har" && (*follow || *wait) {
+		fmt.Fprintf(os.Stderr, "httpmon query: --format har cannot be used with --follow or --wait\n")
+		return 1
+	}
+	if *wait && (*follow || *bodyFlag != "" || pos[0] == "-") {
+		fmt.Fprintf(os.Stderr, "httpmon query: --wait reads a session, and cannot be used with --follow or --body\n")
 		return 1
 	}
 	if *maxBody <= 0 {
@@ -198,21 +210,6 @@ Options:
 	displayMaxBody = *maxBody
 	showSecrets = *show
 
-	var in io.Reader = os.Stdin
-	path, err := session.Resolve(pos[0])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
-		return 1
-	}
-	if path != "-" {
-		f, err := os.Open(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
-			return 1
-		}
-		defer f.Close()
-		in = f
-	}
 	w, err := out.open(os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
@@ -224,9 +221,12 @@ Options:
 	defer signal.Stop(stop)
 
 	var digest exchange.Digest
-	var har []*exchange.Exchange
+	var harOut *exchange.HARStream
+	if *format == "har" {
+		harOut = exchange.NewHARStream(w, version)
+	}
 	matched, bad := 0, 0
-	err = readRecords(in, *follow, stop, func(e *exchange.Exchange) bool {
+	handle := func(e *exchange.Exchange) bool {
 		if !q.match(e) {
 			return true
 		}
@@ -238,10 +238,10 @@ Options:
 		switch *format {
 		case "curl":
 			emitText(curlForExchange(e) + "\n\n")
-			return true
+			return !*wait
 		case "har":
 			maskForExport(e)
-			har = append(har, e)
+			harOut.Add(e)
 			return true
 		}
 		prepareForDisplay(e)
@@ -254,8 +254,54 @@ Options:
 		case "text":
 			emitText(renderExchangeText(e))
 		}
-		return true
-	})
+		// --wait ends at the first match.
+		return !*wait
+	}
+
+	if pos[0] == "-" {
+		err = readRecords(os.Stdin, *follow, stop, handle)
+	} else {
+		var st *store.Store
+		var want func(int) bool
+		if q.id != 0 && !*follow && !*wait {
+			id := q.id
+			want = func(n int) bool { return n == id }
+		}
+		st, err = openStoreOnly(pos[0], want)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
+			return 1
+		}
+		defer st.Close()
+		switch {
+		case *wait:
+			after := *afterID
+			if after < 0 {
+				after = st.MaxID()
+			}
+			q.after = after
+			var timedOut bool
+			timedOut, err = waitFor(st, &q, *timeout, stop, handle)
+			if err == nil && timedOut {
+				fmt.Fprintf(os.Stderr, "httpmon query: no matching exchange within %s\n", *timeout)
+				return exitWaitTimeout
+			}
+			if err == nil && matched == 0 {
+				return 1 // interrupted
+			}
+		default:
+			err = eachMatching(st, &q, *format == "summary" && q.grep == nil && !showSecrets && *bodyFlag == "",
+				func(line string, light *exchange.Exchange) {
+					matched++
+					digest.Add(light)
+					emitText(textsafe.Line(line) + "\n")
+				}, handle)
+			if err == nil && *follow {
+				path, end := st.Tail()
+				_, err = followFrom(st.Dir, path, end, stop, nil, handle)
+			}
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
 		return 1
@@ -271,7 +317,7 @@ Options:
 		return 0
 	}
 	if *format == "har" {
-		if err := exchange.WriteHAR(w, version, har); err != nil {
+		if err := harOut.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
 			return 1
 		}
@@ -280,7 +326,7 @@ Options:
 	if *live {
 		writeLive(pos[0], *format == "json")
 	}
-	if *format == "summary" && !*follow && matched != 1 {
+	if *format == "summary" && !*follow && !*wait && matched != 1 {
 		emitText(textsafe.Line(digest.String()) + "\n")
 	}
 	if matched == 0 && q.id != 0 {
@@ -557,4 +603,184 @@ func writeRenderedBody(b *strings.Builder, title string, r *body.Rendered) {
 		s += truncationMarker
 	}
 	fmt.Fprintf(b, "\n%s:\n%s\n", title, quoteBody(s))
+}
+
+// exitWaitTimeout is query --wait's exit code when nothing matched in time.
+const exitWaitTimeout = 4
+
+// openStore opens what a user named: a session name or directory, or an
+// exchanges file. An index it has to rebuild is saved unless the session is
+// running, since then its own process writes the index.
+func openStore(arg string) (*store.Store, error) { return openStoreOnly(arg, nil) }
+
+// openStoreOnly is openStore keeping only the entries want accepts.
+func openStoreOnly(arg string, want func(int) bool) (*store.Store, error) {
+	path, err := session.Resolve(arg)
+	if err != nil {
+		return nil, err
+	}
+	persist := false
+	if filepath.Base(path) == session.ExchangesFile {
+		var m session.Meta
+		persist = session.ReadJSON(filepath.Dir(path), session.MetaFile, &m) != nil || !m.Running()
+	}
+	return store.OpenOnly(path, persist, want)
+}
+
+// eachMatching visits a store's exchanges that pass q, filtering on the
+// index first. With summaryOnly, exchanges that pass are given to line as
+// their indexed summary and never read; otherwise each is read and given to
+// full, until it returns false.
+func eachMatching(st *store.Store, q *queryFilter, summaryOnly bool, line func(string, *exchange.Exchange), full func(*exchange.Exchange) bool) error {
+	indexed := *q
+	indexed.grep = nil // needs the record
+	for _, en := range st.Entries {
+		light := en.Light()
+		if !indexed.match(light) {
+			continue
+		}
+		if summaryOnly {
+			line(en.Summary, light)
+			continue
+		}
+		e, err := st.Read(en)
+		if err != nil {
+			return err
+		}
+		if !full(e) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// waitFor gives fn the exchanges that pass q -- those already recorded
+// after q.after, then new ones as they are added -- until fn returns false.
+// It reports whether the timeout passed first.
+func waitFor(st *store.Store, q *queryFilter, timeout time.Duration, stop <-chan os.Signal, fn func(*exchange.Exchange) bool) (bool, error) {
+	done := false
+	if err := eachMatching(st, q, false, nil, func(e *exchange.Exchange) bool {
+		if q.match(e) && !fn(e) {
+			done = true
+			return false
+		}
+		return true
+	}); err != nil || done {
+		return false, err
+	}
+	path, end := st.Tail()
+	if path == "" {
+		return true, nil
+	}
+	return followFrom(st.Dir, path, end, stop, time.After(timeout), fn)
+}
+
+// followFrom reads exchanges appended to path from offset on, until fn
+// returns false, stop fires or deadline passes (reported as true). A
+// session's current segment is replaced when the session is rotated or
+// started again; either way it moves on to the new file, and says so when
+// the session started again.
+func followFrom(dir, path string, offset int64, stop <-chan os.Signal, deadline <-chan time.Time, fn func(*exchange.Exchange) bool) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer func() { f.Close() }() //nolint:errcheck
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return false, err
+	}
+	br := bufio.NewReaderSize(f, 64*1024)
+	var pending []byte
+	pos := offset
+	for {
+		chunk, err := br.ReadBytes('\n')
+		pending = append(pending, chunk...)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return false, err
+		}
+		if errors.Is(err, io.EOF) {
+			// At the end: has the file been replaced or cut short?
+			if dir != "" && len(pending) == 0 {
+				cur, serr := os.Stat(path)
+				old, ferr := f.Stat()
+				if serr == nil && ferr == nil && (!os.SameFile(cur, old) || cur.Size() < pos) {
+					if os.SameFile(cur, old) || !store.IsSegmentOf(dir, old) {
+						fmt.Fprintln(os.Stderr, "── session started again")
+					} else {
+						// Rotated, perhaps more than once since the last
+						// look: read the segments written in between.
+						for _, seg := range store.SegmentsAfter(dir, old) {
+							if done, err := readWhole(seg, fn); err != nil || done {
+								return false, err
+							}
+						}
+					}
+					nf, err := os.Open(path)
+					if err != nil {
+						return false, err
+					}
+					f.Close() //nolint:errcheck
+					f, pos = nf, 0
+					br.Reset(f)
+					continue
+				}
+			}
+			select {
+			case <-stop:
+				return false, nil
+			case <-deadline:
+				return true, nil
+			case <-time.After(200 * time.Millisecond):
+			}
+			continue // keep a partial line until its newline arrives
+		}
+		pos += int64(len(pending))
+		line := bytes.TrimSpace(pending)
+		pending = nil
+		if len(line) == 0 {
+			continue
+		}
+		var e exchange.Exchange
+		if json.Unmarshal(line, &e) != nil || e.V != exchange.Version {
+			continue
+		}
+		if !fn(&e) {
+			return false, nil
+		}
+	}
+}
+
+// sessionFiles lists what to read for a session, oldest segment first: all
+// its segments, or the one file named.
+func sessionFiles(arg string) ([]string, error) {
+	path, err := session.Resolve(arg)
+	if err != nil || filepath.Base(path) != session.ExchangesFile {
+		return []string{path}, err
+	}
+	return store.Segments(filepath.Dir(path))
+}
+
+// readWhole gives fn each exchange in a file, reporting whether fn stopped.
+func readWhole(path string, fn func(*exchange.Exchange) bool) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, nil // removed meanwhile: nothing to read
+	}
+	defer f.Close()
+	rd := exchange.NewReader(f)
+	for {
+		e, err := rd.Next()
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			if strings.HasPrefix(err.Error(), "line ") {
+				continue // one bad line
+			}
+			return false, err
+		}
+		if !fn(e) {
+			return true, nil
+		}
+	}
 }

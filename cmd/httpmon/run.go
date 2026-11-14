@@ -23,6 +23,8 @@ import (
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
 // listFlag collects a repeatable flag.
@@ -53,7 +55,9 @@ type captureOptions struct {
 	mock          listFlag
 	fault         listFlag
 	mapRules      listFlag
+	headerRules   listFlag
 	mockFrom      string
+	maxSession    string
 	cfg           config.Config
 }
 
@@ -74,6 +78,11 @@ func (o *captureOptions) register(fs *flag.FlagSet, cfg config.Config, proxyMode
 	fs.StringVar(&o.session, "session", defSession, "save exchanges to this named session (read them with: httpmon query NAME)")
 	fs.StringVar(&o.sessionDir, "session-dir", "", "save exchanges to a session in this directory")
 	fs.BoolVar(&o.appendSession, "append", false, "add to the session's earlier exchanges instead of replacing them")
+	defMax := "0"
+	if proxyMode {
+		defMax = "1GB"
+	}
+	fs.StringVar(&o.maxSession, "max-session-size", defMax, "keep the session under this size (e.g. 500MB, 2GB), dropping its oldest exchanges; 0 keeps everything")
 	fs.BoolVar(&o.insecure, "insecure-upstream", config.Bool(cfg.InsecureUpstream, false), "skip TLS certificate verification for upstream servers")
 	fs.StringVar(&o.upstream, "upstream-proxy", cfg.UpstreamProxy, "proxy for httpmon's own upstream requests (default: HTTP(S)_PROXY from the environment)")
 	fs.IntVar(&o.maxBody, "max-body", config.Int(cfg.MaxBody, 1000), "approximate max bytes of each body shown in output")
@@ -83,6 +92,7 @@ func (o *captureOptions) register(fs *flag.FlagSet, cfg config.Config, proxyMode
 	fs.StringVar(&o.caDir, "ca-dir", config.String(cfg.CADir, os.Getenv("HTTPMON_CA_DIR")), "use the persistent CA in this directory (httpmon proxy uses the default one)")
 	fs.Var(&o.mock, "mock", "answer matching requests: '[METHOD] PATTERN => STATUS [BODY|@FILE]' (repeatable)")
 	fs.Var(&o.fault, "fault", "inject a fault: '[METHOD] PATTERN => delay 2s|reset|reset after 1KB|timeout [N%]' (repeatable)")
+	fs.Var(&o.headerRules, "header", "set or remove a header: '[METHOD] PATTERN => request|response set NAME: VALUE|remove NAME' (repeatable)")
 	fs.Var(&o.mapRules, "map", "send a host's requests elsewhere: 'HOST[:PORT] => [SCHEME://]HOST[:PORT]' (repeatable)")
 	fs.StringVar(&o.mockFrom, "mock-from", cfg.MockFrom, "answer requests from a recorded session where it has a matching response")
 }
@@ -141,17 +151,18 @@ func (o *captureOptions) apply(name string) error {
 	}
 	rs, err := rules.NewSet(append(append([]string(nil), o.cfg.Mock...), o.mock...),
 		append(append([]string(nil), o.cfg.Fault...), o.fault...),
-		append(append([]string(nil), o.cfg.Map...), o.mapRules...))
+		append(append([]string(nil), o.cfg.Map...), o.mapRules...),
+		append(append([]string(nil), o.cfg.Header...), o.headerRules...)...)
 	if err != nil {
 		return err
 	}
 	activeRules = rs
 	if o.mockFrom != "" {
-		p, err := session.Resolve(o.mockFrom)
+		files, err := sessionFiles(o.mockFrom)
 		if err != nil {
 			return fmt.Errorf("--mock-from: %w", err)
 		}
-		if recordedMocks, err = rules.LoadRecorded(p, false); err != nil {
+		if recordedMocks, err = rules.LoadRecordedFiles(files, false); err != nil {
 			return fmt.Errorf("--mock-from: %w", err)
 		}
 	}
@@ -187,13 +198,27 @@ func (o *captureOptions) openSession(name string) error {
 	if session.ReadJSON(dir, session.MetaFile, &m) == nil && m.Running() && m.PID != os.Getpid() {
 		return fmt.Errorf("session %s is in use by process %d; choose another with --session", dir, m.PID)
 	}
+	// Everything that can reject the run is checked before Create discards
+	// the previous run's exchanges.
+	maxSize, err := parseByteSize(o.maxSession)
+	if err != nil {
+		return fmt.Errorf("--max-session-size: %w", err)
+	}
 	if err := session.Create(dir, o.appendSession); err != nil {
 		return fmt.Errorf("session %s: %w", dir, err)
 	}
-	if err := openRecordFile(filepath.Join(dir, session.ExchangesFile)); err != nil {
+	w, err := store.OpenWriter(dir, maxSize)
+	if err != nil {
 		return fmt.Errorf("session %s: %w", dir, err)
 	}
-	addCleanup(func() { recordFile.Close() }) //nolint:errcheck
+	// Records are written straight to the file, unbuffered: closing it is
+	// tidiness, done when the session finishes.
+	recordWriter = w
+	// Ids continue from an earlier run of the session (--append), so each
+	// names one exchange.
+	counterMu.Lock()
+	requestCounter = w.NextID() - 1
+	counterMu.Unlock()
 	recordMode = true
 	sessionPath = dir
 	if name == "" {
@@ -347,11 +372,11 @@ func reloadSessionRules() {
 		noticef("session rules: %v", err)
 		return
 	}
-	if err := activeRules.Replace(r.Mock, r.Fault, r.Map); err != nil {
+	if err := activeRules.Replace(r.Mock, r.Fault, r.Map, r.Header...); err != nil {
 		noticef("session rules: %v", err)
 		return
 	}
-	noticef("session rules reloaded: %d mock, %d fault, %d map", len(r.Mock), len(r.Fault), len(r.Map))
+	noticef("session rules reloaded: %d mock, %d fault, %d map, %d header", len(r.Mock), len(r.Fault), len(r.Map), len(r.Header))
 }
 
 var finishOnce sync.Once
@@ -362,6 +387,7 @@ func finishSession() {
 		return
 	}
 	finishOnce.Do(func() {
+		closeRecordWriter()
 		close(sessionStop)
 		sessionMeta.Ended = time.Now()
 		session.WriteJSON(sessionPath, session.MetaFile, sessionMeta)                       //nolint:errcheck
@@ -474,6 +500,7 @@ func cmdProxy(args []string) int {
 	fs := flag.NewFlagSet("httpmon proxy", flag.ContinueOnError)
 	var o captureOptions
 	o.register(fs, cfg, true)
+	uiFlag := fs.Bool("ui", false, "show the traffic in the interactive UI (as httpmon ui does)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: httpmon proxy [options]
 
@@ -498,6 +525,11 @@ Options:
 	if o.caDir == "" {
 		o.caDir = defaultCADir()
 	}
+	if *uiFlag && !isTerminal(os.Stdout) {
+		fmt.Fprintln(os.Stderr, "httpmon proxy: --ui needs a terminal")
+		return 1
+	}
+	tuiMode = *uiFlag
 	if err := o.apply(o.session); err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon proxy: %v\n", err)
 		return 1
@@ -529,6 +561,14 @@ Press Ctrl-C to stop.
 `, version, rt.ln.Addr(), sessionMeta.Name, rt.proxyURL, certPath, envHint, sessionMeta.Name)
 	currentSink().start(runInfo{Version: version, Proxy: rt.ln.Addr().String(), CA: rt.caBundle, Session: sessionPath})
 
+	if tuiMode {
+		tuiTitle = fmt.Sprintf("httpmon  proxy %s  session %s", rt.proxyURL, textsafe.Line(sessionMeta.Name))
+		runTUI()
+		drainInflight(exitDrainTimeout)
+		printTUINotices(os.Stderr)
+		finishRun(0)
+		return 0
+	}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
@@ -629,8 +669,28 @@ func exportLine(shell, k, v string, unset bool) string {
 // ---- sessions ----
 
 func cmdSessions(args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "rm":
+			return cmdSessionsRm(args[1:])
+		case "prune":
+			return cmdSessionsPrune(args[1:])
+		}
+	}
 	fs := flag.NewFlagSet("httpmon sessions", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "print JSON")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage: httpmon sessions [--json]
+       httpmon sessions rm NAME...
+       httpmon sessions prune --older-than 7d [--dry-run]
+
+Lists the sessions in httpmon's home, most recent first, or removes them.
+A running session is never removed.
+
+Options:
+`)
+		fs.PrintDefaults()
+	}
 	if _, err := parseInterspersed(fs, args); err != nil {
 		return flagErr(err)
 	}
@@ -657,9 +717,88 @@ func cmdSessions(args []string) int {
 		if len(s.Meta.Command) > 0 {
 			what = clipText(strings.Join(s.Meta.Command, " "), 60)
 		}
-		fmt.Printf("%-20s %-8s %8s  %s  %s\n", s.Name, state, humanBytes(s.Exchanges), s.Modified.Format("2006-01-02 15:04"), what)
+		if s.Truncated {
+			state += "*"
+		}
+		fmt.Printf("%-20s %-8s %7d %8s  %s  %s\n", s.Name, state, s.Count, humanBytes(s.Bytes), s.Modified.Format("2006-01-02 15:04"), what)
 	}
 	return 0
+}
+
+func cmdSessionsRm(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: httpmon sessions rm NAME...")
+		return 1
+	}
+	code := 0
+	for _, name := range args {
+		if err := session.Remove(name); err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon sessions rm: %v\n", err)
+			code = 1
+			continue
+		}
+		fmt.Printf("removed %s\n", name)
+	}
+	return code
+}
+
+func cmdSessionsPrune(args []string) int {
+	fs := flag.NewFlagSet("httpmon sessions prune", flag.ContinueOnError)
+	older := fs.String("older-than", "", "remove ended sessions not changed for this long: 12h, 7d, 4w (required)")
+	dry := fs.Bool("dry-run", false, "only list what would be removed")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return flagErr(err)
+	}
+	age, err := parseAge(*older)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon sessions prune: --older-than: %v\n", err)
+		return 1
+	}
+	list, err := session.List()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon sessions prune: %v\n", err)
+		return 1
+	}
+	cut := time.Now().Add(-age)
+	n := 0
+	for _, s := range list {
+		if s.Running || s.Modified.After(cut) {
+			continue
+		}
+		if !*dry {
+			if err := session.Remove(s.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "httpmon sessions prune: %v\n", err)
+				continue
+			}
+		}
+		fmt.Printf("removed %s (%s, last changed %s)\n", s.Name, humanBytes(s.Bytes), s.Modified.Format("2006-01-02 15:04"))
+		n++
+	}
+	if n == 0 {
+		fmt.Println("nothing to remove")
+	}
+	return 0
+}
+
+// parseAge parses a Go duration, or a number of days ("7d") or weeks ("4w").
+func parseAge(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, errors.New("required, e.g. 7d")
+	}
+	for suf, unit := range map[string]time.Duration{"d": 24 * time.Hour, "w": 7 * 24 * time.Hour} {
+		if n, ok := strings.CutSuffix(s, suf); ok {
+			v, err := strconv.Atoi(n)
+			if err != nil || v <= 0 {
+				return 0, fmt.Errorf("bad age %q", s)
+			}
+			return time.Duration(v) * unit, nil
+		}
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("bad age %q (e.g. 12h, 7d, 4w)", s)
+	}
+	return d, nil
 }
 
 func humanBytes(n int64) string {
@@ -677,4 +816,34 @@ func clipText(s string, n int) string {
 		return string(r[:n]) + "…"
 	}
 	return s
+}
+
+// parseByteSize parses "0", "1048576", "512KB", "500MB" or "2GB".
+func parseByteSize(s string) (int64, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	mult := int64(1)
+	for _, u := range []struct {
+		suf string
+		m   int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(t, u.suf) {
+			mult, t = u.m, strings.TrimSuffix(t, u.suf)
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("bad size %q (e.g. 0, 500MB, 2GB)", s)
+	}
+	return n * mult, nil
+}
+
+// closeRecordWriter closes the session's files; later exchanges are dropped.
+func closeRecordWriter() {
+	recordMu.Lock()
+	defer recordMu.Unlock()
+	if recordWriter != nil {
+		recordWriter.Close() //nolint:errcheck
+		recordWriter = nil
+	}
 }

@@ -1,15 +1,24 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 )
 
 // TestPerfBudget guards the cost of going through httpmon: the latency it
@@ -86,5 +95,68 @@ func TestPerfBudget(t *testing.T) {
 	t.Logf("throughput: %.0f requests/s at %d clients (budget %.0f)", rate, clients, minRate)
 	if rate < minRate {
 		t.Errorf("throughput %.0f requests/s; budget %.0f", rate, minRate)
+	}
+}
+
+// TestPerfBudget_Session guards reading a large session: one exchange by id
+// through the index, and HAR export streamed rather than held in memory.
+func TestPerfBudget_Session(t *testing.T) {
+	if os.Getenv("HTTPMON_PERF") != "1" {
+		t.Skip("set HTTPMON_PERF=1 to run the performance budget")
+	}
+	const n = 20000
+	dir := t.TempDir()
+	w, err := store.OpenWriter(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pad := strings.Repeat("x", 2000)
+	for i := 1; i <= n; i++ {
+		w.Write(&exchange.Exchange{V: exchange.Version, ID: i, Method: "GET", Kind: "http", //nolint:errcheck
+			URL: fmt.Sprintf("https://api.example.com/item/%d", i), Status: 200,
+			Response: &exchange.Message{Headers: exchange.Headers{}, Body: &body.Rendered{Size: 2000, Raw: body.NewRaw([]byte(pad), false)}}})
+	}
+	w.Close() //nolint:errcheck
+
+	start := time.Now()
+	out, code := runQuery(t, dir, "--id", strconv.Itoa(n-1), "--format", "json")
+	took := time.Since(start)
+	t.Logf("query --id on %d exchanges: %v", n, took)
+	if code != 0 || !strings.Contains(out, fmt.Sprintf("/item/%d", n-1)) {
+		t.Fatalf("query --id failed (exit %d)", code)
+	}
+	if took > 300*time.Millisecond {
+		t.Errorf("query --id took %v; budget 300ms", took)
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	done := make(chan struct{})
+	var peak uint64
+	go func() {
+		var m runtime.MemStats
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(20 * time.Millisecond):
+				runtime.ReadMemStats(&m)
+				peak = max(peak, m.HeapInuse)
+			}
+		}
+	}()
+	if _, code := runQuery(t, dir, "--format", "har"); code != 0 {
+		t.Fatalf("HAR export failed")
+	}
+	close(done)
+	// Holding the session, as 4.0 did, peaked at about 8 times its size;
+	// streaming stays well under half that (the figure includes garbage
+	// not yet collected).
+	fi, _ := os.Stat(filepath.Join(dir, store.Current))
+	grew := int64(peak) - int64(before.HeapInuse)
+	t.Logf("HAR export of %d exchanges (%d MB session): heap grew %d MB", n, fi.Size()>>20, grew>>20)
+	if grew > 4*fi.Size() {
+		t.Errorf("HAR export grew the heap by %d MB; budget 4× the session, %d MB", grew>>20, 4*fi.Size()>>20)
 	}
 }

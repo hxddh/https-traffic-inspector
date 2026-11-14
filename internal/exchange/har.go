@@ -3,6 +3,7 @@ package exchange
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/url"
 	"sort"
@@ -113,17 +114,11 @@ type HARLog struct {
 
 // WriteHAR writes the exchanges as a HAR file.
 func WriteHAR(w io.Writer, version string, list []*Exchange) error {
-	var h HARLog
-	h.Log.Version = "1.2"
-	h.Log.Creator = map[string]string{"name": "httpmon", "version": version}
-	h.Log.Entries = make([]HAREntry, 0, len(list))
+	h := NewHARStream(w, version)
 	for _, e := range list {
-		h.Log.Entries = append(h.Log.Entries, ToHAR(e))
+		h.Add(e)
 	}
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	enc.SetEscapeHTML(false)
-	return enc.Encode(h)
+	return h.Close()
 }
 
 // ToHAR converts one exchange. Bodies come from the raw bytes a session
@@ -337,4 +332,53 @@ func wsOpcode(typ string) int {
 		return 10
 	}
 	return 0
+}
+
+// HARStream writes a HAR file one entry at a time, so a large session is
+// never held in memory.
+type HARStream struct {
+	w   io.Writer
+	n   int
+	err error
+}
+
+// NewHARStream writes the HAR preamble.
+func NewHARStream(w io.Writer, version string) *HARStream {
+	creator, _ := json.Marshal(map[string]string{"name": "httpmon", "version": version})
+	s := &HARStream{w: w}
+	_, s.err = fmt.Fprintf(w, "{\n  \"log\": {\n    \"version\": \"1.2\",\n    \"creator\": %s,\n    \"entries\": [", creator)
+	return s
+}
+
+// Add writes one exchange.
+func (s *HARStream) Add(e *Exchange) {
+	if s.err != nil {
+		return
+	}
+	b, err := json.MarshalIndent(ToHAR(e), "      ", "  ")
+	if err != nil {
+		s.err = err
+		return
+	}
+	sep := ",\n      "
+	if s.n == 0 {
+		sep = "\n      "
+	}
+	if _, s.err = io.WriteString(s.w, sep); s.err == nil {
+		_, s.err = s.w.Write(b)
+	}
+	s.n++
+}
+
+// Close writes the closing brackets and reports any write error.
+func (s *HARStream) Close() error {
+	if s.err != nil {
+		return s.err
+	}
+	end := "\n    ]\n  }\n}\n"
+	if s.n == 0 {
+		end = "]\n  }\n}\n"
+	}
+	_, s.err = io.WriteString(s.w, end)
+	return s.err
 }

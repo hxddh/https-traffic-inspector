@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 )
 
 // File names inside a session directory.
@@ -124,10 +125,11 @@ func Create(dir string, keep bool) error {
 		return err
 	}
 	if !keep {
-		for _, f := range []string{ExchangesFile, LiveFile} {
-			if err := os.Remove(filepath.Join(dir, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
+		if err := store.RemoveAll(dir); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(dir, LiveFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
 	}
 	return nil
@@ -144,7 +146,10 @@ type Meta struct {
 	PID      int       `json:"pid"`
 	Started  time.Time `json:"started"`
 	Ended    time.Time `json:"ended,omitzero"`
-	Version  string    `json:"httpmon_version"`
+	// Dropped counts the oldest segments removed to keep the session under
+	// its size limit: its earliest exchanges are gone.
+	Dropped int    `json:"dropped_segments,omitempty"`
+	Version string `json:"httpmon_version"`
 }
 
 // Running reports whether the session's process is still running.
@@ -193,18 +198,26 @@ type Live struct {
 // Rules are mock, fault and map rules added to a running session -- by
 // "httpmon mcp" or by hand -- which the session's process reloads.
 type Rules struct {
-	Mock  []string `json:"mock,omitempty"`
-	Fault []string `json:"fault,omitempty"`
-	Map   []string `json:"map,omitempty"`
+	Mock   []string `json:"mock,omitempty"`
+	Fault  []string `json:"fault,omitempty"`
+	Map    []string `json:"map,omitempty"`
+	Header []string `json:"header,omitempty"`
 }
 
 // Info summarises a session for listing.
 type Info struct {
-	Name      string    `json:"name"`
-	Meta      Meta      `json:"meta"`
-	Running   bool      `json:"running"`
-	Exchanges int64     `json:"bytes"`
-	Modified  time.Time `json:"modified"`
+	Name     string    `json:"name"`
+	Dir      string    `json:"dir"`
+	Meta     Meta      `json:"meta"`
+	Running  bool      `json:"running"`
+	Bytes    int64     `json:"bytes"`
+	Count    int       `json:"exchanges"`
+	First    string    `json:"first,omitempty"`
+	Last     string    `json:"last,omitempty"`
+	Modified time.Time `json:"modified"`
+	// Truncated means the oldest exchanges were dropped to keep the
+	// session under its size limit.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // List returns the sessions under Home, most recently modified first.
@@ -226,15 +239,36 @@ func List() ([]Info, error) {
 			continue
 		}
 		dir := filepath.Join(h, "sessions", e.Name())
-		info := Info{Name: e.Name()}
+		info := Info{Name: e.Name(), Dir: dir}
 		_ = ReadJSON(dir, MetaFile, &info.Meta) // a session without meta is still listed
 		info.Running = info.Meta.Running()
+		info.Truncated = info.Meta.Dropped > 0
 		if fi, err := os.Stat(filepath.Join(dir, ExchangesFile)); err == nil {
-			info.Exchanges = fi.Size()
 			info.Modified = fi.ModTime()
+		} else if fi, err := os.Stat(dir); err == nil {
+			info.Modified = fi.ModTime()
+		}
+		if st, err := store.StatDir(dir); err == nil {
+			info.Bytes, info.Count, info.First, info.Last = st.Bytes, st.Count, st.First, st.Last
 		}
 		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
 	return out, nil
+}
+
+// Remove deletes a session that is not running.
+func Remove(name string) error {
+	dir, err := Dir(name)
+	if err != nil {
+		return err
+	}
+	var m Meta
+	if ReadJSON(dir, MetaFile, &m) == nil && m.Running() {
+		return fmt.Errorf("session %q is running (process %d); stop it first", name, m.PID)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return fmt.Errorf("no session %q", name)
+	}
+	return os.RemoveAll(dir)
 }

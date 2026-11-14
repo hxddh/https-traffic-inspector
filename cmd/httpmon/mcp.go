@@ -10,10 +10,12 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
@@ -22,8 +24,8 @@ import (
 // A Model Context Protocol server over stdio: an agent's client starts
 // "httpmon mcp" and gets tools to list sessions, query their exchanges, read
 // one in full, see what is in flight and compare two runs. With
-// --allow-mutations it can also add mock and fault rules to a running
-// session. Credentials are masked unless --show-secrets.
+// --allow-mutations it can also add rules to a running session and replay
+// recorded requests. Credentials are masked unless --show-secrets.
 
 const mcpProtocolVersion = "2025-06-18"
 
@@ -56,16 +58,17 @@ type mcpTool struct {
 
 func cmdMCP(args []string) int {
 	fs := flag.NewFlagSet("httpmon mcp", flag.ContinueOnError)
-	allowMut := fs.Bool("allow-mutations", false, "offer tools that change a running session: add_rule, clear_rules")
+	allowMut := fs.Bool("allow-mutations", false, "offer tools that change something: add_rule, clear_rules (a running session's rules), replay_exchange (sends traffic)")
 	show := fs.Bool("show-secrets", false, "show credentials instead of masking them")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: httpmon mcp [--allow-mutations] [--show-secrets]
 
 Runs a Model Context Protocol server on stdin and stdout, for an agent's
 MCP client. Its tools read httpmon sessions -- list_sessions,
-query_exchanges, get_exchange, get_body, in_flight, diff_sessions -- and,
-with --allow-mutations, add_rule and clear_rules change the rules of a
-running session.
+query_exchanges, get_exchange, get_body, wait_for_exchange, export_curl,
+in_flight, diff_sessions -- and, with --allow-mutations, add_rule and
+clear_rules change the rules of a running session and replay_exchange
+sends a recorded request again.
 
 Example client configuration:
   {"mcpServers": {"httpmon": {"command": "httpmon", "args": ["mcp"]}}}
@@ -246,6 +249,30 @@ func mcpTools(allowMutations bool) []mcpTool {
 			call:        mcpInFlight,
 		},
 		{
+			Name: "wait_for_exchange",
+			Description: "Wait until an exchange matching the filters happens in a session, and return it in full. By default only exchanges " +
+				"after the call count; after_id also accepts earlier ones above that id. Use it after triggering an action (a click, a test) " +
+				"instead of polling query_exchanges.",
+			InputSchema: schema(map[string]any{
+				"session":     sessionProp,
+				"status":      strProp("statuses: classes (5xx), codes (404), error, comma-separated"),
+				"method":      strProp("HTTP method"),
+				"url":         strProp("text the URL contains (case-insensitive)"),
+				"grep":        strProp("regular expression searched in URL, headers and decoded bodies"),
+				"after_id":    intProp("also accept exchanges already recorded with an id above this"),
+				"timeout_sec": intProp("how long to wait, at most 60 (default 30)"),
+			}, "session"),
+			Annotations: ro,
+			call:        mcpWait,
+		},
+		{
+			Name:        "export_curl",
+			Description: "A curl command that sends an exchange's request again. Credentials are masked unless the server runs with --show-secrets.",
+			InputSchema: schema(map[string]any{"session": sessionProp, "id": intProp("exchange id")}, "session", "id"),
+			Annotations: ro,
+			call:        mcpCurl,
+		},
+		{
 			Name:        "diff_sessions",
 			Description: "Compare two sessions exchange by exchange: changed outcomes, bodies, new and gone requests.",
 			InputSchema: schema(map[string]any{
@@ -261,15 +288,28 @@ func mcpTools(allowMutations bool) []mcpTool {
 			mcpTool{
 				Name: "add_rule",
 				Description: "Add a rule to a running session. mock: '[METHOD] PATTERN => STATUS [BODY]'; " +
-					"fault: '[METHOD] PATTERN => delay 2s | reset | reset after 1KB | timeout [N%]'; map: 'HOST[:PORT] => [SCHEME://]HOST[:PORT]'. " +
-					"PATTERN is host/path with * wildcards.",
+					"fault: '[METHOD] PATTERN => delay 2s | reset | reset after 1KB | timeout [N%]'; map: 'HOST[:PORT] => [SCHEME://]HOST[:PORT]'; " +
+					"header: '[METHOD] PATTERN => request|response set NAME: VALUE | remove NAME'. " +
+					"PATTERN is host/path with * wildcards; mock, fault and header rules may add conditions: [header NAME] or [header NAME: VALUE*].",
 				InputSchema: schema(map[string]any{
 					"session": sessionProp,
-					"kind":    map[string]any{"type": "string", "enum": []string{"mock", "fault", "map"}},
+					"kind":    map[string]any{"type": "string", "enum": []string{"mock", "fault", "map", "header"}},
 					"rule":    strProp("the rule"),
 				}, "session", "kind", "rule"),
 				Annotations: map[string]any{"readOnlyHint": false, "destructiveHint": false},
 				call:        mcpAddRule,
+			},
+			mcpTool{
+				Name: "replay_exchange",
+				Description: "Send a recorded request again, byte for byte, and compare the new response with the recorded one. " +
+					"target replaces the scheme and host (e.g. http://localhost:3000). This sends real traffic.",
+				InputSchema: schema(map[string]any{
+					"session": sessionProp,
+					"id":      intProp("exchange id"),
+					"target":  strProp("scheme and host to send it to instead"),
+				}, "session", "id"),
+				Annotations: map[string]any{"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true},
+				call:        mcpReplay,
 			},
 			mcpTool{
 				Name:        "clear_rules",
@@ -301,16 +341,17 @@ func mcpListSessions(map[string]any) (string, error) {
 		if len(s.Meta.Command) > 0 {
 			what = clipText(strings.Join(s.Meta.Command, " "), 60)
 		}
-		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%s\n", s.Name, state, humanBytes(s.Exchanges), s.Modified.Format("2006-01-02 15:04"), textsafe.Line(what))
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%s\n", s.Name, state, humanBytes(s.Bytes), s.Modified.Format("2006-01-02 15:04"), textsafe.Line(what))
 	}
 	return b.String(), nil
 }
 
 func mcpQuery(a map[string]any) (string, error) {
-	list, err := readExchanges(argString(a, "session"))
+	st, err := openStore(argString(a, "session"))
 	if err != nil {
 		return "", err
 	}
+	defer st.Close()
 	var q queryFilter
 	q.method, q.url = argString(a, "method"), argString(a, "url")
 	if s := argString(a, "status"); s != "" {
@@ -330,13 +371,19 @@ func mcpQuery(a map[string]any) (string, error) {
 	limit := argInt(a, "limit", 200)
 	var lines []string
 	var d exchange.Digest
-	for _, e := range list {
-		if !q.match(e) {
-			continue
-		}
-		e.URL = displayURL(e.URL)
+	add := func(line string, e *exchange.Exchange) {
 		d.Add(e)
-		lines = append(lines, textsafe.Line(e.SummaryLine()))
+		lines = append(lines, textsafe.Line(line))
+	}
+	err = eachMatching(st, &q, q.grep == nil && !showSecrets, add, func(e *exchange.Exchange) bool {
+		if q.match(e) {
+			prepareForDisplay(e)
+			add(e.SummaryLine(), e)
+		}
+		return true
+	})
+	if err != nil {
+		return "", err
 	}
 	skipped := 0
 	if limit > 0 && len(lines) > limit {
@@ -354,18 +401,21 @@ func mcpQuery(a map[string]any) (string, error) {
 	return b.String(), nil
 }
 
+// findExchange reads one exchange through the session's index.
 func findExchange(a map[string]any) (*exchange.Exchange, error) {
 	id := argInt(a, "id", 0)
-	list, err := readExchanges(argString(a, "session"))
+	st, err := openStoreOnly(argString(a, "session"), func(n int) bool { return n == id })
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range list {
-		if e.ID == id {
-			return e, nil
-		}
+	defer st.Close()
+	found := st.Find(id)
+	if len(found) == 0 {
+		return nil, fmt.Errorf("no exchange #%d", id)
 	}
-	return nil, fmt.Errorf("no exchange #%d", id)
+	// An older session written with --append can repeat an id: the most
+	// recent run's exchange is the one meant.
+	return readWithHint(st, found[len(found)-1])
 }
 
 func mcpGetExchange(a map[string]any) (string, error) {
@@ -373,10 +423,11 @@ func mcpGetExchange(a map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	displayMaxBody = argInt(a, "max_body", 4000)
-	if displayMaxBody <= 0 {
+	maxBody := argInt(a, "max_body", 4000)
+	if maxBody <= 0 {
 		return "", errors.New("max_body must be greater than 0")
 	}
+	displayMaxBody = maxBody
 	prepareForDisplay(e)
 	s := renderExchangeText(e)
 	if e.Rule != "" {
@@ -430,15 +481,14 @@ func mcpInFlight(a map[string]any) (string, error) {
 }
 
 func mcpDiff(a map[string]any) (string, error) {
-	before, err := readExchanges(argString(a, "before"))
+	before, after, load, closeAll, err := readForDiff(argString(a, "before"), argString(a, "after"))
 	if err != nil {
 		return "", err
 	}
-	after, err := readExchanges(argString(a, "after"))
-	if err != nil {
-		return "", err
-	}
-	changes, counts := exchange.Diff(before, after, exchange.DefaultDiffOptions)
+	defer closeAll()
+	opt := exchange.DefaultDiffOptions
+	opt.Load = load
+	changes, counts := exchange.Diff(before, after, opt)
 	var b strings.Builder
 	for _, c := range changes {
 		c.URL = displayURL(c.URL)
@@ -478,6 +528,8 @@ func mcpAddRule(a map[string]any) (string, error) {
 		r.Fault = append(r.Fault, text)
 	case rules.KindMap:
 		r.Map = append(r.Map, text)
+	case rules.KindHeader:
+		r.Header = append(r.Header, text)
 	}
 	if err := session.WriteJSON(dir, session.RulesFile, r); err != nil {
 		return "", err
@@ -494,4 +546,76 @@ func mcpClearRules(a map[string]any) (string, error) {
 		return "", err
 	}
 	return "cleared the rules added at run time; rules given on the command line stay", nil
+}
+
+func mcpWait(a map[string]any) (string, error) {
+	st, err := openStore(argString(a, "session"))
+	if err != nil {
+		return "", err
+	}
+	defer st.Close()
+	var q queryFilter
+	q.method, q.url = argString(a, "method"), argString(a, "url")
+	if s := argString(a, "status"); s != "" {
+		f, err := exchange.ParseFailOn(s)
+		if err != nil {
+			return "", err
+		}
+		q.status = f
+	}
+	if g := argString(a, "grep"); g != "" {
+		re, err := regexp.Compile(g)
+		if err != nil {
+			return "", err
+		}
+		q.grep = re
+	}
+	q.after = argInt(a, "after_id", -1)
+	if q.after < 0 {
+		q.after = st.MaxID()
+	}
+	timeout := time.Duration(min(max(argInt(a, "timeout_sec", 30), 1), 60)) * time.Second
+	var found *exchange.Exchange
+	timedOut, err := waitFor(st, &q, timeout, nil, func(e *exchange.Exchange) bool {
+		if !q.match(e) {
+			return true
+		}
+		found = e
+		return false
+	})
+	if err != nil {
+		return "", err
+	}
+	if timedOut || found == nil {
+		return "", fmt.Errorf("no matching exchange within %s (latest id was %d)", timeout, q.after)
+	}
+	if found.Status >= 400 && found.Response != nil {
+		found.Hint = store.HintOf(found.Response)
+	}
+	prepareForDisplay(found)
+	return textsafe.Line(found.SummaryLine()) + "\n" + renderExchangeText(found), nil
+}
+
+func mcpCurl(a map[string]any) (string, error) {
+	e, err := findExchange(a)
+	if err != nil {
+		return "", err
+	}
+	return textsafe.Terminal(curlForExchange(e)), nil
+}
+
+func mcpReplay(a map[string]any) (string, error) {
+	e, err := findExchange(a)
+	if err != nil {
+		return "", err
+	}
+	// replayExchange also writes a report; it must not reach stdout, which
+	// carries the protocol.
+	saved := swapTextOut(io.Discard)
+	savedJSON := jsonMode
+	jsonMode = false
+	defer func() { swapTextOut(saved); jsonMode = savedJSON }()
+	res := replayExchange(newUpstreamClient(insecureUpstream), e, argString(a, "target"))
+	b, _ := json.MarshalIndent(res, "", "  ")
+	return textsafe.Terminal(string(b)), nil
 }

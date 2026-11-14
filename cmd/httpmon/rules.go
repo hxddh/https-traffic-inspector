@@ -18,7 +18,6 @@ import (
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
@@ -30,6 +29,9 @@ func setRuleLabel(id int, label string) {
 		label = prev.(string) + "; " + label
 	}
 	ruleLabels.Store(id, label)
+	if tuiMode {
+		tuiSend(tuiRuleMsg{reqID: id, rule: label})
+	}
 }
 
 func ruleLabel(id int) string {
@@ -48,6 +50,8 @@ type ruleOutcome struct {
 	done  bool  // the request has been answered (or failed); stop
 	mapTo *url2 // send the request here instead
 	reset int64 // reset the connection after this many response body bytes (>0)
+	// headers are the header rules to apply, request and response.
+	headers []*rules.Rule
 }
 
 // url2 is a scheme and host to send a mapped request to.
@@ -61,13 +65,17 @@ func applyRules(w http.ResponseWriter, req *http.Request, host string, reqID int
 	if activeRules.Empty() && recordedMocks == nil {
 		return out
 	}
-	d := activeRules.Decide(req.Method, host, req.URL.Path)
+	d := activeRules.Decide(req.Method, host, req.URL.Path, req.Header)
 	label := func(s string) {
 		if facts != nil {
 			setRuleLabel(reqID, s)
 		}
 	}
 
+	for _, h := range d.Headers {
+		label(h.Label())
+	}
+	out.headers = d.Headers
 	if f := d.Fault; f != nil {
 		label(f.Label())
 		switch f.Action {
@@ -204,12 +212,12 @@ Options:
 		fs.Usage()
 		return 1
 	}
-	path, err := session.Resolve(pos[0])
+	files, err := sessionFiles(pos[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon mock: %v\n", err)
 		return 1
 	}
-	rec, err := rules.LoadRecorded(path, !*matchHost)
+	rec, err := rules.LoadRecordedFiles(files, !*matchHost)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon mock: %v\n", err)
 		return 1
@@ -265,4 +273,13 @@ func mockHandler(rec *rules.Recorded) http.Handler {
 		w.WriteHeader(status)
 		w.Write(b) //nolint:errcheck,gosec // G705: replays a recorded response, as asked
 	})
+}
+
+// applyHeaderRules makes the header rules' changes in one direction.
+func applyHeaderRules(rs []*rules.Rule, dir string, h http.Header) {
+	for _, r := range rs {
+		if r.Dir == dir {
+			r.Apply(h)
+		}
+	}
 }

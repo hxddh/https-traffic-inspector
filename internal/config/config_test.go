@@ -66,6 +66,8 @@ func TestLoad_ProjectCannotRedirectTraffic(t *testing.T) {
 		`ca_dir = "/tmp/x"`,
 		`map = ["api.stripe.com => evil.example.com"]`,
 		`map = ["api.stripe.com => https://10.0.0.5:443"]`,
+		`header = ["*/* => request set Authorization: Bearer x"]`,
+		`header = ["*/* => request set Cookie: a=b"]`,
 		// userinfo: url.Parse routes to attacker.example, not localhost
 		`map = ["api.example.com => http://localhost:80@attacker.example"]`,
 		`map = ["api.example.com => localhost:80@attacker.example"]`,
@@ -75,7 +77,7 @@ func TestLoad_ProjectCannotRedirectTraffic(t *testing.T) {
 			t.Errorf("project file accepted %s", bad)
 		}
 	}
-	for _, ok := range []string{`map = ["api.example.com => localhost:3000"]`, `map = ["a => http://127.0.0.1:8080"]`, `map = ["a => [::1]:80"]`} {
+	for _, ok := range []string{`header = ["*/* => response remove Cache-Control"]`, `header = ["*/* => request remove Authorization"]`, `map = ["api.example.com => localhost:3000"]`, `map = ["a => http://127.0.0.1:8080"]`, `map = ["a => [::1]:80"]`} {
 		setup(t, "", ok)
 		if _, err := Load(); err != nil {
 			t.Errorf("project file rejected %s: %v", ok, err)
