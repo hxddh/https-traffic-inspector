@@ -4,6 +4,43 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-11-14
+
+Fixes found reviewing the published 3.0.0 — it could not be installed with
+`go install`, and its new default output used several times the memory of the
+old one — and adds `httpmon diff`.
+
+### Fixed
+
+- **`go install` could not install 3.0.0.** Its module path was still
+  `…/v2`, so `go install …/v2@latest` — the command the README gave —
+  silently installed 2.0.0, and `…/v3@latest` found no package. The module
+  path is now `github.com/hxddh/https-traffic-inspector/v3`; install with
+  `go install github.com/hxddh/https-traffic-inspector/v3@latest`. A binary
+  built this way now reports its version instead of `dev`.
+- **The summary output kept a copy of every body.** The summary and JSON
+  formats buffered up to `--max-capture` of each body although the summary
+  shows none. Measured with 100 parallel 5 MB downloads: 115 MB peak in 3.0.0,
+  20 MB now (text output: 20 MB). A body is now kept only as far as an output
+  uses it: the summary keeps an error response's JSON, JSON output keeps JSON
+  and gRPC bodies and a prefix of text, and nothing of a binary body.
+- **A long query string made a long summary line** — a pre-signed URL produced
+  1148 characters. Query strings past 60 characters are cut at a parameter
+  boundary (`?X-Amz-Algorithm=AWS4-HMAC-SHA256&…(+994 chars)`); the full URL
+  is in the record.
+
+### Added
+
+- **`httpmon diff <before> <after>`** compares two records: exchanges that are
+  new or gone, changed outcomes (`500 db_timeout ⇒ 200`), request and response
+  bodies that differ — JSON by the first differing path, with a count of the
+  others — and exchanges that became much slower. `--ignore` skips volatile
+  JSON fields; exit status 0 means no difference, 1 differences.
+- **Unfinished exchanges are named.** An exchange still waiting when the run
+  ends gets its own line (`#2 GET api/x → … no response after 3.5s`), and in
+  JSON an `incomplete` event; the digest used to give only a count.
+  `--fail-on incomplete` turns them into exit code 3.
+
 ## [3.0.0] - 2026-11-14
 
 3.0 makes httpmon usable by AI coding agents as well as people: compact

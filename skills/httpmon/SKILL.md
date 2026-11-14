@@ -1,6 +1,6 @@
 ---
 name: httpmon
-description: Inspect the HTTP(S) traffic of any command with httpmon — see which requests a program, test suite or CLI makes, find failing calls (4xx/5xx, DNS, TLS, refused), read request and response bodies, and verify a fix by exit code. Use when debugging API calls, flaky integration tests, auth or certificate errors, or "what is this tool actually sending?".
+description: Inspect the HTTP(S) traffic of any command with httpmon — see which requests a program, test suite or CLI makes, find failing or hanging calls (4xx/5xx, DNS, TLS, refused, no response), read request and response bodies, verify a fix by exit code, and diff the requests before and after a code change. Use when debugging API calls, flaky integration tests, auth or certificate errors, or "what is this tool actually sending?".
 ---
 
 # httpmon
@@ -37,6 +37,21 @@ httpmon query /tmp/trace.ndjson --id 10 --body response    # decoded body, untru
 The record keeps raw bytes and can be large; `query` controls how much you read.
 For a long-running process, start it with `--record` in the background and use
 `httpmon query <file> --follow` (or re-run `query`) as traffic arrives.
+
+## Did my change work? — compare runs
+
+```bash
+httpmon --record /tmp/before.ndjson <command>    # before the change
+httpmon --record /tmp/after.ndjson <command>     # after it
+httpmon diff /tmp/before.ndjson /tmp/after.ndjson --ignore .updated_at
+```
+
+`diff` lists new (+) and gone (-) exchanges, changed outcomes
+(`500 db_timeout ⇒ 200`), request/response bodies that differ by JSON path, and
+much slower exchanges. Exit 0 = no difference, 1 = differences.
+
+Requests still waiting when the command exits are listed
+(`#2 GET … → … no response after 3.5s`); add `incomplete` to `--fail-on` to fail on them.
 
 ## Structured output
 

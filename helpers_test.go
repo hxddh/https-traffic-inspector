@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // useMemoryHAR routes HAR entries to memory for the duration of a test.

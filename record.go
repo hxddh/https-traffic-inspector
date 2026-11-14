@@ -10,12 +10,11 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // ---- exchange records ----
@@ -181,10 +180,6 @@ func writeRecord(e *exchange.Exchange) {
 
 // ---- run statistics ----
 
-// started counts the exchanges that were logged, so the digest can report
-// the ones that never finished.
-var started atomic.Int64
-
 // stats feeds the end-of-run digest and --fail-on.
 type stats struct {
 	mu     sync.Mutex
@@ -203,13 +198,18 @@ func (s *stats) add(e *exchange.Exchange) {
 	}
 }
 
-// final returns the digest for the end of the run.
-func (s *stats) final() *exchange.Digest {
+// final returns the digest for the end of the run, given the exchanges
+// still unfinished.
+func (s *stats) final(pending []exchange.Pending) *exchange.Digest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d := s.digest
-	if n := int(started.Load()) - d.Total; n > 0 {
-		d.Incomplete = n
+	d.Matched = append([]int(nil), d.Matched...)
+	d.Incomplete = len(pending)
+	if s.failOn.MatchIncomplete() {
+		for _, p := range pending {
+			d.Matched = append(d.Matched, p.ID)
+		}
 	}
 	if d.ByClass == nil {
 		d.ByClass = map[string]int{}

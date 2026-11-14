@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
 )
 
 // showSecrets turns off masking in terminal and JSON output (--show-secrets).

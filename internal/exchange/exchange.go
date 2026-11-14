@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
 )
 
 // Version is the schema version written in every record.
@@ -135,7 +135,7 @@ func FormatTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05
 // caller for the medium it is written to.
 func (e *Exchange) SummaryLine() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "#%d %s %s → ", e.ID, e.Method, stripScheme(e.URL))
+	fmt.Fprintf(&b, "#%d %s %s → ", e.ID, e.Method, ShortURL(e.URL))
 	dur := formatMs(e.DurationMs)
 	switch {
 	case e.Error != nil:
@@ -161,6 +161,40 @@ func (e *Exchange) SummaryLine() string {
 		fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(size))
 	}
 	return b.String()
+}
+
+// maxSummaryQuery bounds the query string shown in a summary line. A
+// pre-signed URL's query alone can run past a kilobyte; the whole URL is
+// still in the record and in "query --id".
+const maxSummaryQuery = 60
+
+// ShortURL is u without its scheme and with a long query string cut short:
+// "api.example.com/f?X-Amz-Algorithm=…(+1084 chars)".
+func ShortURL(u string) string {
+	u = stripScheme(u)
+	path, query, ok := strings.Cut(u, "?")
+	if !ok || len([]rune(query)) <= maxSummaryQuery {
+		return u
+	}
+	// Keep whole parameters while they fit, so a cut never lands inside a
+	// value -- or inside the marker of a masked one.
+	params := strings.Split(query, "&")
+	kept, n := 0, 0
+	for kept < len(params) && n+len([]rune(params[kept]))+1 <= maxSummaryQuery {
+		n += len([]rune(params[kept])) + 1
+		kept++
+	}
+	if kept == 0 {
+		// Even the first parameter is too long: keep its name if that fits,
+		// else just the start of the query.
+		q := []rune(query)
+		if name, _, hasValue := strings.Cut(params[0], "="); hasValue && len([]rune(name)) < maxSummaryQuery {
+			return fmt.Sprintf("%s?%s=…(+%d chars)", path, name, len(q)-len([]rune(name))-1)
+		}
+		return fmt.Sprintf("%s?%s…(+%d chars)", path, string(q[:maxSummaryQuery]), len(q)-maxSummaryQuery)
+	}
+	shown := strings.Join(params[:kept], "&")
+	return fmt.Sprintf("%s?%s&…(+%d chars)", path, shown, len([]rune(query))-len([]rune(shown))-1)
 }
 
 func stripScheme(u string) string {
@@ -195,6 +229,26 @@ func clip(s string, max int) string {
 		return string(r[:max]) + "…"
 	}
 	return s
+}
+
+// Pending is an exchange that had not finished when the run ended: the
+// server never answered, or the command exited first.
+type Pending struct {
+	ID        int     `json:"id"`
+	Method    string  `json:"method"`
+	URL       string  `json:"url"`
+	WaitingMs float64 `json:"waiting_ms"`
+	// Status is set when the response had started -- its headers arrived --
+	// but its body had not ended: a stream, or a stalled download.
+	Status int `json:"status,omitempty"`
+}
+
+// SummaryLine renders p like a completed exchange's line.
+func (p Pending) SummaryLine() string {
+	if p.Status != 0 {
+		return fmt.Sprintf("#%d %s %s → %d … body still open after %s", p.ID, p.Method, ShortURL(p.URL), p.Status, formatMs(p.WaitingMs))
+	}
+	return fmt.Sprintf("#%d %s %s → … no response after %s", p.ID, p.Method, ShortURL(p.URL), formatMs(p.WaitingMs))
 }
 
 // ---- digest ----

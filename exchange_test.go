@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // Regression: a record was written only when the response finished after the

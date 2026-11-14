@@ -8,7 +8,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
 )
 
 // bodySampler wraps a body so its content can be logged without holding up
@@ -96,8 +96,20 @@ func (s *bodySampler) fire(reachedEOF bool) {
 // the body completes — immediately when there is no body at all, so callers can
 // rely on it firing exactly once.
 func sampleBody(bodyp *io.ReadCloser, h http.Header, length int64, onDone func(bodyView)) {
-	limit := captureLimitFor(h)
+	sampleBodyFor(bodyp, h, length, captureLimitFor(h, 0, false), onDone)
+}
 
+// sampleRequestBody and sampleResponseBody keep only as much of a body as
+// the active outputs need.
+func sampleRequestBody(bodyp *io.ReadCloser, h http.Header, length int64, onDone func(bodyView)) {
+	sampleBodyFor(bodyp, h, length, captureLimitFor(h, 0, true), onDone)
+}
+
+func sampleResponseBody(bodyp *io.ReadCloser, h http.Header, length int64, status int, onDone func(bodyView)) {
+	sampleBodyFor(bodyp, h, length, captureLimitFor(h, status, false), onDone)
+}
+
+func sampleBodyFor(bodyp *io.ReadCloser, h http.Header, length int64, limit int, onDone func(bodyView)) {
 	// http.NoBody must stay as it is. Wrapped, it no longer reads as empty to
 	// the transport, which then forwards a Content-Length: 0 POST or PUT as
 	// Transfer-Encoding: chunked -- a request S3 and others reject.
@@ -112,12 +124,43 @@ func sampleBody(bodyp *io.ReadCloser, h http.Header, length int64, onDone func(b
 	})
 }
 
-// captureLimitFor reports how many bytes of a body to retain. Recording, HAR
-// export and decompression all need more than the display limit.
-func captureLimitFor(h http.Header) int {
-	// The summary and JSON outputs render from the whole body: a JSON body is
-	// parsed and cut by structure, and an error body is searched for a code.
-	if recordMode || harMode || jsonMode || summaryMode || len(body.SplitEncodings(h.Get("Content-Encoding"))) > 0 {
+// captureLimitFor reports how many bytes of a body to keep, which depends on
+// what the active outputs will do with it. Keeping a full capture of every
+// body made the summary -- the default off a terminal -- use nearly seven
+// times the memory of the text output for parallel downloads, although it
+// shows no body at all.
+//
+//   - --record and --har store the bytes: up to --max-capture.
+//   - Text and the TUI show a prefix: --max-body, or --max-capture for a
+//     compressed body, which must be decoded from its start.
+//   - The summary only reads an error response's JSON for its code.
+//   - JSON parses JSON and gRPC bodies, shows a prefix of text, and gives
+//     only the size of anything else.
+func captureLimitFor(h http.Header, status int, isRequest bool) int {
+	if recordMode || harMode {
+		return captureMaxBody
+	}
+	ct := h.Get("Content-Type")
+	encoded := len(body.SplitEncodings(h.Get("Content-Encoding"))) > 0
+	switch {
+	case summaryMode && !tuiMode:
+		if !isRequest && status >= 400 && (ct == "" || body.LooksLikeJSONType(ct)) {
+			return captureMaxBody
+		}
+		return 0
+	case jsonMode && !tuiMode:
+		switch {
+		case ct == "" || body.LooksLikeJSONType(ct) || body.IsGRPC(ct):
+			return captureMaxBody
+		case body.PrintableType(ct):
+			if encoded {
+				return captureMaxBody
+			}
+			return displayMaxBody
+		}
+		return 0
+	}
+	if encoded {
 		return captureMaxBody
 	}
 	return displayMaxBody

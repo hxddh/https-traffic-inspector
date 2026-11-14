@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
 )
 
 func TestSummaryLine(t *testing.T) {

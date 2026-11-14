@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // subcommands are reserved first arguments. Anything else is a command to
@@ -30,6 +30,8 @@ func subcommand(name string) func([]string) int {
 		return cmdReplay
 	case "query":
 		return cmdQuery
+	case "diff":
+		return cmdDiff
 	case "ca":
 		return cmdCA
 	case "schema":
@@ -345,7 +347,11 @@ const exitFailOn = 3
 // command's own failure first, then a HAR that could not be written, then
 // --fail-on.
 func finishRun(exitCode int) int {
-	d := runStats.final()
+	pending := unfinishedExchanges()
+	for _, p := range pending {
+		currentSink().incomplete(p)
+	}
+	d := runStats.final(pending)
 	currentSink().end(d)
 	exitCode = finishHAR(exitCode)
 	if exitCode == 0 && len(d.Matched) > 0 {
@@ -482,6 +488,7 @@ func usage(fs *flag.FlagSet) {
 	fmt.Fprint(os.Stderr, `Usage:
   httpmon [options] <command> [args...]   run a command and show its HTTP(S) traffic
   httpmon query  <record> [filters]       list or expand exchanges from a --record file
+  httpmon diff   <before> <after>         compare two records: what changed between runs
   httpmon replay <record> [options]       re-send recorded requests and compare responses
   httpmon ca     --dir <dir>              create or show a persistent CA
   httpmon schema                          print the JSON Schema of an exchange record
@@ -498,6 +505,7 @@ Examples:
   httpmon curl https://api.github.com
   httpmon --fail-on 5xx,error --record trace.ndjson npm test
   httpmon query trace.ndjson --status 5xx
+  httpmon diff before.ndjson after.ndjson --ignore .updated_at
   httpmon --format json -o trace.ndjson curl https://api.github.com
   httpmon --ui curl https://api.github.com
   httpmon replay trace.ndjson --target https://staging.example.com

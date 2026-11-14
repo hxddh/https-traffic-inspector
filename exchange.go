@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // capturedRequest and capturedResponse are the two halves of an exchange as
@@ -113,6 +113,7 @@ func (j *exchangeJoiner) pending() int {
 // completeExchange hands a finished exchange to the active output, the
 // digest and --fail-on, and to each capture that wants it.
 func completeExchange(id int, r capturedRequest, rs capturedResponse) {
+	untrack(id)
 	e := buildExchange(id, r, rs, false)
 	runStats.add(e)
 	currentSink().exchange(e)
@@ -127,6 +128,7 @@ func completeExchange(id int, r capturedRequest, rs capturedResponse) {
 // discardReqID cleans up per-request state when a request was logged but will
 // never be reported as completed or failed.
 func discardReqID(reqID int) {
+	untrack(reqID)
 	reqStartMu.Lock()
 	delete(reqStartTimes, reqID)
 	reqStartMu.Unlock()

@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
 )
 
 // ---- forwarding ----

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +39,23 @@ var (
 // -ldflags "-X main.version=<tag>".
 var version = "dev"
 
+// buildVersion returns the version a binary was built as: the release tag
+// injected by the release workflow, or else the module version Go records
+// for "go install …@v3.1.0", which runs no link-time injection.
+func buildVersion(injected string, info *debug.BuildInfo, ok bool) string {
+	if injected != "dev" || !ok || info == nil {
+		return injected
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	return injected
+}
+
 func init() {
+	info, ok := debug.ReadBuildInfo()
+	version = buildVersion(version, info, ok)
+
 	var err error
 	caCert, caKey, err = generateCA()
 	if err != nil {

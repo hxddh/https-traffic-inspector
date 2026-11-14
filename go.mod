@@ -1,4 +1,4 @@
-module github.com/hxddh/https-traffic-inspector/v2
+module github.com/hxddh/https-traffic-inspector/v3
 
 go 1.26.0
 
