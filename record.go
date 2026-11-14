@@ -1,39 +1,142 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
+	"math"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
-// recordedExchange is one request/response pair serialised to NDJSON.
-// The file contains one JSON object per line; "type" distinguishes them.
-type recordedExchange struct {
-	ID          int               `json:"id"`
-	Time        string            `json:"time"`
-	Method      string            `json:"method"`
-	URL         string            `json:"url"`
-	ReqHeaders  map[string]string `json:"req_headers"`
-	ReqBody     string            `json:"req_body,omitempty"`
-	Status      int               `json:"status"`
-	StatusText  string            `json:"status_text"`
-	RespHeaders map[string]string `json:"resp_headers"`
-	RespBody    string            `json:"resp_body,omitempty"`
-	// RespTrailers holds trailers sent after the body, where gRPC puts its status.
-	RespTrailers map[string]string `json:"resp_trailers,omitempty"`
-	DurationMs   int64             `json:"duration_ms"`
+// ---- record format v2 ----
+//
+// One JSON object per line, each a complete exchange. Unlike v1, which stored
+// the human-readable view of each body (and so a placeholder for anything
+// binary), v2 stores what crossed the wire:
+//
+//   - headers as an ordered list of [name, value] pairs, so repeated headers
+//     such as Set-Cookie survive;
+//   - bodies as their raw bytes -- UTF-8 text verbatim, anything else base64 --
+//     with the decoded text alongside when the body was compressed;
+//   - a session id and sequence number, unique across appended runs;
+//   - failed exchanges, with the error, and WebSocket messages.
 
-	// Set when the stored body is only a prefix: it exceeded --max-capture,
-	// or the stream was cut off before it ended.
-	ReqBodyTruncated  bool `json:"req_body_truncated,omitempty"`
-	RespBodyTruncated bool `json:"resp_body_truncated,omitempty"`
+const recordVersion = 2
+
+type recordV2 struct {
+	V       int    `json:"v"`
+	Session string `json:"session"`
+	Seq     int    `json:"seq"`
+	Time    string `json:"time"`
+	Kind    string `json:"kind"` // "http" or "websocket"
+
+	Method     string     `json:"method"`
+	URL        string     `json:"url"`
+	Proto      string     `json:"proto,omitempty"`
+	ReqHeaders headerList `json:"req_headers"`
+	ReqBody    *recBody   `json:"req_body,omitempty"`
+
+	Status       int        `json:"status,omitempty"`
+	StatusText   string     `json:"status_text,omitempty"`
+	RespProto    string     `json:"resp_proto,omitempty"`
+	RespHeaders  headerList `json:"resp_headers,omitempty"`
+	RespBody     *recBody   `json:"resp_body,omitempty"`
+	RespTrailers headerList `json:"resp_trailers,omitempty"`
+
+	DurationMs float64 `json:"duration_ms"`
+	// Error is set, and the response fields are empty, when no response came.
+	Error string `json:"error,omitempty"`
+
+	WSMessages []recWSMessage `json:"ws_messages,omitempty"`
+	WSDropped  int            `json:"ws_dropped,omitempty"`
+
+	// Redacted marks a recording made with --redact: credentials in headers
+	// and the URL are masked, so requests that carried them cannot be replayed.
+	Redacted bool `json:"redacted,omitempty"`
+}
+
+// headerList is an ordered list of [name, value] pairs.
+type headerList [][2]string
+
+// recBody is a body as it crossed the wire.
+type recBody struct {
+	Encoding  string `json:"encoding"` // "utf8" or "base64"
+	Data      string `json:"data"`
+	Size      int64  `json:"size"` // bytes on the wire; more than Data holds when truncated
+	Truncated bool   `json:"truncated,omitempty"`
+	// Decoded is the text with its Content-Encoding removed, when the body
+	// was compressed and decodes to text.
+	Decoded string `json:"decoded,omitempty"`
+}
+
+type recWSMessage struct {
+	From        string `json:"from"` // "client" or "server"
+	Time        string `json:"time"`
+	Type        string `json:"type"`
+	Size        int64  `json:"size"`
+	Encoding    string `json:"encoding,omitempty"`
+	Data        string `json:"data,omitempty"`
+	Truncated   bool   `json:"truncated,omitempty"`
+	CloseCode   int    `json:"close_code,omitempty"`
+	CloseReason string `json:"close_reason,omitempty"`
+}
+
+// toHeaderList orders h by name, keeping each name's values in order.
+func toHeaderList(h http.Header) headerList {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(headerList, 0, len(h))
+	for _, k := range sortedKeys(h) {
+		for _, v := range h[k] {
+			out = append(out, [2]string{k, v})
+		}
+	}
+	return out
+}
+
+func (l headerList) header() http.Header {
+	h := make(http.Header, len(l))
+	for _, kv := range l {
+		h.Add(kv[0], kv[1])
+	}
+	return h
+}
+
+// encodeBytes stores b as UTF-8 text when it is, and base64 otherwise.
+func encodeBytes(b []byte) (encoding, data string) {
+	if utf8.Valid(b) {
+		return "utf8", string(b)
+	}
+	return "base64", base64.StdEncoding.EncodeToString(b)
+}
+
+func decodeBytes(encoding, data string) ([]byte, error) {
+	if encoding == "base64" {
+		return base64.StdEncoding.DecodeString(data)
+	}
+	return []byte(data), nil
+}
+
+func newRecBody(h http.Header, v bodyView) *recBody {
+	if v.Size == 0 && len(v.Raw) == 0 {
+		return nil
+	}
+	b := &recBody{Size: v.Size, Truncated: v.RawTruncated}
+	b.Encoding, b.Data = encodeBytes(v.Raw)
+	if len(splitEncodings(h.Get("Content-Encoding"))) > 0 {
+		if dec, err := decompressBody(h.Get("Content-Encoding"), v.Raw); err == nil &&
+			utf8.Valid(dec.Data) && isPrintableContentType(h.Get("Content-Type")) {
+			b.Decoded = string(dec.Data)
+		}
+	}
+	return b
 }
 
 // recordFile is the open file used by the proxy when --record is active.
@@ -44,7 +147,17 @@ var (
 	// json.Encoder is not safe for concurrent use, so unguarded writes could
 	// interleave two records on one line.
 	recordMu sync.Mutex
+
+	// recordSession identifies this run's records in a file appended to by
+	// several runs.
+	recordSession = newSessionID()
 )
+
+func newSessionID() string {
+	var b [4]byte
+	rand.Read(b[:]) //nolint:errcheck // never fails
+	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
+}
 
 // openRecordFile opens (or creates) the NDJSON recording file.
 func openRecordFile(path string) error {
@@ -59,33 +172,56 @@ func openRecordFile(path string) error {
 	return nil
 }
 
-// nonEmptyFlat flattens h, or returns nil for an empty header so the JSON
-// field is omitted.
-func nonEmptyFlat(h http.Header) map[string]string {
-	if len(h) == 0 {
-		return nil
+func millis(d time.Duration) float64 {
+	return math.Round(float64(d)/float64(time.Microsecond)) / 1000
+}
+
+// buildRecord turns a completed exchange into a v2 record.
+func buildRecord(id int, r capturedRequest, rs capturedResponse) recordV2 {
+	e := recordV2{
+		V:          recordVersion,
+		Session:    recordSession,
+		Seq:        id,
+		Time:       r.facts.startTime.UTC().Format("2006-01-02T15:04:05.000Z07:00"),
+		Kind:       "http",
+		Method:     r.facts.method,
+		URL:        captureURL(r.facts.rawURL),
+		Proto:      r.facts.proto,
+		ReqHeaders: toHeaderList(captureHeaders(r.facts.headers)),
+		ReqBody:    newRecBody(r.facts.headers, r.body),
+		DurationMs: millis(rs.facts.totalDuration()),
+		Redacted:   redactCaptures,
 	}
-	return flattenHeaders(h)
+	if rs.err != "" {
+		e.Error = rs.err
+		return e
+	}
+	e.Status = rs.facts.status
+	e.StatusText = rs.facts.statusText
+	e.RespProto = rs.facts.proto
+	e.RespHeaders = toHeaderList(captureHeaders(rs.facts.headers))
+	e.RespBody = newRecBody(rs.facts.headers, rs.body)
+	e.RespTrailers = toHeaderList(captureHeaders(rs.facts.trailers))
+	if rs.facts.upgraded {
+		e.Kind = "websocket"
+		for _, m := range rs.ws {
+			rm := recWSMessage{
+				From: m.sender(), Time: m.at.UTC().Format("2006-01-02T15:04:05.000Z07:00"),
+				Type: m.typeName(), Size: m.size, Truncated: m.truncated,
+				CloseCode: m.closeCode, CloseReason: m.closeReason,
+			}
+			if m.opcode != wsClose && len(m.data) > 0 {
+				rm.Encoding, rm.Data = encodeBytes(m.data)
+			}
+			e.WSMessages = append(e.WSMessages, rm)
+		}
+	}
+	return e
 }
 
 // writeRecord appends one completed exchange to the recording.
 func writeRecord(id int, r capturedRequest, rs capturedResponse) {
-	e := recordedExchange{
-		ID:                id,
-		Time:              r.facts.startTime.Format(time.RFC3339),
-		Method:            r.facts.method,
-		URL:               r.facts.rawURL,
-		ReqHeaders:        flattenHeaders(r.facts.headers),
-		ReqBody:           r.body.Text,
-		ReqBodyTruncated:  r.body.Truncated,
-		Status:            rs.facts.status,
-		StatusText:        rs.facts.statusText,
-		RespHeaders:       flattenHeaders(rs.facts.headers),
-		RespBody:          rs.body.Text,
-		RespBodyTruncated: rs.body.Truncated,
-		RespTrailers:      nonEmptyFlat(rs.facts.trailers),
-		DurationMs:        rs.facts.duration.Milliseconds(),
-	}
+	e := buildRecord(id, r, rs)
 	recordMu.Lock()
 	defer recordMu.Unlock()
 	if recordEncoder != nil {
@@ -93,230 +229,17 @@ func writeRecord(id int, r capturedRequest, rs capturedResponse) {
 	}
 }
 
-// ── Replay ───────────────────────────────────────────────────────────────────
-
-// replayResult is the outcome of replaying a single recorded exchange.
-type replayResult struct {
-	ID             int    `json:"id"`
-	Method         string `json:"method"`
-	URL            string `json:"url"`
-	RecordedStatus int    `json:"recorded_status"`
-	ActualStatus   int    `json:"actual_status"`
-	StatusMatch    bool   `json:"status_match"`
-	BodyMatch      bool   `json:"body_match"`
-	DurationMs     int64  `json:"duration_ms"`
-	Err            string `json:"error,omitempty"`
-	// Skipped explains why the exchange was not re-sent.
-	Skipped string `json:"skipped,omitempty"`
+// isSensitiveHeaderList reports whether any header in l carries credentials.
+func (l headerList) hasSensitive() bool {
+	for _, kv := range l {
+		if isSensitiveHeader(kv[0]) {
+			return true
+		}
+	}
+	return false
 }
 
-// Differs reports whether the replayed response deviated from the recording.
-func (r replayResult) Differs() bool {
-	if r.Skipped != "" {
-		return false
-	}
-	return r.Err != "" || !r.StatusMatch || !r.BodyMatch
-}
-
-// grpcReplaySkip is why recorded gRPC calls are not replayed.
-const grpcReplaySkip = "gRPC call: the recording holds a summary of its binary body, not the bytes"
-
-// replayFile reads an NDJSON recording and replays each exchange.
-// If targetBase is non-empty it is used as the URL prefix (scheme+host),
-// replacing the original host. Results are printed to stdout.
-//
-// Exit codes: 0 = clean, 1 = read/parse failure, 2 = differences found while
-// failOnDiff is set (so CI can gate on it).
-func replayFile(path, targetBase string, delayBetween time.Duration, failOnDiff bool) int {
-	f, err := os.Open(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "replay: cannot open %s: %v\n", path, err)
-		return 1
-	}
-	defer f.Close()
-
-	// The proxy's own client, so replay follows the same verification policy
-	// and upstream proxy: a recording from a self-signed host, or one taken
-	// behind an egress proxy, must still be replayable.
-	client := newUpstreamClient(insecureUpstream)
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-
-	n, errs, diffs, skipped := 0, 0, 0, 0
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-
-		var ex recordedExchange
-		if err := json.Unmarshal(line, &ex); err != nil {
-			fmt.Fprintf(os.Stderr, "replay: malformed line: %v\n", err)
-			errs++
-			continue
-		}
-
-		if n > 0 && delayBetween > 0 {
-			time.Sleep(delayBetween)
-		}
-
-		res := replayOne(client, &ex, targetBase)
-		if res.Differs() {
-			diffs++
-		}
-		if res.Skipped != "" {
-			skipped++
-		}
-		n++
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "replay: read error: %v\n", err)
-		return 1
-	}
-	if !jsonMode {
-		fmt.Printf("\n%s replayed %d request(s), %d error(s), %d diff(s), %d skipped\n",
-			strings.Repeat("─", 60), n-skipped, errs, diffs, skipped)
-	}
-	if errs > 0 {
-		return 1
-	}
-	if failOnDiff && diffs > 0 {
-		return 2
-	}
-	return 0
-}
-
-// replayOne re-issues a single recorded exchange and reports how the response
-// compares. Output goes to stdout as text, or as one NDJSON object when
-// --format json is set.
-func replayOne(client *http.Client, ex *recordedExchange, targetBase string) replayResult {
-	res := replayResult{ID: ex.ID, Method: ex.Method, RecordedStatus: ex.Status}
-	replayURL := ex.URL
-	if targetBase != "" {
-		// Replace scheme+host in the original URL with targetBase,
-		// preserving path, query string, and fragment.
-		rest := ex.URL
-		if i := strings.Index(rest, "://"); i >= 0 {
-			rest = rest[i+3:]
-			// Find the first '/' or '?' to split off the host.
-			cut := strings.IndexAny(rest, "/?#")
-			if cut >= 0 {
-				rest = rest[cut:]
-			} else {
-				rest = "/"
-			}
-		}
-		replayURL = strings.TrimRight(targetBase, "/") + rest
-	}
-	res.URL = replayURL
-
-	if !jsonMode {
-		fmt.Printf("\n\033[36m── REPLAY #%d ──\033[0m\n", ex.ID)
-		fmt.Printf("Original:  %s %s  →  %s\n", ex.Method, ex.URL, ex.StatusText)
-		fmt.Printf("Replaying: %s %s\n", ex.Method, replayURL)
-	}
-
-	// Re-sending the summary text as a request body would send the server
-	// garbage and report a spurious difference.
-	if isGRPCContentType(ex.ReqHeaders["Content-Type"]) {
-		res.Skipped = grpcReplaySkip
-		emitReplayResult(res, "")
-		return res
-	}
-
-	var bodyReader io.Reader
-	if ex.ReqBody != "" {
-		bodyReader = strings.NewReader(ex.ReqBody)
-	}
-
-	req, err := http.NewRequest(ex.Method, replayURL, bodyReader)
-	if err != nil {
-		res.Err = err.Error()
-		emitReplayResult(res, "")
-		return res
-	}
-	for k, v := range ex.ReqHeaders {
-		req.Header.Set(k, v)
-	}
-	// Remove host-specific headers that would break the replayed request.
-	req.Header.Del("Host")
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	dur := time.Since(start)
-	res.DurationMs = dur.Milliseconds()
-	if err != nil {
-		res.Err = err.Error()
-		emitReplayResult(res, "")
-		return res
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, int64(captureMaxBody)))
-
-	res.ActualStatus = resp.StatusCode
-	res.StatusMatch = resp.StatusCode == ex.Status
-
-	newBody := strings.TrimSpace(decodeForCompare(resp.Header, respBody))
-	if ex.RespBodyTruncated {
-		// Only a prefix was recorded, so only a prefix can be compared.
-		res.BodyMatch = strings.HasPrefix(newBody, strings.TrimSpace(ex.RespBody))
-	} else {
-		res.BodyMatch = strings.TrimSpace(ex.RespBody) == newBody
-	}
-
-	emitReplayResult(res, newBody)
-	return res
-}
-
-// decodeForCompare decompresses a replayed response body so it can be compared
-// against the recording, which stores bodies already decoded. Without this,
-// every compressed endpoint would report a body difference on every replay.
-// Bodies that cannot be decoded are compared as-is.
-func decodeForCompare(h http.Header, body []byte) string {
-	enc := h.Get("Content-Encoding")
-	if len(splitEncodings(enc)) == 0 {
-		return string(body)
-	}
-	res, err := decompressBody(enc, body)
-	if err != nil {
-		return string(body)
-	}
-	return string(res.Data)
-}
-
-// emitReplayResult renders one replay outcome, as coloured text or NDJSON.
-func emitReplayResult(res replayResult, newBody string) {
-	if jsonMode {
-		jsonEncMu.Lock()
-		jsonEnc.Encode(res) //nolint:errcheck
-		jsonEncMu.Unlock()
-		return
-	}
-
-	if res.Skipped != "" {
-		fmt.Printf("  \033[33mSKIP\033[0m: %s\n", res.Skipped)
-		return
-	}
-	if res.Err != "" {
-		fmt.Fprintf(os.Stderr, "  \033[31mFAIL\033[0m: %v\n", res.Err)
-		return
-	}
-
-	statusIcon := "\033[32m✓\033[0m"
-	if !res.StatusMatch {
-		statusIcon = "\033[31m✗\033[0m"
-	}
-	fmt.Printf("  Status:  %s  recorded=%d  actual=%d  (%dms)\n",
-		statusIcon, res.RecordedStatus, res.ActualStatus, res.DurationMs)
-
-	if res.BodyMatch {
-		fmt.Printf("  Body:    \033[32m✓ unchanged\033[0m\n")
-		return
-	}
-	fmt.Printf("  Body:    \033[33m≠ changed\033[0m\n")
-	if len(newBody) > 200 {
-		newBody = newBody[:200] + "…"
-	}
-	fmt.Printf("    now: %s\n", newBody)
+// redactedURL reports whether u had a credential masked by --redact.
+func redactedURL(u string) bool {
+	return strings.Contains(u, "…(") || strings.Contains(u, ":…@")
 }

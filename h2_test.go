@@ -314,7 +314,7 @@ func TestForward_ZeroLengthBodyKeepsContentLengthFraming(t *testing.T) {
 	req.ContentLength = 0
 	req.RequestURI = ""
 
-	forwardRequest(httptest.NewRecorder(), req, upstreamClient)
+	forwardRequest(httptest.NewRecorder(), req, upstreamClient, false)
 
 	got := <-seen
 	if len(got.te) != 0 || got.cl != 0 {

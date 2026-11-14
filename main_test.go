@@ -13,8 +13,6 @@ import (
 	"errors"
 
 	"fmt"
-	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
 	"io"
 	"net"
 	"net/http"
@@ -25,6 +23,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 // ---- generateCert ----
@@ -608,18 +609,21 @@ func TestRecord_WriteAndRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var ex recordedExchange
+	var ex recordV2
 	if err := json.Unmarshal(bytes.TrimSpace(data), &ex); err != nil {
 		t.Fatalf("invalid NDJSON: %v\nraw: %s", err, data)
+	}
+	if ex.V != 2 || ex.Session == "" {
+		t.Errorf("v = %d, session = %q; want a v2 record with a session", ex.V, ex.Session)
 	}
 	if ex.Status != http.StatusOK {
 		t.Errorf("recorded status = %d, want 200", ex.Status)
 	}
-	if !strings.Contains(ex.RespBody, "hello") {
-		t.Errorf("recorded body %q missing expected content", ex.RespBody)
+	if ex.RespBody == nil || !strings.Contains(ex.RespBody.Data, "hello") {
+		t.Errorf("recorded body %+v missing expected content", ex.RespBody)
 	}
 	if ex.DurationMs < 0 {
-		t.Errorf("recorded duration_ms = %d, want >= 0", ex.DurationMs)
+		t.Errorf("recorded duration_ms = %v, want >= 0", ex.DurationMs)
 	}
 }
 
@@ -929,15 +933,15 @@ func TestRecord_LargeBodyFullyStored(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var ex recordedExchange
+	var ex recordV2
 	if err := json.Unmarshal(bytes.TrimSpace(data), &ex); err != nil {
 		t.Fatalf("invalid NDJSON: %v\nraw: %s", err, data)
 	}
-	if len(ex.ReqBody) != bodySize {
-		t.Errorf("recorded req body len = %d, want %d", len(ex.ReqBody), bodySize)
+	if ex.ReqBody == nil || len(ex.ReqBody.Data) != bodySize || ex.ReqBody.Size != int64(bodySize) {
+		t.Errorf("recorded req body = %d bytes (size %d), want %d", len(ex.ReqBody.Data), ex.ReqBody.Size, bodySize)
 	}
-	if len(ex.RespBody) != bodySize {
-		t.Errorf("recorded resp body len = %d, want %d", len(ex.RespBody), bodySize)
+	if ex.RespBody == nil || len(ex.RespBody.Data) != bodySize {
+		t.Errorf("recorded resp body len = %d, want %d", len(ex.RespBody.Data), bodySize)
 	}
 }
 
@@ -1231,7 +1235,7 @@ func TestSpliceWebSocket(t *testing.T) {
 	spliceDone := make(chan struct{})
 	go func() {
 		defer close(spliceDone)
-		spliceWebSocket(proxyUpConn, req, proxyClientConn, bw, br)
+		spliceWebSocket(proxyUpConn, req, proxyClientConn, bw, br, 0, nil)
 	}()
 
 	// Client side: read the forwarded 101.
@@ -1286,14 +1290,7 @@ func TestHAR_BasicCapture(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	harEntriesMu.Lock()
-	harEntries = nil
-	harEntriesMu.Unlock()
-	captures = newExchangeJoiner()
-
-	savedHM := harMode
-	harMode = true
-	defer func() { harMode = savedHM }()
+	mem := useMemoryHAR(t)
 
 	req, _ := http.NewRequest("GET", upstream.URL+"/data?foo=bar", nil)
 	rr := httptest.NewRecorder()
@@ -1303,10 +1300,7 @@ func TestHAR_BasicCapture(t *testing.T) {
 		t.Fatalf("status = %d", rr.Code)
 	}
 
-	harEntriesMu.Lock()
-	entries := make([]harEntry, len(harEntries))
-	copy(entries, harEntries)
-	harEntriesMu.Unlock()
+	entries := mem.entries()
 
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 HAR entry, got %d", len(entries))
@@ -1333,8 +1327,7 @@ func TestHAR_BasicCapture(t *testing.T) {
 }
 
 func TestHAR_WriteFile(t *testing.T) {
-	harEntriesMu.Lock()
-	harEntries = []harEntry{
+	entries := []harEntry{
 		{
 			StartedDateTime: time.Now().UTC().Format(time.RFC3339Nano),
 			Time:            42.0,
@@ -1362,17 +1355,9 @@ func TestHAR_WriteFile(t *testing.T) {
 			Timings: harTimings{Wait: 42.0},
 		},
 	}
-	harEntriesMu.Unlock()
 
-	f, err := os.CreateTemp("", "httpmon-test-har-*.har")
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := f.Name()
-	f.Close()
-	defer os.Remove(path)
-
-	if err := writeHARFile(path); err != nil {
+	path := t.TempDir() + "/out.har"
+	if err := writeHARForTest(path, entries...); err != nil {
 		t.Fatal(err)
 	}
 

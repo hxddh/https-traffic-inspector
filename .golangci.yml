@@ -33,6 +33,12 @@ linters:
         - G304
         # G204: wrapping a user-supplied command is the tool's entire purpose.
         - G204
+        # G703: the same as G304 by taint analysis: --ca-dir and the other
+        # paths are the user's own flags.
+        - G703
+        # G704: forwarding the wrapped command's requests to wherever they
+        # are addressed is what a proxy does.
+        - G704
 
   exclusions:
     rules:

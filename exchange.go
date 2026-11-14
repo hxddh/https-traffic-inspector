@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // capturedRequest and capturedResponse are the two halves of an exchange as
 // --record and --har need them, each available once its body has finished.
@@ -12,6 +15,10 @@ type capturedRequest struct {
 type capturedResponse struct {
 	facts responseFacts
 	body  bodyView
+	// err is set when the exchange failed and facts holds only the duration.
+	err string
+	// ws holds the messages of an upgraded WebSocket connection.
+	ws []wsMessage
 }
 
 // exchangeJoiner pairs the two halves of each exchange by request ID.
@@ -71,6 +78,12 @@ func (j *exchangeJoiner) addResponse(id int, rs capturedResponse) {
 	completeExchange(id, r, rs)
 }
 
+// addFailure records that an exchange got no response. It completes once the
+// request half arrives, so a failed exchange is recorded like any other.
+func (j *exchangeJoiner) addFailure(id int, msg string, dur time.Duration) {
+	j.addResponse(id, capturedResponse{facts: responseFacts{duration: dur}, err: msg})
+}
+
 // drop abandons an exchange that will never complete, such as one whose
 // upstream request failed. The request half may still be in flight -- the
 // transport closes the body after the failure is reported -- so its arrival
@@ -100,5 +113,16 @@ func completeExchange(id int, r capturedRequest, rs capturedResponse) {
 	}
 	if harMode {
 		addHAREntry(r, rs)
+	}
+}
+
+// discardReqID cleans up per-request state when a request was logged but will
+// never be reported as completed or failed.
+func discardReqID(reqID int) {
+	reqStartMu.Lock()
+	delete(reqStartTimes, reqID)
+	reqStartMu.Unlock()
+	if recordMode || harMode {
+		captures.drop(reqID)
 	}
 }

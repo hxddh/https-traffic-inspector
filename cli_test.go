@@ -486,12 +486,8 @@ func TestVersion_DefaultAndHARCreator(t *testing.T) {
 		t.Fatal("version must never be empty")
 	}
 
-	harEntriesMu.Lock()
-	harEntries = nil
-	harEntriesMu.Unlock()
-
 	path := t.TempDir() + "/out.har"
-	if err := writeHARFile(path); err != nil {
+	if err := writeHARForTest(path); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -611,8 +607,8 @@ func TestHandleConnect_UnknownLengthResponseIsFramed(t *testing.T) {
 		Transport: &http.Transport{
 			Proxy:           http.ProxyURL(proxyURL),
 			TLSClientConfig: &tls.Config{RootCAs: pool},
-			// Send no Accept-Encoding, so httpmon's own transport requests gzip
-			// and transparently decodes it -- the case that loses Content-Length.
+			// Send no Accept-Encoding: the body must still arrive as the
+			// server sent it, gzip and all, and properly framed.
 			DisableCompression: true,
 		},
 	}
@@ -627,8 +623,13 @@ func TestHandleConnect_UnknownLengthResponseIsFramed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading body: %v", err)
 	}
-	if string(got) != payload {
-		t.Errorf("body = %q, want %q", got, payload)
+	zr, err := gzip.NewReader(bytes.NewReader(got))
+	if err != nil {
+		t.Fatalf("body is not the gzip stream the server sent: %v (%q)", err, got)
+	}
+	plain, _ := io.ReadAll(zr)
+	if string(plain) != payload {
+		t.Errorf("body = %q, want %q", plain, payload)
 	}
 	if resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 {
 		t.Error("response reached the client with no length and no chunked framing")
@@ -923,7 +924,7 @@ func TestTextOutput_ConcurrentResponsesAreAttributable(t *testing.T) {
 	// Map each request number to the URL path it was assigned.
 	text := out.String()
 	pathOf := map[string]string{}
-	reqRe := regexp.MustCompile(`=== REQUEST #(\d+) ===\x1b\[0m\nTime: [^\n]*\nGET http://[^/]+/(\d+) `)
+	reqRe := regexp.MustCompile(`=== REQUEST #(\d+) ===\nTime: [^\n]*\nGET http://[^/]+/(\d+) `)
 	for _, m := range reqRe.FindAllStringSubmatch(text, -1) {
 		pathOf[m[1]] = m[2]
 	}
@@ -931,7 +932,7 @@ func TestTextOutput_ConcurrentResponsesAreAttributable(t *testing.T) {
 		t.Fatalf("found %d intact request blocks, want %d; output:\n%s", len(pathOf), n, text)
 	}
 
-	bodyRe := regexp.MustCompile(`--- RESPONSE #(\d+) body ---\x1b\[0m\nbody-for-(\d+)\n`)
+	bodyRe := regexp.MustCompile(`--- RESPONSE #(\d+) body ---\nbody-for-(\d+)\n`)
 	bodies := bodyRe.FindAllStringSubmatch(text, -1)
 	if len(bodies) != n {
 		t.Fatalf("found %d intact response body blocks, want %d; output:\n%s", len(bodies), n, text)

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"unicode/utf8"
 )
 
 // bodySampler wraps a body so its content can be logged without holding up
@@ -24,7 +25,7 @@ type bodySampler struct {
 	rc     io.ReadCloser
 	limit  int
 	expect int64 // declared length, or -1 when unknown
-	onDone func(raw []byte, incomplete bool)
+	onDone func(raw []byte, incomplete bool, total int64)
 
 	mu       sync.Mutex
 	buf      bytes.Buffer
@@ -33,7 +34,7 @@ type bodySampler struct {
 	fired    bool
 }
 
-func newBodySampler(rc io.ReadCloser, limit int, expect int64, onDone func(raw []byte, incomplete bool)) *bodySampler {
+func newBodySampler(rc io.ReadCloser, limit int, expect int64, onDone func(raw []byte, incomplete bool, total int64)) *bodySampler {
 	return &bodySampler{rc: rc, limit: limit, expect: expect, onDone: onDone}
 }
 
@@ -80,11 +81,12 @@ func (s *bodySampler) fire(reachedEOF bool) {
 	// its consumer stopped before reading EOF.
 	whole := reachedEOF || (s.expect >= 0 && s.total == s.expect)
 	incomplete := s.overflow || !whole
+	total := s.total
 	cb := s.onDone
 	s.mu.Unlock()
 
 	if cb != nil {
-		cb(raw, incomplete)
+		cb(raw, incomplete, total)
 	}
 }
 
@@ -101,8 +103,10 @@ func sampleBody(bodyp *io.ReadCloser, h http.Header, length int64, onDone func(b
 		onDone(bodyView{})
 		return
 	}
-	*bodyp = newBodySampler(*bodyp, limit, length, func(raw []byte, incomplete bool) {
-		onDone(decodeBody(h, raw, incomplete))
+	*bodyp = newBodySampler(*bodyp, limit, length, func(raw []byte, incomplete bool, total int64) {
+		v := decodeBody(h, raw, incomplete)
+		v.Raw, v.RawTruncated, v.Size = raw, incomplete, total
+		onDone(v)
 	})
 }
 
@@ -131,7 +135,7 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 	compressed := len(splitEncodings(enc)) > 0
 
 	if !compressed {
-		if isPrintableContentType(h.Get("Content-Type")) {
+		if looksLikeText(h.Get("Content-Type"), raw, incomplete) {
 			return bodyView{Text: string(raw), Truncated: incomplete}
 		}
 		return bodyView{Text: binaryPlaceholder(raw)}
@@ -142,6 +146,25 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 		return bodyView{Text: string(res.Data), Truncated: res.Truncated || incomplete}
 	}
 	return bodyView{Text: encodedPlaceholder(enc, raw)}
+}
+
+// looksLikeText reports whether an uncompressed body should be shown as text.
+// A body with no Content-Type is judged by its bytes: printed blindly, a
+// binary download would fill the screen with escaped noise.
+func looksLikeText(ct string, raw []byte, incomplete bool) bool {
+	if !isPrintableContentType(ct) {
+		return false
+	}
+	if ct != "" {
+		return true
+	}
+	if incomplete {
+		// The capture may have cut a multi-byte character in half.
+		for i := 0; i < 3 && len(raw) > 0 && !utf8.Valid(raw); i++ {
+			raw = raw[:len(raw)-1]
+		}
+	}
+	return utf8.Valid(raw)
 }
 
 // binaryPlaceholder describes a body that is not worth printing as text.
