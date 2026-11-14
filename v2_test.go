@@ -17,8 +17,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 

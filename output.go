@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
 )
 
 // ---- output channel ----
@@ -103,6 +103,8 @@ type sink interface {
 	wsClosed(id int, s wsSummary)
 	// exchange reports a completed exchange.
 	exchange(e *exchange.Exchange)
+	// incomplete reports, at the end of the run, an exchange still waiting.
+	incomplete(p exchange.Pending)
 	connect(target string)
 	notice(msg string)
 	// start and end bracket the run.
@@ -260,6 +262,10 @@ func (textSink) wsClosed(id int, s wsSummary) {
 
 func (textSink) exchange(*exchange.Exchange) {} // shown as it unfolded
 
+func (textSink) incomplete(p exchange.Pending) {
+	emitText("\n" + paint(colYellow, textsafe.Line(p.SummaryLine())) + "\n")
+}
+
 func (textSink) connect(target string) {
 	emitText("\n" + paint(colYellow, fmt.Sprintf("=== CONNECT %s ===", textsafe.Line(target))) + "\n\n")
 }
@@ -329,6 +335,10 @@ func (summarySink) exchange(e *exchange.Exchange) {
 	emitText(textsafe.Line(e.SummaryLine()) + "\n")
 }
 
+func (summarySink) incomplete(p exchange.Pending) {
+	emitText(textsafe.Line(p.SummaryLine()) + "\n")
+}
+
 func (summarySink) notice(msg string) {
 	emitText("! " + textsafe.Line(msg) + "\n")
 }
@@ -349,10 +359,11 @@ func (summarySink) end(d *exchange.Digest) {
 type jsonSink struct{}
 
 type jsonEvent struct {
-	Event   string           `json:"event"`
-	Message string           `json:"message,omitempty"`
-	Run     *runInfo         `json:"run,omitempty"`
-	Digest  *exchange.Digest `json:"digest,omitempty"`
+	Event      string            `json:"event"`
+	Message    string            `json:"message,omitempty"`
+	Incomplete *exchange.Pending `json:"exchange,omitempty"`
+	Run        *runInfo          `json:"run,omitempty"`
+	Digest     *exchange.Digest  `json:"digest,omitempty"`
 }
 
 func (jsonSink) requestHead(int, *requestFacts)                            {}
@@ -365,6 +376,10 @@ func (jsonSink) wsClosed(int, wsSummary)                                   {}
 func (jsonSink) connect(string)                                            {}
 
 func (jsonSink) exchange(e *exchange.Exchange) { emitJSON(e) }
+
+func (jsonSink) incomplete(p exchange.Pending) {
+	emitJSON(jsonEvent{Event: "incomplete", Incomplete: &p})
+}
 
 func (jsonSink) notice(msg string) { emitJSON(jsonEvent{Event: "notice", Message: msg}) }
 

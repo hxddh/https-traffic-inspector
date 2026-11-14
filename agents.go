@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // ---- httpmon help ----
@@ -46,7 +46,9 @@ Recommended invocation
       ── 11 exchanges: 9×2xx, 1×5xx, 1 failed · slowest #5 45ms
   - --fail-on makes the exit code meaningful: 3 when the command exited 0
     but a matching exchange happened. The command's own non-zero exit code
-    is passed through unchanged.
+    is passed through unchanged. Add "incomplete" to fail on requests still
+    unanswered when the command exits; they are listed by name either way:
+      #2 GET api.example.com/v1/report → … no response after 3.5s
 
 Expanding details (from the --record file)
   httpmon query /tmp/trace.ndjson                     # the summary again
@@ -57,6 +59,12 @@ Expanding details (from the --record file)
 
   A record keeps raw bytes and is large: read it through query, not directly.
   query --follow keeps reading while a long-running command appends to it.
+
+After changing code: what did the change do to the requests?
+  httpmon --record /tmp/after.ndjson <command>
+  httpmon diff /tmp/trace.ndjson /tmp/after.ndjson --ignore .updated_at
+  Lists new (+) and gone (-) exchanges, changed outcomes, bodies that differ
+  (by JSON path) and much slower exchanges. Exit 0 same, 1 different.
 
 Structured output
   --format json writes one object per exchange (schema: httpmon schema).
@@ -81,6 +89,7 @@ Settings that apply to every run
   HTTPMON_FORMAT=summary|json|text   HTTPMON_FAIL_ON=5xx,error
 
 Other subcommands
+  httpmon diff <before> <after>            compare two runs
   httpmon replay <record> [--target URL]   re-send and compare
   httpmon ca --dir <dir>                   persistent CA for devices/containers
   httpmon schema                           JSON Schema of an exchange

@@ -2,13 +2,14 @@ package main
 
 import (
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // ---- exchange events ----
@@ -26,7 +27,52 @@ var (
 	// per-request start times for duration tracking
 	reqStartTimes = make(map[int]time.Time)
 	reqStartMu    sync.Mutex
+
+	// unfinished holds logged exchanges that have not completed, so the end
+	// of the run can name the ones still waiting.
+	unfinished   = make(map[int]exchange.Pending)
+	unfinishedMu sync.Mutex
 )
+
+func trackUnfinished(id int, method, url string) {
+	unfinishedMu.Lock()
+	unfinished[id] = exchange.Pending{ID: id, Method: method, URL: url}
+	unfinishedMu.Unlock()
+}
+
+func untrack(id int) {
+	unfinishedMu.Lock()
+	delete(unfinished, id)
+	unfinishedMu.Unlock()
+}
+
+// unfinishedExchanges lists, in id order, the exchanges still waiting.
+func unfinishedExchanges() []exchange.Pending {
+	unfinishedMu.Lock()
+	ids := make([]int, 0, len(unfinished))
+	for id := range unfinished {
+		ids = append(ids, id)
+	}
+	unfinishedMu.Unlock()
+	sort.Ints(ids)
+	out := make([]exchange.Pending, 0, len(ids))
+	reqStartMu.Lock()
+	unfinishedMu.Lock()
+	for _, id := range ids {
+		p, ok := unfinished[id]
+		if !ok {
+			continue
+		}
+		if start, ok := reqStartTimes[id]; ok {
+			p.WaitingMs = millis(time.Since(start))
+		}
+		p.URL = displayURL(p.URL)
+		out = append(out, p)
+	}
+	unfinishedMu.Unlock()
+	reqStartMu.Unlock()
+	return out
+}
 
 func nextReqID() int {
 	counterMu.Lock()
@@ -95,7 +141,6 @@ type bodyView struct {
 // event follows when it ends.
 func logRequestFacts(req *http.Request) (int, *requestFacts) {
 	reqID := nextReqID()
-	started.Add(1)
 
 	startTime := time.Now()
 	reqStartMu.Lock()
@@ -113,11 +158,12 @@ func logRequestFacts(req *http.Request) (int, *requestFacts) {
 		headers:   req.Header.Clone(),
 		startTime: startTime,
 	}
+	trackUnfinished(reqID, f.method, f.rawURL)
 	currentSink().requestHead(reqID, f)
 
 	// Sample the body alongside delivery instead of reading a prefix up front.
 	// Reading first would hold a chunked upload until the client finished it.
-	sampleBody(&req.Body, f.headers, req.ContentLength, func(v bodyView) {
+	sampleRequestBody(&req.Body, f.headers, req.ContentLength, func(v bodyView) {
 		onRequestBody(reqID, f, v)
 	})
 	return reqID, f
@@ -182,7 +228,7 @@ func logResponse(resp *http.Response, reqID int) {
 	//
 	// Trailers are read when the body completes: the transport fills
 	// resp.Trailer in place just before the body reports EOF.
-	sampleBody(&resp.Body, f.headers, f.contentLength, func(v bodyView) {
+	sampleResponseBody(&resp.Body, f.headers, f.contentLength, f.status, func(v bodyView) {
 		f.trailers = resp.Trailer.Clone()
 		f.total = time.Since(f.start)
 		onResponseBody(reqID, f, v)

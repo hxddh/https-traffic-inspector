@@ -16,9 +16,9 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
 )
 
 // tuiEntry holds one HTTP transaction displayed in the TUI. Every string in
@@ -201,7 +201,12 @@ func (tuiSink) failed(id int, _ *requestFacts, err *exchange.Error, dur time.Dur
 }
 
 func (tuiSink) exchange(*exchange.Exchange) {} // shown as it unfolded
-func (tuiSink) start(runInfo)               {}
+
+// incomplete is printed after the UI has closed, like the digest.
+func (tuiSink) incomplete(p exchange.Pending) {
+	fmt.Fprintln(os.Stderr, textsafe.Line(p.SummaryLine()))
+}
+func (tuiSink) start(runInfo) {}
 
 // end has nothing to draw on: the UI has closed by then. The digest is
 // printed after it, with the notices.

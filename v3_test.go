@@ -8,11 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
 )
 
 // Regression: body text started at the first column like httpmon's own
@@ -52,9 +54,12 @@ func useSummary(t *testing.T) *syncBuffer {
 
 func useStats(t *testing.T, failOn string) {
 	t.Helper()
-	saved, savedStarted := runStats, started.Load()
+	saved := runStats
 	runStats = &stats{}
-	started.Store(0)
+	unfinishedMu.Lock()
+	savedUnfinished := unfinished
+	unfinished = make(map[int]exchange.Pending)
+	unfinishedMu.Unlock()
 	if failOn != "" {
 		f, err := exchange.ParseFailOn(failOn)
 		if err != nil {
@@ -62,7 +67,12 @@ func useStats(t *testing.T, failOn string) {
 		}
 		runStats.failOn = f
 	}
-	t.Cleanup(func() { runStats = saved; started.Store(savedStarted) })
+	t.Cleanup(func() {
+		runStats = saved
+		unfinishedMu.Lock()
+		unfinished = savedUnfinished
+		unfinishedMu.Unlock()
+	})
 }
 
 func apiServer(t *testing.T) *httptest.Server {
@@ -322,5 +332,129 @@ func TestQuery_IDDefaultsToFullText(t *testing.T) {
 	}
 	if out, _ := runQuery(t, path, "--id", id, "--format", "summary"); strings.Contains(out, "Request headers") {
 		t.Errorf("an explicit --format summary was overridden:\n%s", out)
+	}
+}
+
+// ---- v3.1 ----
+
+func TestBuildVersion(t *testing.T) {
+	info := &debug.BuildInfo{Main: debug.Module{Version: "v3.1.0"}}
+	if got := buildVersion("dev", info, true); got != "v3.1.0" {
+		t.Errorf("go install build reports %q, want v3.1.0", got)
+	}
+	if got := buildVersion("v3.1.0-rc", info, true); got != "v3.1.0-rc" {
+		t.Errorf("an injected version was overridden: %q", got)
+	}
+	if got := buildVersion("dev", &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}}, true); got != "dev" {
+		t.Errorf("a local build reports %q", got)
+	}
+}
+
+// Regression: the summary and JSON outputs kept up to --max-capture of every
+// body, so parallel downloads used nearly seven times the memory of the text
+// output although the summary shows no body.
+func TestCaptureLimit_KeepsOnlyWhatOutputsUse(t *testing.T) {
+	saved := []bool{summaryMode, jsonMode, recordMode, harMode, tuiMode}
+	defer func() {
+		summaryMode, jsonMode, recordMode, harMode, tuiMode = saved[0], saved[1], saved[2], saved[3], saved[4]
+	}()
+	bin := http.Header{"Content-Type": {"application/octet-stream"}}
+	js := http.Header{"Content-Type": {"application/json"}}
+	txt := http.Header{"Content-Type": {"text/plain"}}
+
+	summaryMode, jsonMode, recordMode, harMode, tuiMode = true, false, false, false, false
+	for _, tc := range []struct {
+		h      http.Header
+		status int
+		req    bool
+		want   int
+	}{
+		{bin, 200, false, 0},
+		{js, 200, false, 0},
+		{js, 500, false, captureMaxBody},
+		{js, 0, true, 0},
+	} {
+		if got := captureLimitFor(tc.h, tc.status, tc.req); got != tc.want {
+			t.Errorf("summary: %v status %d request %v = %d, want %d", tc.h, tc.status, tc.req, got, tc.want)
+		}
+	}
+
+	summaryMode, jsonMode = false, true
+	if got := captureLimitFor(bin, 200, false); got != 0 {
+		t.Errorf("json: binary keeps %d bytes", got)
+	}
+	if got := captureLimitFor(js, 200, false); got != captureMaxBody {
+		t.Errorf("json: JSON keeps %d bytes", got)
+	}
+	if got := captureLimitFor(txt, 200, false); got != displayMaxBody {
+		t.Errorf("json: text keeps %d bytes", got)
+	}
+
+	recordMode = true
+	if got := captureLimitFor(bin, 200, false); got != captureMaxBody {
+		t.Errorf("--record keeps %d bytes of a binary body", got)
+	}
+}
+
+// The summary still reports the size of a body it did not keep.
+func TestSummary_BinaryBodySizeWithoutKeepingIt(t *testing.T) {
+	payload := strings.Repeat("\x00\x01", 50000)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		io.WriteString(w, payload) //nolint:errcheck
+	}))
+	defer up.Close()
+	out := useSummary(t)
+	useStats(t, "")
+	get(t, up.URL+"/f")
+	if !strings.Contains(out.String(), "(") || !strings.Contains(out.String(), "97 KB") {
+		t.Errorf("summary = %q, want the 100000-byte size", out.String())
+	}
+}
+
+// Regression: the digest said "1 incomplete" without saying which.
+func TestFinishRun_NamesUnfinishedExchanges(t *testing.T) {
+	out := useSummary(t)
+	useStats(t, "incomplete")
+	reqStartMu.Lock()
+	reqStartTimes[424242] = time.Now().Add(-2 * time.Second)
+	reqStartMu.Unlock()
+	trackUnfinished(424242, "GET", "http://h/hang")
+	defer untrack(424242)
+
+	if code := finishRun(0); code != exitFailOn {
+		t.Errorf("finishRun = %d, want %d with --fail-on incomplete", code, exitFailOn)
+	}
+	if !strings.Contains(out.String(), "#424242 GET h/hang → … no response after 2.0s") ||
+		!strings.Contains(out.String(), "1 incomplete") {
+		t.Errorf("output:\n%s", out.String())
+	}
+}
+
+func TestDiffCommand_ExitCodes(t *testing.T) {
+	a := writeRecording(t, recordedExchange{ID: 1, Method: "GET", URL: "http://h/x", Status: 200,
+		RespHeaders: map[string]string{"Content-Type": "application/json"}, RespBody: `{"v":1}`})
+	b := writeRecording(t, recordedExchange{ID: 1, Method: "GET", URL: "http://h/x", Status: 200,
+		RespHeaders: map[string]string{"Content-Type": "application/json"}, RespBody: `{"v":2}`})
+	run := func(args ...string) (string, int) {
+		outPath := filepath.Join(t.TempDir(), "out")
+		saved := swapTextOut(io.Discard)
+		defer func() { swapTextOut(saved); runCleanups() }()
+		code := cmdDiff(append(args, "-o", outPath))
+		runCleanups()
+		data, _ := os.ReadFile(outPath)
+		return string(data), code
+	}
+	if out, code := run(a, a); code != exitDiffSame || !strings.Contains(out, "0 changed") {
+		t.Errorf("same: exit %d\n%s", code, out)
+	}
+	if out, code := run(a, b); code != exitDiffChanged || !strings.Contains(out, "response body: .v") {
+		t.Errorf("changed: exit %d\n%s", code, out)
+	}
+	if out, code := run(a, b, "--ignore", ".v"); code != exitDiffSame {
+		t.Errorf("--ignore .v: exit %d\n%s", code, out)
+	}
+	if _, code := run(a, filepath.Join(t.TempDir(), "missing")); code != exitDiffTrouble {
+		t.Errorf("missing file: exit %d", code)
 	}
 }

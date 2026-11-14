@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v3/internal/textsafe"
 )
 
 // replayResult is the outcome of replaying a single recorded exchange.

@@ -68,11 +68,12 @@ No system configuration is changed, and the temporary CA bundle is removed when 
 ### go install (requires Go 1.26+)
 
 ```bash
-go install github.com/hxddh/https-traffic-inspector/v2@latest
+go install github.com/hxddh/https-traffic-inspector/v3@latest
 ```
 
 The binary is installed as `https-traffic-inspector`; rename or alias it to `httpmon`.
-(The module path keeps `/v2`: it names the Go module, not the release.)
+(v3.0.0 kept the `/v2` module path by mistake, so `go install …/v2@latest`
+installs 2.0.0. Use `/v3` and v3.1.0 or later.)
 
 ### Pre-built binaries
 
@@ -87,8 +88,8 @@ Download the latest binary for your platform from the [Releases](https://github.
 | Windows x86-64 | `httpmon-<version>-windows-amd64.exe` |
 
 ```bash
-chmod +x httpmon-v3.0.0-macos-arm64
-sudo mv httpmon-v3.0.0-macos-arm64 /usr/local/bin/httpmon
+chmod +x httpmon-v3.1.0-macos-arm64
+sudo mv httpmon-v3.1.0-macos-arm64 /usr/local/bin/httpmon
 ```
 
 ### From source
@@ -106,13 +107,14 @@ go build -o httpmon .
 ```
 httpmon [options] <command> [args...]   run a command and show its HTTP(S) traffic
 httpmon query  <record> [filters]       list or expand exchanges from a --record file
+httpmon diff   <before> <after>         compare two records: what changed between runs
 httpmon replay <record> [options]       re-send recorded requests and compare responses
 httpmon ca     --dir <dir>              create or show a persistent CA
 httpmon schema                          print the JSON Schema of an exchange record
 httpmon help   [agents]                 help, or a guide for AI agents
 ```
 
-`replay`, `query`, `ca`, `schema` and `help` are subcommands only as the first
+`replay`, `query`, `diff`, `ca`, `schema` and `help` are subcommands only as the first
 argument. To wrap a command with one of those names, write `httpmon -- query …`.
 
 ### Options
@@ -120,7 +122,7 @@ argument. To wrap a command with one of those names, write `httpmon -- query …
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--format` | _(auto)_ | `text`, `summary` or `json`. Default: `text` when output is a terminal, `summary` otherwise. `$HTTPMON_FORMAT` sets it for every run. |
-| `--fail-on` | _(none)_ | Exit `3` if any exchange matches: status classes (`5xx`), codes (`404`) or `error`, comma-separated. `$HTTPMON_FAIL_ON`. |
+| `--fail-on` | _(none)_ | Exit `3` if any exchange matches: status classes (`5xx`), codes (`404`), `error` (no response) or `incomplete` (still unanswered at the end), comma-separated. `$HTTPMON_FAIL_ON`. |
 | `-o`, `--output` | _(stderr)_ | Write httpmon's output to a file; `-` for stdout. |
 | `--record` | _(none)_ | Append each exchange, with its raw bytes, to an NDJSON file. |
 | `--har` | _(none)_ | Write captured traffic as HAR 1.2 JSON. |
@@ -144,8 +146,8 @@ argument. To wrap a command with one of those names, write `httpmon -- query …
 | Code | Meaning |
 |------|---------|
 | _(command's code)_ | The wrapped command's own exit code is passed through. |
-| `1` | httpmon failed to start, or writing the HAR file failed. For `query` / `replay`: the record could not be read. |
-| `2` | `replay --fail-on-diff`: at least one response differed from the recording. |
+| `1` | httpmon failed to start, or writing the HAR file failed. For `query` / `replay`: the record could not be read. For `diff`: the records differ. |
+| `2` | `replay --fail-on-diff`: at least one response differed from the recording. For `diff`: a record could not be read. |
 | `3` | `--fail-on`: the command exited 0, but an exchange matched. |
 
 ---
@@ -161,13 +163,21 @@ httpmon --fail-on 5xx,error --record /tmp/trace.ndjson npm test
 httpmon query /tmp/trace.ndjson --status 5xx,error       # what failed
 httpmon query /tmp/trace.ndjson --id 10                  # one exchange in full
 httpmon query /tmp/trace.ndjson --id 10 --body response  # its decoded body
+
+# after changing the code: what is different?
+httpmon --record /tmp/after.ndjson npm test
+httpmon diff /tmp/trace.ndjson /tmp/after.ndjson --ignore .updated_at
 ```
 
 - **Overview first, details on demand.** The summary format answers "which
   request failed and why" in about 1/20 the size of the full text output (11
   exchanges: ~170 tokens against ~3,900). Details are one `query` away.
 - **Results an agent can check.** `--fail-on 5xx,error` turns a failed request
-  into exit code 3, so a fix-and-verify loop only has to read the exit code.
+  into exit code 3, so a fix-and-verify loop only has to read the exit code;
+  `httpmon diff` says what a code change did to the program's requests.
+- **Nothing hangs unseen.** An exchange still waiting when the command exits is
+  listed by name (`#2 GET api/x → … no response after 3.5s`), and
+  `--fail-on incomplete` turns it into exit code 3.
 - **Structured, valid data.** `--format json` writes one object per exchange.
   JSON bodies are embedded as JSON values and stay valid when shortened; errors
   carry a `kind` (`dns`, `refused`, `timeout`, `tls_verify`, …).
@@ -194,8 +204,9 @@ Set `HTTPMON_FAIL_ON=5xx,error` in the agent's environment to make it the defaul
 | `summary` | default elsewhere | One line per completed exchange, then a digest |
 | `json` | `--format json` | One object per completed exchange (see [Exchange records](#exchange-records)) |
 
-All three end with a digest — counts by status class, failures, the slowest
-exchange, and what matched `--fail-on`. In JSON the digest, the start of the
+All three end with any exchanges still unanswered, one line each, and a
+digest — counts by status class, failures, the slowest exchange, and what
+matched `--fail-on`. In JSON the digest, the start of the
 run and any warnings are objects with an `"event"` field, so every line of the
 stream parses.
 
@@ -277,6 +288,40 @@ httpmon query trace.ndjson --follow                 # keep reading while it is w
 Bodies are re-rendered from the raw bytes within `--max-body` (default 4000 for
 query), and credentials are masked unless `--show-secrets`. `--body` writes the
 bytes as they are into a pipe or file, and escaped onto a terminal.
+
+### Diff — `httpmon diff`
+
+Compares two records — typically before and after a code change — exchange by
+exchange:
+
+```bash
+httpmon --record before.ndjson npm test
+# … change the code …
+httpmon --record after.ndjson npm test
+httpmon diff before.ndjson after.ndjson --ignore .updated_at
+```
+
+```
+~ #1→#1 GET api.example.com/items?ts=1794643091 → 200   response body: .items[0].price
+~ #2→#2 GET api.example.com/orders   (500 db_timeout ⇒ 200)
+~ #3→#3 GET api.example.com/search → 200   slower: 54ms ⇒ 543ms
++ #4 GET api.example.com/v2/cache → 204   (new)
+- #4 GET api.example.com/v1/cache → 200   (gone)
+── 2 changed, 1 new, 1 gone, 1 unchanged · 1 slower
+```
+
+- Exchanges are paired by method, path and the **names** of their query
+  parameters — not the values, which often hold timestamps — in the order they
+  happened.
+- Reported: exchanges only in one run (`+` / `-`), a changed outcome (status,
+  failure, gRPC status), a request or response body that differs — JSON by the
+  first differing path, with a count of the others — and exchanges at least
+  twice as slow and 200 ms slower. Timing alone does not count as a difference
+  (`--no-timing` hides it).
+- `--ignore .updated_at,.request_id` skips volatile fields; a path matches any
+  path ending in it.
+- Exit status: `0` no difference, `1` differences, `2` a record could not be
+  read. `--format json` writes one object per change and an `end` event.
 
 ### Replay — `httpmon replay`
 
@@ -401,6 +446,7 @@ the traffic of every device that trusts the CA.
 | `--format json` | one object per request and one per response | one object per exchange |
 | `--record` format | v2 | v3: the exchange object plus raw bytes |
 | 2.x / 1.x recordings | replayed | not read — replay them with httpmon 2.0 |
+| `go install` path | `…/v2@latest` | `…/v3@latest` (v3.1.0 and later) |
 | Failures in JSON | `"error": "<text>"` | `"error": {"kind", "message"}` |
 | Body text in text output | at the first column | prefixed with `│ ` |
 | Commands named `query`, `replay`, `ca`, `schema`, `help` | wrapped | need `httpmon -- <name>` |
@@ -416,7 +462,7 @@ the traffic of every device that trusts the CA.
 - **Cleartext HTTP/2 cannot be sent through `--upstream-proxy`.**
 - **A JVM that does not see `JAVA_TOOL_OPTIONS`** — for example a Gradle daemon already running before httpmon started — is not configured. Stop it first (`./gradlew --stop`).
 - **A HAR file from a run that was killed** lacks the closing `]}}`.
-- **Bodies are capped.** Output shows about `--max-body` bytes; records and decoding keep `--max-capture` bytes, buffered per request.
+- **Bodies are capped.** Output shows about `--max-body` bytes; records and decoding keep `--max-capture` bytes, buffered per request. The summary and JSON outputs keep only what they use: the summary only an error response's JSON, JSON output nothing of a binary body.
 - **Masking covers headers and URLs, not bodies.**
 
 ---
