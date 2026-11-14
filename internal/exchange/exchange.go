@@ -53,6 +53,10 @@ type Exchange struct {
 	// Hint is a short error description found in a 4xx/5xx body, for the
 	// summary line. It is not part of the record.
 	Hint string `json:"-"`
+
+	// Ref locates the exchange in the session it was read from, for
+	// reading it back in full. It is not part of the record.
+	Ref int `json:"-"`
 }
 
 // Message is one side of an exchange.

@@ -18,7 +18,6 @@ import (
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
@@ -204,12 +203,12 @@ Options:
 		fs.Usage()
 		return 1
 	}
-	path, err := session.Resolve(pos[0])
+	files, err := sessionFiles(pos[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon mock: %v\n", err)
 		return 1
 	}
-	rec, err := rules.LoadRecorded(path, !*matchHost)
+	rec, err := rules.LoadRecordedFiles(files, !*matchHost)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon mock: %v\n", err)
 		return 1

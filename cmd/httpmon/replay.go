@@ -12,7 +12,6 @@ import (
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
@@ -61,24 +60,29 @@ const (
 // Exit codes: 0 = clean, 1 = read/parse failure, 2 = differences found while
 // failOnDiff is set (so CI can gate on it).
 func replayFile(arg, targetBase string, delayBetween time.Duration, failOnDiff bool) int {
-	path, err := session.Resolve(arg)
+	files, err := sessionFiles(arg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon replay: %v\n", err)
 		return 1
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon replay: %v\n", err)
-		return 1
+	var readers []io.Reader
+	for _, p := range files {
+		f, err := os.Open(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon replay: %v\n", err)
+			return 1
+		}
+		defer f.Close()
+		readers = append(readers, f)
 	}
-	defer f.Close()
 
 	// The proxy's own client, so replay follows the same verification policy
 	// and upstream proxy: a recording from a self-signed host, or one taken
 	// behind an egress proxy, must still be replayable.
 	client := newUpstreamClient(insecureUpstream)
 
-	rd := exchange.NewReader(f)
+	// A session's segments are read oldest first, as one stream.
+	rd := exchange.NewReader(io.MultiReader(readers...))
 	n, errs, diffs, skipped := 0, 0, 0, 0
 	for {
 		e, err := rd.Next()

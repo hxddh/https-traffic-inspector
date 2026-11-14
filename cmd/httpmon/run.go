@@ -23,6 +23,7 @@ import (
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 )
 
 // listFlag collects a repeatable flag.
@@ -54,6 +55,7 @@ type captureOptions struct {
 	fault         listFlag
 	mapRules      listFlag
 	mockFrom      string
+	maxSession    string
 	cfg           config.Config
 }
 
@@ -74,6 +76,11 @@ func (o *captureOptions) register(fs *flag.FlagSet, cfg config.Config, proxyMode
 	fs.StringVar(&o.session, "session", defSession, "save exchanges to this named session (read them with: httpmon query NAME)")
 	fs.StringVar(&o.sessionDir, "session-dir", "", "save exchanges to a session in this directory")
 	fs.BoolVar(&o.appendSession, "append", false, "add to the session's earlier exchanges instead of replacing them")
+	defMax := "0"
+	if proxyMode {
+		defMax = "1GB"
+	}
+	fs.StringVar(&o.maxSession, "max-session-size", defMax, "keep the session under this size (e.g. 500MB, 2GB), dropping its oldest exchanges; 0 keeps everything")
 	fs.BoolVar(&o.insecure, "insecure-upstream", config.Bool(cfg.InsecureUpstream, false), "skip TLS certificate verification for upstream servers")
 	fs.StringVar(&o.upstream, "upstream-proxy", cfg.UpstreamProxy, "proxy for httpmon's own upstream requests (default: HTTP(S)_PROXY from the environment)")
 	fs.IntVar(&o.maxBody, "max-body", config.Int(cfg.MaxBody, 1000), "approximate max bytes of each body shown in output")
@@ -147,11 +154,11 @@ func (o *captureOptions) apply(name string) error {
 	}
 	activeRules = rs
 	if o.mockFrom != "" {
-		p, err := session.Resolve(o.mockFrom)
+		files, err := sessionFiles(o.mockFrom)
 		if err != nil {
 			return fmt.Errorf("--mock-from: %w", err)
 		}
-		if recordedMocks, err = rules.LoadRecorded(p, false); err != nil {
+		if recordedMocks, err = rules.LoadRecordedFiles(files, false); err != nil {
 			return fmt.Errorf("--mock-from: %w", err)
 		}
 	}
@@ -190,10 +197,26 @@ func (o *captureOptions) openSession(name string) error {
 	if err := session.Create(dir, o.appendSession); err != nil {
 		return fmt.Errorf("session %s: %w", dir, err)
 	}
-	if err := openRecordFile(filepath.Join(dir, session.ExchangesFile)); err != nil {
+	maxSize, err := parseByteSize(o.maxSession)
+	if err != nil {
+		return fmt.Errorf("--max-session-size: %w", err)
+	}
+	w, err := store.OpenWriter(dir, maxSize)
+	if err != nil {
 		return fmt.Errorf("session %s: %w", dir, err)
 	}
-	addCleanup(func() { recordFile.Close() }) //nolint:errcheck
+	recordWriter = w
+	addCleanup(func() {
+		recordMu.Lock()
+		w.Close() //nolint:errcheck
+		recordWriter = nil
+		recordMu.Unlock()
+	})
+	// Ids continue from an earlier run of the session (--append), so each
+	// names one exchange.
+	counterMu.Lock()
+	requestCounter = w.NextID() - 1
+	counterMu.Unlock()
 	recordMode = true
 	sessionPath = dir
 	if name == "" {
@@ -677,4 +700,24 @@ func clipText(s string, n int) string {
 		return string(r[:n]) + "…"
 	}
 	return s
+}
+
+// parseByteSize parses "0", "1048576", "512KB", "500MB" or "2GB".
+func parseByteSize(s string) (int64, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	mult := int64(1)
+	for _, u := range []struct {
+		suf string
+		m   int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(t, u.suf) {
+			mult, t = u.m, strings.TrimSuffix(t, u.suf)
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("bad size %q (e.g. 0, 500MB, 2GB)", s)
+	}
+	return n * mult, nil
 }

@@ -4,14 +4,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
+	"runtime/debug"
 	"strings"
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/config"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
 )
 
@@ -88,16 +88,15 @@ Options:
 	}
 	showSecrets = *show
 
-	before, err := readExchanges(pos[0])
+	// Two large sessions' light forms are the whole of what diff holds; a
+	// tighter collection target keeps the heap near that.
+	debug.SetGCPercent(30)
+	before, after, load, closeAll, err := readForDiff(pos[0], pos[1])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon diff: %v\n", err)
 		return exitDiffTrouble
 	}
-	after, err := readExchanges(pos[1])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon diff: %v\n", err)
-		return exitDiffTrouble
-	}
+	defer closeAll()
 	if _, err := out.open(os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon diff: %v\n", err)
 		return exitDiffTrouble
@@ -105,6 +104,7 @@ Options:
 
 	opt := exchange.DefaultDiffOptions
 	opt.Ignore = ignore
+	opt.Load = load
 	if *noTiming {
 		opt.SlowerFactor = 0
 	}
@@ -131,34 +131,64 @@ Options:
 	return exitDiffSame
 }
 
-// readExchanges reads a whole record, recovering each error response's hint
-// from its raw bytes: the hint is not stored, and an outcome such as
-// "500 db_timeout" is more telling than "500".
-func readExchanges(arg string) ([]*exchange.Exchange, error) {
-	path, err := session.Resolve(arg)
+// readForDiff reads two sessions in their light form (exchange.Slim) and
+// returns how to load an exchange back in full: a diff of large sessions
+// then holds little more than their summaries.
+func readForDiff(a, b string) (before, after []*exchange.Exchange, load func(*exchange.Exchange) (*exchange.Exchange, error), closeAll func(), err error) {
+	sa, err := openStore(a)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	sb, err := openStore(b)
+	if err != nil {
+		sa.Close()
+		return nil, nil, nil, nil, err
+	}
+	sa.Lean()
+	sb.Lean()
+	stores := []*store.Store{sa, sb}
+	closeAll = func() { sa.Close(); sb.Close() }
+	read := func(which int) ([]*exchange.Exchange, error) {
+		st := stores[which]
+		out := make([]*exchange.Exchange, 0, len(st.Entries))
+		for i, en := range st.Entries {
+			e, err := readWithHint(st, en)
+			if err != nil {
+				return nil, err
+			}
+			e.Ref = i*2 + which
+			exchange.Slim(e)
+			e.Session = intern(e.Session)
+			out = append(out, e)
+		}
+		return out, nil
+	}
+	if before, err = read(0); err == nil {
+		after, err = read(1)
+	}
+	if err != nil {
+		closeAll()
+		return nil, nil, nil, nil, err
+	}
+	load = func(e *exchange.Exchange) (*exchange.Exchange, error) {
+		st := stores[e.Ref%2]
+		return readWithHint(st, st.Entries[e.Ref/2])
+	}
+	return before, after, load, closeAll, nil
+}
+
+// readWithHint reads one exchange, recovering its error response's hint:
+// the hint is not stored, and an outcome such as "500 db_timeout" is more
+// telling than "500".
+func readWithHint(st *store.Store, en store.Entry) (*exchange.Exchange, error) {
+	e, err := st.Read(en)
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+	if e.Status >= 400 && e.Response != nil {
+		e.Hint = hintOf(e.Response)
 	}
-	defer f.Close()
-	var out []*exchange.Exchange
-	rd := exchange.NewReader(f)
-	for {
-		e, err := rd.Next()
-		if errors.Is(err, io.EOF) {
-			return out, nil
-		}
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
-		}
-		if e.Status >= 400 && e.Response != nil {
-			e.Hint = hintOf(e.Response)
-		}
-		out = append(out, e)
-	}
+	return e, nil
 }
 
 func hintOf(m *exchange.Message) string {
@@ -178,4 +208,15 @@ func hintOf(m *exchange.Message) string {
 		return body.ErrorHint(b.JSON)
 	}
 	return ""
+}
+
+var interned = map[string]string{}
+
+// intern shares one copy of a string repeated across a session's exchanges.
+func intern(s string) string {
+	if v, ok := interned[s]; ok {
+		return v
+	}
+	interned[s] = s
+	return s
 }

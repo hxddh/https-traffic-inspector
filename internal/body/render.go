@@ -27,6 +27,10 @@ type Rendered struct {
 	Truncated bool `json:"truncated,omitempty"`
 
 	Raw *Raw `json:"raw,omitempty"`
+
+	// Digest identifies the content of a body reduced to it for comparison
+	// (exchange.Slim). It is never written.
+	Digest string `json:"-"`
 }
 
 // Raw is a body's wire bytes: UTF-8 text verbatim, anything else base64.

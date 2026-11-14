@@ -307,10 +307,11 @@ func mcpListSessions(map[string]any) (string, error) {
 }
 
 func mcpQuery(a map[string]any) (string, error) {
-	list, err := readExchanges(argString(a, "session"))
+	st, err := openStore(argString(a, "session"))
 	if err != nil {
 		return "", err
 	}
+	defer st.Close()
 	var q queryFilter
 	q.method, q.url = argString(a, "method"), argString(a, "url")
 	if s := argString(a, "status"); s != "" {
@@ -330,13 +331,19 @@ func mcpQuery(a map[string]any) (string, error) {
 	limit := argInt(a, "limit", 200)
 	var lines []string
 	var d exchange.Digest
-	for _, e := range list {
-		if !q.match(e) {
-			continue
-		}
-		e.URL = displayURL(e.URL)
+	add := func(line string, e *exchange.Exchange) {
 		d.Add(e)
-		lines = append(lines, textsafe.Line(e.SummaryLine()))
+		lines = append(lines, textsafe.Line(line))
+	}
+	err = eachMatching(st, &q, q.grep == nil && !showSecrets, add, func(e *exchange.Exchange) bool {
+		if q.match(e) {
+			prepareForDisplay(e)
+			add(e.SummaryLine(), e)
+		}
+		return true
+	})
+	if err != nil {
+		return "", err
 	}
 	skipped := 0
 	if limit > 0 && len(lines) > limit {
@@ -354,18 +361,21 @@ func mcpQuery(a map[string]any) (string, error) {
 	return b.String(), nil
 }
 
+// findExchange reads one exchange through the session's index.
 func findExchange(a map[string]any) (*exchange.Exchange, error) {
 	id := argInt(a, "id", 0)
-	list, err := readExchanges(argString(a, "session"))
+	st, err := openStoreOnly(argString(a, "session"), func(n int) bool { return n == id })
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range list {
-		if e.ID == id {
-			return e, nil
-		}
+	defer st.Close()
+	found := st.Find(id)
+	if len(found) == 0 {
+		return nil, fmt.Errorf("no exchange #%d", id)
 	}
-	return nil, fmt.Errorf("no exchange #%d", id)
+	// An older session written with --append can repeat an id: the most
+	// recent run's exchange is the one meant.
+	return readWithHint(st, found[len(found)-1])
 }
 
 func mcpGetExchange(a map[string]any) (string, error) {
@@ -430,15 +440,14 @@ func mcpInFlight(a map[string]any) (string, error) {
 }
 
 func mcpDiff(a map[string]any) (string, error) {
-	before, err := readExchanges(argString(a, "before"))
+	before, after, load, closeAll, err := readForDiff(argString(a, "before"), argString(a, "after"))
 	if err != nil {
 		return "", err
 	}
-	after, err := readExchanges(argString(a, "after"))
-	if err != nil {
-		return "", err
-	}
-	changes, counts := exchange.Diff(before, after, exchange.DefaultDiffOptions)
+	defer closeAll()
+	opt := exchange.DefaultDiffOptions
+	opt.Load = load
+	changes, counts := exchange.Diff(before, after, opt)
 	var b strings.Builder
 	for _, c := range changes {
 		c.URL = displayURL(c.URL)

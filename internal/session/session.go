@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
 )
 
 // File names inside a session directory.
@@ -124,10 +125,11 @@ func Create(dir string, keep bool) error {
 		return err
 	}
 	if !keep {
-		for _, f := range []string{ExchangesFile, LiveFile} {
-			if err := os.Remove(filepath.Join(dir, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
+		if err := store.RemoveAll(dir); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(dir, LiveFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
 	}
 	return nil
@@ -144,6 +146,9 @@ type Meta struct {
 	PID      int       `json:"pid"`
 	Started  time.Time `json:"started"`
 	Ended    time.Time `json:"ended,omitzero"`
+	// Dropped counts the oldest segments removed to keep the session under
+	// its size limit: its earliest exchanges are gone.
+	Dropped int `json:"dropped_segments,omitempty"`
 	Version  string    `json:"httpmon_version"`
 }
 
