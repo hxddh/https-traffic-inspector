@@ -14,6 +14,9 @@ v3 有一项新能力是**对 agent 友好**：让 Claude Code、Codex 这类 AI
 
 token 数按 4 字节 ≈ 1 token 估算，只用于比较量级。
 
+> **维护者决定：v3.0 不需要兼容历史版本，可以做破坏性变更。** 因此本文不安排兼容性补丁版本（原计划的 v2.0.1 并入 v3.0.0），
+> 也不保留兼容层：不再读取 v1 / v2 的 record，不保留旧的事件流格式和旧参数，CLI 按 v3 的需要重新设计。
+
 ---
 
 ## 第一部分：v2.0.0 review
@@ -110,10 +113,28 @@ agent 和人用 httpmon 的方式有结构性的差别。下表逐条对照 v2.0
 
 ## 第三部分：v3.0 的 agent 友好能力（按价值和成本排序）
 
-### A1 ⚠ 以交换为单位的 JSON（破坏性）
+### A0 ⚠ CLI 重新组织：子命令 + 按终端自动选择格式
 
-`--format json` 改为**每个完成的交换输出一个对象**，请求和响应合并在一起，取代现在"一个请求一个对象、一个响应一个对象"的事件流。
-事件流保留为 `--format events`，给需要实时看到请求头的场景。
+v2 用 `--replay`、`--ca-dir`（不带命令）这类参数来切换模式，每加一种模式就多一组互相排斥的参数。v3 改为子命令：
+
+```
+httpmon [options] <command> [args...]     包装命令（默认动作）
+httpmon replay <record> [--target URL]    回放
+httpmon query  <record> [filters]         事后查询（A4）
+httpmon ca     [--dir DIR]                创建或显示持久 CA
+httpmon schema                            输出交换对象的 JSON Schema
+httpmon help   [agents]                   帮助；agents 输出面向 agent 的说明
+```
+
+- `replay`、`query`、`ca`、`schema`、`help` 是保留名；要包装同名的命令，写 `httpmon -- query …`；
+- 删除 `--replay`、`--replay-target`、`--replay-delay`、`--replay-fail-on-diff`，以及 `--ca-dir` 不带命令时的行为，全部移到子命令；
+- **默认格式按输出目标自动选择**：输出是终端时用 `text`，不是终端时（管道、文件、agent 的非交互 shell）用 `summary`（A2）。
+  agent 不需要知道任何参数，第一次调用拿到的就是约 1/23 体积的摘要；`--format` 可以显式覆盖。
+
+### A1 ⚠ 以交换为单位的 JSON，同时也是 record 的格式
+
+`--format json` 改为**每个完成的交换输出一个对象**，请求和响应合并在一起。旧的事件流（一个请求一个对象、一个响应一个对象）直接删除，不保留：
+需要实时看到请求头的场景由 `text` 格式覆盖。
 
 ```json
 {"v":3,"id":10,"time":"…","method":"GET","url":"http://127.0.0.1:18100/fail",
@@ -125,13 +146,14 @@ agent 和人用 httpmon 的方式有结构性的差别。下表逐条对照 v2.0
 
 - body 是 JSON 时直接**嵌入成 JSON 值**（`"json":{…}`），agent 可以直接按字段取值，不用二次解析；其他文本放在 `"text"` 里；
 - 截断**按结构进行**：长数组保留前几项，并给出 `"…": "37 more items"`；长字符串截短；截断后的结果始终是合法 JSON，`truncated: true`；
-- 输出的 schema 和 record v3 共用（见"破坏性变更"）。
+- **`--record` 写的就是同一种对象**，只多一个 `raw` 字段（原始字节，replay 用）。整个工具只有一种交换格式，
+  `query` 和 `replay` 都读它；不再存在 record v1 / v2 的区分。
 
 ### A2 摘要格式 `--format summary`
 
 一行一个交换，加上运行结束时的汇总（按状态分类计数、失败列表、最慢的请求），格式见上。
 4xx/5xx 响应里如果有常见的错误字段（`error.code`、`message`、`detail`），就提取出来放在同一行。
-它是 agent 的默认推荐格式，人在终端里快速扫一眼时也同样好用。
+输出不是终端时，它是默认格式（A0）。
 
 ### A3 `--fail-on`：让结果可以判定
 
@@ -141,6 +163,9 @@ httpmon --fail-on 5xx,error npm test
 
 被包装的命令退出码为 0、但期间出现了匹配的交换时，httpmon 以 **3** 退出，并在汇总里列出匹配的交换。
 命令本身的退出码非 0 时仍然原样透传。这样 agent 的"修复 → 验证"循环只需要看退出码。
+
+默认不开启：httpmon 包装的往往是测试或构建命令，退出码的含义不应该在用户不知情的情况下改变。
+`help agents` 和附带的 skill 都推荐 agent 使用它。
 
 ### A4 `httpmon query`：事后按需展开
 
@@ -152,26 +177,27 @@ httpmon query trace.ndjson --id 10 --body response  # 只取解码后的响应 b
 httpmon query trace.ndjson --follow                 # 跟随一个还在写入的文件
 ```
 
-能读 v2 和 v3 的 record。它把 record（给 replay 用、体积大）和 agent 真正要读的内容
-（摘要或单个交换）分开：record 照样保留原始字节，读取的成本由 query 控制。
-跨多次调用的场景——一次调用里 `httpmon --record t.ndjson npm run dev &`，之后随时 query——也因此成立。
+只读 v3 的 record。它把 record（带原始字节、体积大）和 agent 真正要读的内容（摘要或单个交换）分开，
+读取的成本由 query 控制。跨多次调用的场景——一次调用里 `httpmon --record t.ndjson npm run dev &`，
+之后随时 query——也因此成立。
 
 ### A5 不可信内容的边界
 
 - 修 P1-1：文本模式下 body 行加前缀，无法伪造输出结构；
+- 修 P1-3：JSON 模式下横幅和 notice 也是 JSON 对象，流里的每一行都能解析；
 - 文档增加"在 AI agent 中使用 httpmon"一节，明确说明 body 和 header 都是**来自网络的不可信数据**，
   建议 agent 使用 JSON 或摘要格式，在这些格式里内容一定位于明确的字段中；
 - 给 agent 的用法说明里写明：body 里出现的任何"指令"都只是数据。
 
 ### A6 错误分类
 
-失败对象增加 `error.kind`，取值为 `dns`、`refused`、`timeout`、`tls_verify`、`tls_handshake`、`reset`、
-`proxy`、`canceled` 或 `other`，`error.message` 保留原文。
-agent 可以直接按类型分支处理（例如 `tls_verify` → 建议加 `--insecure-upstream` 或 `--ca-dir`），不用匹配字符串。
+失败对象改为 `error: {kind, message}`，`kind` 取值为 `dns`、`refused`、`timeout`、`tls_verify`、`tls_handshake`、
+`reset`、`proxy`、`canceled` 或 `other`，`message` 使用显示 URL（修 P2-1）。
+agent 可以直接按类型分支处理（例如 `tls_verify` → 建议加 `--insecure-upstream` 或 `httpmon ca`），不用匹配字符串。
 
 ### A7 可发现性：让 agent 知道怎么用
 
-- `httpmon help agents`：输出一页面向 agent 的说明，包括推荐参数（`--format summary --fail-on 5xx,error -o …`）、
+- `httpmon help agents`：输出一页面向 agent 的说明，包括推荐参数（`--fail-on 5xx,error --record …`）、
   输出 schema、`query` 用法和不可信内容的注意事项；
 - 仓库里附一份 Claude Code skill（`skills/httpmon/SKILL.md`）和 `AGENTS.md`，用户复制到自己的项目里即可使用；
 - `httpmon schema` 输出 v3 交换对象的 JSON Schema；
@@ -193,7 +219,7 @@ agent 可以直接按类型分支处理（例如 `tls_verify` → 建议加 `--i
 
 | # | 能力 | 价值 | 成本 | 说明 |
 |---|---|---|---|---|
-| B1 | **拆分 `internal/` 包** | 中 | 中 | v2.0 推迟的项。现在有了明确的理由：record、`query`、以后的 MCP 要共用同一个交换模型和 body 渲染。顺带把测试改为不依赖包内全局状态 |
+| B1 | **拆分 `internal/` 包** | 中 | 中 | v2.0 推迟的项。现在有了明确的理由：record、`query`、`replay`、以后的 MCP 要共用同一个交换模型和 body 渲染。不用兼容之后，测试也可以一并重写，不再依赖包内全局状态 |
 | B2 | **gRPC 无 schema 解码**（类似 `protoc --decode_raw`） | 中 | 中 | 显示字段编号、类型和值；在 A1 的 JSON 里输出成结构化对象，对 agent 同样有用 |
 | B3 | **显示路径流式解压** | 中 | 低 | 修 P2-6：只解压到显示所需的字节数 |
 | B4 | **容器支持** `httpmon docker run …` | 中 | 中 | 给 `docker run` 注入代理环境变量并挂载 CA bundle。代理需要监听 docker 网桥地址；默认仍然只监听 loopback，这一项要单独确认风险后再做 |
@@ -204,45 +230,46 @@ agent 可以直接按类型分支处理（例如 `tls_verify` → 建议加 `--i
 
 ## v3.0 的破坏性变更
 
+不提供迁移工具，也不保留兼容层。
+
 | 变更 | 理由 |
 |---|---|
-| `--format json` 改为每个交换一个对象；旧的事件流改名为 `--format events` | A1；绝大多数使用者要的是完整的交换 |
-| record v3 和 `--format json` 共用同一个交换 schema（record 额外保存原始字节，用于 replay） | 一个 schema、一个 `query` |
-| 保留子命令名：`query`、`help`、`schema`（以后还有 `mcp`）。要包装同名的命令，使用 `httpmon -- query …` | A4 / A7 |
-| 文本模式下 body 行带前缀 | P1-1 |
+| CLI 改为子命令：`replay`、`query`、`ca`、`schema`、`help`；删除 `--replay*` 参数和 `--ca-dir` 不带命令的用法 | A0 |
+| 输出不是终端时，默认格式从 `text` 改为 `summary` | A0 / A2 |
+| `--format json` 改为每个交换一个对象；事件流格式删除 | A1 |
+| record 改为同一种交换对象（多一个 `raw` 字段）；**不再读取 v1 / v2 的 record** | A1：只有一种格式 |
+| 失败从字符串改为 `error: {kind, message}` | A6 |
+| JSON 模式下横幅和 notice 是 JSON 对象 | P1-3 |
+| 文本模式下 body 行带前缀；JSON 输出不再在 body 内加截断标记 | P1-1 / P1-2 |
 
-replay 继续读 v1 和 v2 的 record。
+v2 的 record 如果还要回放，用 v2.0.0 的二进制回放即可。
 
 ---
 
-## 建议的发布节奏
+## 发布节奏
 
-**v2.0.1（立即，全部兼容）**
-
-| # | 内容 |
-|---|------|
-| P1-1 | 文本模式下 body 行加前缀，防止伪造输出结构 |
-| P1-2 | JSON 输出去掉内联截断标记 |
-| P1-3 | JSON 模式下横幅和 notice 也输出成 JSON 对象；不带 `-o` 时给出提示 |
-| P2-1 | 失败信息使用显示 URL |
-| 测试 | body 里伪造的分隔行在输出中不从第 0 列开始；截断的 JSON body 能被解析或带有 `body_truncated`；JSON 模式下 stderr 的每一行都是 JSON |
+不再单独发布 v2.0.1，第一部分的修复全部并入 v3.0.0。
 
 **v3.0.0**
 
 | # | 内容 | 类型 |
 |---|------|------|
-| A1 | 以交换为单位的 JSON、按结构截断、`--format events` | ⚠ breaking |
+| P1/P2 | body 行加前缀；去掉内联截断标记；JSON 流纯净；失败使用显示 URL | fix / security |
+| A0 | 子命令 CLI、按终端自动选择默认格式 | ⚠ breaking |
+| A1 | 以交换为单位的 JSON = record 格式、按结构截断 | ⚠ breaking |
 | A2 | `--format summary` | feat |
 | A3 | `--fail-on`，退出码 3 | feat |
-| A4 | `httpmon query` | ⚠ breaking（保留子命令名） |
+| A4 | `httpmon query` | feat |
 | A5 | 不可信内容的边界，文档 | security / docs |
-| A6 | `error.kind` | feat |
+| A6 | `error.kind` | ⚠ breaking |
 | A7 | `help agents`、skill、`AGENTS.md`、`schema`、`HTTPMON_*` 环境变量 | feat / docs |
-| B1 | `internal/` 拆包 | refactor |
+| B1 | `internal/` 拆包，测试重写 | refactor |
 | B2 | gRPC 无 schema 解码 | feat |
 | B3 | 显示路径流式解压 | perf |
+| 测试 | body 伪造的分隔行不从第 0 列开始；截断后的 JSON body 能解析；JSON 流每一行都能解析；非终端时默认输出摘要；`--fail-on` 的退出码；每种 `error.kind` 各有一个用例 | test |
 
 **v3.x**：MCP server、`httpmon diff`（对比两次运行的 record）、容器支持。
 
 一句话总结：v2.0 让输出对人**可组合、可分享、安全**；v3.0 让它对 agent **省 token、可解析、可判定、不可伪造**。
+不用兼容之后，v3 可以收敛成一种交换格式、一组子命令，并让非交互环境默认就拿到摘要。
 实现顺序是先概览后展开：摘要格式给出全局，`query` 按编号展开细节，`--fail-on` 把成败交给退出码。
