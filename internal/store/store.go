@@ -231,6 +231,11 @@ func loadSegment(sg *segment, persist bool, want func(int) bool, maxID *int) ([]
 	}
 	if sg.index != "" {
 		if b, err := os.ReadFile(sg.index); err == nil {
+			// A last line without its newline was torn mid-write: leave it
+			// out, and index its record again from the segment.
+			if i := bytes.LastIndexByte(b, '\n'); i < len(b)-1 {
+				b = b[:i+1]
+			}
 			for _, line := range bytes.Split(b, []byte{'\n'}) {
 				if len(bytes.TrimSpace(line)) == 0 {
 					continue
@@ -691,4 +696,36 @@ func parseEntry(line []byte) (Entry, bool) {
 		ID: id, Off: off, Len: n, Method: unescape(f[3]), Status: status, ErrKind: unescape(f[5]),
 		WS: len(f[6]) > 0, DurMs: dur, Rule: unescape(f[8]), Time: unescape(f[9]), URL: unescape(f[10]), Summary: unescape(f[11]),
 	}, true
+}
+
+// Stats summarises a session directory for listing.
+type Stats struct {
+	Count int    // exchanges kept
+	Bytes int64  // size of all segments
+	First string // time of the first exchange kept
+	Last  string // time of the last
+}
+
+// StatDir reads a session directory's indexes.
+func StatDir(dir string) (Stats, error) {
+	var st Stats
+	segs, err := Segments(dir)
+	if err != nil {
+		return st, err
+	}
+	for _, p := range segs {
+		if fi, err := os.Stat(p); err == nil {
+			st.Bytes += fi.Size()
+		}
+	}
+	s, err := Open(dir, false)
+	if err != nil {
+		return st, err
+	}
+	defer s.Close()
+	st.Count = len(s.Entries)
+	if st.Count > 0 {
+		st.First, st.Last = s.Entries[0].Time, s.Entries[st.Count-1].Time
+	}
+	return st, nil
 }

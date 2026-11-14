@@ -35,6 +35,8 @@ func subcommand(name string) func([]string) int {
 		return cmdSessions
 	case "mcp":
 		return cmdMCP
+	case "ui":
+		return cmdUI
 	}
 	return nil
 }

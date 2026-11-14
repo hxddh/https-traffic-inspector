@@ -50,6 +50,8 @@ type tuiEntry struct {
 	failed   string // the error, when the exchange got no response
 	grpcLine string
 
+	rule string // the rules that touched it: "mock: …; fault: …"
+
 	ws       bool     // an upgraded WebSocket connection
 	wsLines  []string // most recent messages, rendered
 	wsCount  int
@@ -104,6 +106,11 @@ type tuiWSClosedMsg struct {
 	summary string
 }
 type tuiNoticeMsg struct{ text string }
+type tuiRuleMsg struct {
+	reqID int
+	rule  string
+}
+type tuiFlashMsg struct{ text string }
 
 // tuiQueue carries proxy events to the TUI. It is unbounded: proxy
 // goroutines must never block on the display, and a fixed-size channel with a
@@ -322,7 +329,7 @@ func (m *tuiModel) visible() []*tuiEntry {
 // of its method, URL, status or error.
 func (m *tuiModel) matches(e *tuiEntry) bool {
 	q := strings.ToLower(m.filter)
-	hay := strings.ToLower(fmt.Sprintf("%s %s %d %s", e.method, e.rawURL, e.status, e.failed))
+	hay := strings.ToLower(fmt.Sprintf("%s %s %d %s %s", e.method, e.rawURL, e.status, e.failed, ruleTags(e.rule)))
 	return strings.Contains(hay, q)
 }
 
@@ -395,6 +402,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "e":
 			m.exportSelected()
+			return m, nil
+		case "r":
+			m.replaySelected()
 			return m, nil
 		}
 		// Keys the list does not use (pgup/pgdn, ctrl+u/ctrl+d, home/end)
@@ -480,6 +490,17 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			e.wsClosed = msg.summary
 		}
 		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiRuleMsg:
+		if e := m.byID[msg.reqID]; e != nil {
+			e.rule = msg.rule
+		}
+		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiFlashMsg:
+		m.flash = msg.text
 		return m, listenTUI()
 
 	case tuiNoticeMsg:
@@ -710,6 +731,9 @@ func renderEntryDetail(e *tuiEntry, color bool) string {
 			fmt.Fprintf(&b, "  %s: %s\n", textsafe.Line(k), textsafe.Line(h[k]))
 		}
 	}
+	if e.rule != "" {
+		fmt.Fprintf(&b, "Rule: %s\n", textsafe.Line(e.rule))
+	}
 	writeMap("Request Headers", e.reqHeaders)
 	if e.reqBody != "" {
 		b.WriteString("\nRequest Body:\n" + textsafe.Terminal(e.reqBody) + "\n")
@@ -783,6 +807,9 @@ func (m tuiModel) View() string {
 
 	// ── Header bar
 	title := fmt.Sprintf("httpmon  proxy :%s", proxyPort)
+	if tuiTitle != "" {
+		title = tuiTitle
+	}
 	if filterPattern != "" {
 		title += fmt.Sprintf("  filter:%q", textsafe.Line(filterPattern))
 	}
@@ -832,6 +859,9 @@ func (m tuiModel) View() string {
 			statusStr = fmt.Sprintf("%d", e.status)
 			durStr = e.duration.Round(time.Millisecond).String()
 		}
+		if t := ruleTags(e.rule); t != "" {
+			durStr += " " + t
+		}
 		urlStr := truncateDisplay(textsafe.Line(e.host+e.path), urlW)
 		pad := urlW - lipgloss.Width(urlStr)
 		if pad < 0 {
@@ -869,7 +899,10 @@ func (m tuiModel) View() string {
 	}
 
 	// ── Status bar
-	hint := " [↑↓/jk] move  [enter] detail  [/] search  [c] copy curl  [e] export  [q] quit"
+	hint := " [↑↓/jk] move  [enter] detail  [/] search  [c] copy curl  [e] export  [r] replay  [q] quit"
+	if tuiReadOnly {
+		hint = " [↑↓/jk] move  [enter] detail  [/] search  [c] copy curl  [e] export  [q] quit"
+	}
 	if m.showDetail {
 		hint = " [↑↓/jk] move  [pgup/pgdn] scroll  [/] search  [c] copy curl  [esc] close  [q] quit"
 		if !m.vp.AtBottom() {

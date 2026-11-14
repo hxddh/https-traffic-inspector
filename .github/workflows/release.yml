@@ -37,6 +37,10 @@ jobs:
             goarch: amd64
             os_name: windows
             suffix: ".exe"
+          - goos: windows
+            goarch: arm64
+            os_name: windows
+            suffix: ".exe"
 
     steps:
       - uses: actions/checkout@v4
