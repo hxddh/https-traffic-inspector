@@ -706,6 +706,14 @@ func followFrom(dir, path string, offset int64, stop <-chan os.Signal, deadline 
 				if serr == nil && ferr == nil && (!os.SameFile(cur, old) || cur.Size() < pos) {
 					if os.SameFile(cur, old) || !store.IsSegmentOf(dir, old) {
 						fmt.Fprintln(os.Stderr, "── session started again")
+					} else {
+						// Rotated, perhaps more than once since the last
+						// look: read the segments written in between.
+						for _, seg := range store.SegmentsAfter(dir, old) {
+							if done, err := readWhole(seg, fn); err != nil || done {
+								return false, err
+							}
+						}
 					}
 					nf, err := os.Open(path)
 					if err != nil {
@@ -750,4 +758,29 @@ func sessionFiles(arg string) ([]string, error) {
 		return []string{path}, err
 	}
 	return store.Segments(filepath.Dir(path))
+}
+
+// readWhole gives fn each exchange in a file, reporting whether fn stopped.
+func readWhole(path string, fn func(*exchange.Exchange) bool) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, nil // removed meanwhile: nothing to read
+	}
+	defer f.Close()
+	rd := exchange.NewReader(f)
+	for {
+		e, err := rd.Next()
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			if strings.HasPrefix(err.Error(), "line ") {
+				continue // one bad line
+			}
+			return false, err
+		}
+		if !fn(e) {
+			return true, nil
+		}
+	}
 }

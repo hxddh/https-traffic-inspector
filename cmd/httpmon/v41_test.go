@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -281,5 +283,64 @@ func TestTUIEntryFromRecord(t *testing.T) {
 	m.filter = "[fault]"
 	if !m.matches(en) {
 		t.Error("search by rule tag does not match")
+	}
+}
+
+// Regression: rotating twice between two looks skipped the segment written
+// in between.
+func TestFollow_AcrossTwoRotations(t *testing.T) {
+	dir := t.TempDir()
+	cur := filepath.Join(dir, store.Current)
+	line := func(id int) string {
+		b, _ := json.Marshal(&exchange.Exchange{V: exchange.Version, ID: id, Method: "GET", URL: "http://h/" + strconv.Itoa(id)})
+		return string(b) + "\n"
+	}
+	os.WriteFile(cur, []byte(line(1)), 0o600) //nolint:errcheck
+	fi, _ := os.Stat(cur)
+	var got []int
+	done := make(chan struct{})
+	go func() {
+		followFrom(dir, cur, fi.Size(), nil, time.After(5*time.Second), func(e *exchange.Exchange) bool { //nolint:errcheck
+			got = append(got, e.ID)
+			return e.ID < 3
+		})
+		close(done)
+	}()
+	time.Sleep(300 * time.Millisecond)
+	// Two rotations before the follower looks again.
+	os.Rename(cur, filepath.Join(dir, "exchanges.000001.ndjson"))                       //nolint:errcheck
+	os.WriteFile(filepath.Join(dir, "exchanges.000002.ndjson"), []byte(line(2)), 0o600) //nolint:errcheck
+	os.WriteFile(cur, []byte(line(3)), 0o600)                                           //nolint:errcheck
+	<-done
+	if fmt.Sprint(got) != "[2 3]" {
+		t.Errorf("followed %v, want [2 3]", got)
+	}
+}
+
+// Regression: a rejected --max-session-size discarded the previous run's
+// exchanges first.
+func TestOpenSession_BadSizeKeepsExchanges(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	session.Create(dir, false) //nolint:errcheck
+	ex := filepath.Join(dir, store.Current)
+	os.WriteFile(ex, []byte("{}\n"), 0o600) //nolint:errcheck
+	o := &captureOptions{sessionDir: dir, maxSession: "lots"}
+	if err := o.openSession("s"); err == nil {
+		t.Fatal("a bad size was accepted")
+	}
+	if _, err := os.Stat(ex); err != nil {
+		t.Error("the previous exchanges were removed")
+	}
+}
+
+// Regression: the UI list showed a URL's query credentials unmasked.
+func TestTUIEntry_MasksQueryCredentials(t *testing.T) {
+	en := tuiEntryFrom(&exchange.Exchange{V: exchange.Version, ID: 1, Method: "GET",
+		URL: "https://api.example.com/x?access_token=supersecretvalue", Status: 200, Response: &exchange.Message{}})
+	if strings.Contains(en.path, "supersecret") || strings.Contains(en.rawURL, "supersecret") {
+		t.Errorf("shown: %s %s", en.path, en.rawURL)
+	}
+	if !strings.Contains(en.curlURL, "supersecret") {
+		t.Error("replay lost the real URL")
 	}
 }

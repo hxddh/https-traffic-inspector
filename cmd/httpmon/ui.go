@@ -146,9 +146,6 @@ func tuiEntryFrom(e *exchange.Exchange) *tuiEntry {
 		curlURL: e.URL, rawReqHeaders: e.Request.Headers.HTTP(),
 		duration: time.Duration(e.DurationMs * float64(time.Millisecond)),
 	}
-	if u, err := url.Parse(e.URL); err == nil {
-		en.host, en.path = u.Host, u.RequestURI()
-	}
 	if e.Redacted {
 		// Its credentials are masked: replay would send the masks.
 		en.rawReqHeaders = nil
@@ -160,6 +157,11 @@ func tuiEntryFrom(e *exchange.Exchange) *tuiEntry {
 	}
 	prepareForDisplay(e)
 	en.rawURL = e.URL
+	// The list shows host and path: take them from the masked URL, so a
+	// token in the query is not shown. The real URL stays in curlURL.
+	if u, err := url.Parse(e.URL); err == nil {
+		en.host, en.path = u.Host, u.RequestURI()
+	}
 	en.reqHeaders = flattenHeaders(e.Request.Headers.HTTP())
 	en.reqBody = renderedText(e.Request.Body)
 	switch {

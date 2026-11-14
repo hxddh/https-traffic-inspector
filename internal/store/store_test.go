@@ -150,3 +150,29 @@ func TestIndexLineEscaping(t *testing.T) {
 		t.Error("a short line parsed")
 	}
 }
+
+// Regression: a file whose last record had no newline lost that record.
+func TestScan_LastRecordWithoutNewline(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x.ndjson")
+	os.WriteFile(p, []byte(`{"v":3,"id":1,"method":"GET","url":"u1","time":"t","kind":"http","request":{"headers":{}}}`+"\n"+ //nolint:errcheck
+		`{"v":3,"id":2,"method":"GET","url":"u2","time":"t","kind":"http","request":{"headers":{}}}`), 0o600)
+	s, err := Open(p, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if len(s.Entries) != 2 {
+		t.Fatalf("%d entries, want 2", len(s.Entries))
+	}
+	if e, err := s.Read(s.Entries[1]); err != nil || e.URL != "u2" {
+		t.Errorf("read %v, %v", e, err)
+	}
+	// A record still being written (no newline, not yet whole) waits.
+	q := filepath.Join(t.TempDir(), "y.ndjson")
+	os.WriteFile(q, []byte(`{"v":3,"id":1,"method":"GET","url":"u1","time":"t","kind":"http","request":{"headers":{}}}`+"\n"+`{"v":3,"id":2,"meth`), 0o600) //nolint:errcheck
+	s2, _ := Open(q, false)
+	defer s2.Close()
+	if len(s2.Entries) != 1 {
+		t.Errorf("a partial record was indexed: %d entries", len(s2.Entries))
+	}
+}

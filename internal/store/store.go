@@ -291,11 +291,17 @@ func scan(f *os.File, from, to int64) ([]Entry, error) {
 	off := from
 	for {
 		line, err := r.ReadBytes('\n')
-		if len(line) > 0 && line[len(line)-1] == '\n' {
+		complete := len(line) > 0 && line[len(line)-1] == '\n'
+		// A last line without its newline is indexed when it is a whole
+		// record -- a file written without one -- and left for later when
+		// it is a record still being written, which does not parse.
+		if len(line) > 0 && (complete || errors.Is(err, io.EOF)) {
 			if t := bytes.TrimSpace(line); len(t) > 0 {
 				var e exchange.Exchange
 				if json.Unmarshal(t, &e) == nil && e.V == exchange.Version {
 					out = append(out, entryOf(&e, off, len(line)))
+				} else if !complete {
+					return out, nil
 				}
 			}
 			off += int64(len(line))
@@ -745,4 +751,26 @@ func StatDir(dir string) (Stats, error) {
 		st.First, st.Last = s.Entries[0].Time, s.Entries[st.Count-1].Time
 	}
 	return st, nil
+}
+
+// SegmentsAfter lists the rotated segments written after the one fi is,
+// oldest first: what a follower of the current segment must read before the
+// new current one when it finds the session rotated.
+func SegmentsAfter(dir string, fi os.FileInfo) []string {
+	segs, _ := Segments(dir)
+	var out []string
+	found := false
+	for _, p := range segs {
+		if filepath.Base(p) == Current {
+			break
+		}
+		if found {
+			out = append(out, p)
+			continue
+		}
+		if si, err := os.Stat(p); err == nil && os.SameFile(si, fi) {
+			found = true
+		}
+	}
+	return out
 }

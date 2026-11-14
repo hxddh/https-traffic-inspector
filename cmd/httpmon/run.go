@@ -198,12 +198,14 @@ func (o *captureOptions) openSession(name string) error {
 	if session.ReadJSON(dir, session.MetaFile, &m) == nil && m.Running() && m.PID != os.Getpid() {
 		return fmt.Errorf("session %s is in use by process %d; choose another with --session", dir, m.PID)
 	}
-	if err := session.Create(dir, o.appendSession); err != nil {
-		return fmt.Errorf("session %s: %w", dir, err)
-	}
+	// Everything that can reject the run is checked before Create discards
+	// the previous run's exchanges.
 	maxSize, err := parseByteSize(o.maxSession)
 	if err != nil {
 		return fmt.Errorf("--max-session-size: %w", err)
+	}
+	if err := session.Create(dir, o.appendSession); err != nil {
+		return fmt.Errorf("session %s: %w", dir, err)
 	}
 	w, err := store.OpenWriter(dir, maxSize)
 	if err != nil {
