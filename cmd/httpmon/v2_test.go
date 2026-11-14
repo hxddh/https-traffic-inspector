@@ -662,7 +662,7 @@ func TestBinary_OutputLeavesStdoutToTheCommand(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	bin := filepath.Join(t.TempDir(), "httpmon")
+	bin := filepath.Join(t.TempDir(), "httpmon"+exeSuffix)
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}

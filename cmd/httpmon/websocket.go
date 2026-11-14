@@ -104,7 +104,7 @@ type wsObserver struct {
 	server *wsParser
 
 	mu       sync.Mutex
-	msgs     []wsMessage // kept for --record and --har, up to maxWSRecorded
+	msgs     []wsMessage // kept for sessions, up to maxWSRecorded
 	count    int
 	closed   bool
 	dropped  int
@@ -112,7 +112,7 @@ type wsObserver struct {
 }
 
 // maxWSRecorded bounds how many messages of one connection are kept for
-// --record and --har; later ones are still shown, and counted.
+// sessions; later ones are still shown, and counted.
 const maxWSRecorded = 1000
 
 // observeHandshake reports the upgrade response and, for a 101, returns an

@@ -50,7 +50,7 @@ const (
 	websocketReplaySkip = "WebSocket connection"
 	failedReplaySkip    = "the recorded exchange got no response"
 	truncatedReqSkip    = "request body was only partly recorded"
-	noRawSkip           = "the record has no raw bytes for the request body (made with --format json, not --record?)"
+	noRawSkip           = "the record has no raw bytes for the request body (made with --format json, not a session?)"
 	redactedReplaySkip  = "credentials were masked by --redact"
 )
 

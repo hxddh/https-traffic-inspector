@@ -19,7 +19,7 @@ import (
 
 // ---- exchange records ----
 //
-// One shape serves both --format json and --record: an exchange.Exchange,
+// One shape serves both --format json and sessions: an exchange.Exchange,
 // request and response together. The JSON output carries bodies rendered for
 // reading -- a JSON value, text, decoded gRPC -- cut to --max-body; a record
 // carries the same plus each body's raw bytes, which replay needs.
@@ -39,7 +39,7 @@ func millis(d time.Duration) float64 {
 }
 
 // buildExchange turns a completed exchange into its record. forRecord selects
-// the --record form: masked only under --redact, and with raw bytes; otherwise
+// the session form: masked only under --redact, and with raw bytes; otherwise
 // it is the displayed form, masked unless --show-secrets.
 func buildExchange(id int, r capturedRequest, rs capturedResponse, forRecord bool) *exchange.Exchange {
 	headers, url := displayHeaders, displayURL
@@ -145,7 +145,7 @@ func wsRecord(m wsMessage, forRecord bool) exchange.WSMessage {
 	return rm
 }
 
-// ---- --record ----
+// ---- sessions ----
 
 var (
 	recordFile    *os.File

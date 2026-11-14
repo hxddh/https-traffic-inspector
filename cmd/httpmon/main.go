@@ -30,7 +30,7 @@ var (
 	insecureUpstream bool
 	upstreamProxy    *url.URL  // --upstream-proxy; nil means use the environment
 	displayMaxBody   = 1000    // --max-body: bytes of body shown in text/JSON/TUI output
-	captureMaxBody   = 1 << 20 // --max-capture: bytes of body kept for --record/--har/decompression
+	captureMaxBody   = 1 << 20 // --max-capture: bytes of body kept in sessions and for decoding
 )
 
 // version is the released build identifier, injected at link time with

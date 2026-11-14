@@ -8,7 +8,7 @@ import (
 )
 
 // showSecrets turns off masking in terminal and JSON output (--show-secrets).
-// redactCaptures turns it on for --record and --har as well (--redact).
+// redactCaptures turns it on for sessions as well (--redact).
 var (
 	showSecrets    bool
 	redactCaptures bool
@@ -29,7 +29,7 @@ func displayURL(u string) string {
 	return textsafe.MaskURL(u)
 }
 
-// captureHeaders and captureURL apply masking for --record and --har, which
+// captureHeaders and captureURL apply masking for sessions, which
 // keep credentials unless --redact is set: replay needs them.
 func captureHeaders(h http.Header) http.Header {
 	if redactCaptures {

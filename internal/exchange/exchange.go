@@ -1,6 +1,6 @@
 // Package exchange defines httpmon's exchange record -- one HTTP exchange,
 // request and response together -- which is both the --format json output
-// and the --record format, and renders it as a one-line summary.
+// and the format sessions keep, and renders it as a one-line summary.
 package exchange
 
 import (

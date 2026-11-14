@@ -36,7 +36,7 @@ injected into the command's environment (curl, Python, Node, Go, Java, git,
 aws, cargo… are configured automatically).
 
 Recommended invocation
-  httpmon --fail-on 5xx,error --record /tmp/trace.ndjson <command> [args...]
+  httpmon --session run1 --fail-on 5xx,error <command> [args...]
 
   - Output goes to stderr; the command's stdout is untouched.
   - In a non-interactive shell the output is one line per exchange plus a
@@ -49,22 +49,47 @@ Recommended invocation
     is passed through unchanged. Add "incomplete" to fail on requests still
     unanswered when the command exits; they are listed by name either way:
       #2 GET api.example.com/v1/report → … no response after 3.5s
+  - --session NAME keeps every exchange, raw bytes included, in a named
+    session (replaced on the next run of that name; --append adds to it).
 
-Expanding details (from the --record file)
-  httpmon query /tmp/trace.ndjson                     # the summary again
-  httpmon query /tmp/trace.ndjson --status 5xx,error  # only failures
-  httpmon query /tmp/trace.ndjson --id 10             # one exchange in full
-  httpmon query /tmp/trace.ndjson --id 10 --format json
-  httpmon query /tmp/trace.ndjson --id 10 --body response   # decoded body, untruncated
+Expanding details (from the session)
+  httpmon query run1                          # the summary again
+  httpmon query run1 --status 5xx,error       # only failures
+  httpmon query run1 --grep 'order_id.*42'    # search URLs, headers, bodies
+  httpmon query run1 --id 10                  # one exchange in full
+  httpmon query run1 --id 10 --body response  # decoded body, untruncated
+  httpmon query run1 --id 10 --format curl    # a command that re-sends it
+  httpmon query run1 --format har > run1.har  # for browser dev tools
+  httpmon sessions                            # what sessions exist
 
-  A record keeps raw bytes and is large: read it through query, not directly.
-  query --follow keeps reading while a long-running command appends to it.
+  A session keeps raw bytes and is large: read it through query, not directly.
+
+Testing failure paths: mock and fault rules
+  httpmon --mock 'GET api.example.com/v1/orders => 503 {"error":"down"}' <command>
+  httpmon --fault '*/upload => reset after 1KB' <command>
+  httpmon --fault 'api.example.com/* => delay 2s 30%' <command>
+  httpmon --map 'api.example.com => localhost:3000' <command>
+  httpmon --mock-from run1 <command>          # answer from a recorded session
+  httpmon mock run1 --port 8080               # serve it as an offline mock server
+  PATTERN is host/path with * wildcards. Exchanges a rule touched are marked
+  [mock], [fault] or [map]; an injected failure has error kind "injected";
+  query --rule lists them.
 
 After changing code: what did the change do to the requests?
-  httpmon --record /tmp/after.ndjson <command>
-  httpmon diff /tmp/trace.ndjson /tmp/after.ndjson --ignore .updated_at
+  httpmon --session after <command>
+  httpmon diff run1 after --ignore .updated_at
   Lists new (+) and gone (-) exchanges, changed outcomes, bodies that differ
   (by JSON path) and much slower exchanges. Exit 0 same, 1 different.
+
+Traffic from programs httpmon does not start
+  httpmon proxy                   # a standing proxy, session "proxy"
+  eval "$(httpmon env)"           # route this shell's commands through it
+  httpmon query proxy --live      # exchanges so far, and those in flight
+
+MCP
+  httpmon mcp serves the sessions to an MCP client: list_sessions,
+  query_exchanges, get_exchange, get_body, in_flight, diff_sessions; with
+  --allow-mutations also add_rule and clear_rules on a running session.
 
 Structured output
   --format json writes one object per exchange (schema: httpmon schema).
@@ -83,15 +108,16 @@ Untrusted content
 
 Credentials
   Authorization, cookies, API keys and signed-URL parameters are masked in
-  output. --record files keep them (replay needs them) unless --redact.
+  output, query and MCP results. Sessions keep them (replay needs them)
+  unless --redact.
 
 Settings that apply to every run
+  ~/.config/httpmon/config.toml (user), .httpmon.toml (project), or
   HTTPMON_FORMAT=summary|json|text   HTTPMON_FAIL_ON=5xx,error
 
 Other subcommands
-  httpmon diff <before> <after>            compare two runs
-  httpmon replay <record> [--target URL]   re-send and compare
-  httpmon ca --dir <dir>                   persistent CA for devices/containers
+  httpmon replay <session> [--target URL]  re-send and compare
+  httpmon ca                               the persistent CA, for devices
   httpmon schema                           JSON Schema of an exchange
 `
 
@@ -107,12 +133,12 @@ func cmdSchema(args []string) int {
 }
 
 // exchangeSchema is the JSON Schema of an exchange record, as written by
-// --format json and --record.
+// --format json and in sessions.
 var exchangeSchema = `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hxddh/https-traffic-inspector/schema/exchange-v3.json",
   "title": "httpmon exchange",
-  "description": "One HTTP exchange or WebSocket connection, as written by httpmon --format json and --record. Lines of the --format json stream that carry an \"event\" field (start, notice, end) are not exchanges.",
+  "description": "One HTTP exchange or WebSocket connection, as written by httpmon --format json and in sessions. Lines of the --format json stream that carry an \"event\" field (start, notice, end) are not exchanges.",
   "type": "object",
   "required": ["v", "id", "time", "kind", "method", "url", "duration_ms", "request"],
   "properties": {
@@ -190,7 +216,7 @@ var exchangeSchema = `{
         "truncated": {"type": "boolean"},
         "raw": {
           "type": "object",
-          "description": "The wire bytes. Only in --record files.",
+          "description": "The wire bytes. Only in sessions.",
           "required": ["encoding", "data"],
           "properties": {
             "encoding": {"enum": ["utf8", "base64"]},

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
@@ -130,3 +131,11 @@ func (r recordedExchange) v3() *exchange.Exchange {
 }
 
 func must[T any](v T, _ bool) T { return v }
+
+// exeSuffix is what a built binary's name needs to run.
+var exeSuffix = func() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}()

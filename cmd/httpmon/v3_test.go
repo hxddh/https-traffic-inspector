@@ -294,11 +294,11 @@ func TestBinary_SummaryByDefaultAndFailOn(t *testing.T) {
 		t.Skip("curl not installed")
 	}
 	api := apiServer(t)
-	bin := filepath.Join(t.TempDir(), "httpmon")
+	bin := filepath.Join(t.TempDir(), "httpmon"+exeSuffix)
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
-	cmd := exec.Command(bin, "--fail-on", "5xx", "curl", "-s", "-o", "/dev/null", api.URL+"/fail")
+	cmd := exec.Command(bin, "--fail-on", "5xx", "curl", "-s", "-o", os.DevNull, api.URL+"/fail")
 	cmd.Env = append(os.Environ(), "HTTPMON_FORMAT=")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
