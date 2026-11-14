@@ -4,6 +4,58 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-11-14
+
+Makes the scenarios 4.0 introduced — a standing proxy, long sessions, agents
+reading them over MCP — hold up at scale, fixes two session bugs, and adds an
+interactive UI for sessions, a way to wait for a request, and header rules.
+Compatible with 4.0: options, outputs and the exchange format are unchanged.
+
+### Added
+
+- **Session index.** Each session keeps an index beside its exchanges. On a
+  60,000-exchange, 165 MB session: `query --id` 1.67 s → 0.02 s, MCP
+  `get_exchange` 1.62 s / 364 MB → 0.02 s / 20 MB, MCP `query_exchanges`
+  1.70 s / 400 MB → 0.11 s / 67 MB. A 4.0 session is indexed the first time
+  it is read.
+- **Streaming HAR and light diff.** `--format har` writes entries one at a
+  time (peak 1360 MB → 73 MB on that session); `diff` holds light forms of the
+  exchanges and reads bodies back only where they differ (1047 MB → 143 MB).
+- **`--max-session-size`**: a session rotates into segments and drops its
+  oldest when over the limit; `httpmon proxy` keeps at most 1 GB by default.
+  `httpmon sessions rm` and `httpmon sessions prune --older-than 7d` remove
+  sessions; a running one never is. `httpmon sessions` shows exchange counts,
+  and `--json` first and last times and whether exchanges were dropped.
+- **`httpmon ui SESSION`** and **`httpmon proxy --ui`**: the interactive UI
+  on a session, following it live while it runs. Search matches rule tags;
+  `r` replays the selected request (`--read-only` turns it off).
+- **`query --wait`**: blocks until the first new exchange matching the
+  filters, prints it and exits; exit 4 on `--timeout`. `--after ID` also
+  accepts ones already recorded.
+- **MCP**: `wait_for_exchange`, `export_curl`, and — with
+  `--allow-mutations`, since it sends traffic — `replay_exchange`.
+- **Header rules**: `--header 'PATTERN => request|response set NAME: VALUE |
+  remove NAME'`, and `[header NAME]` / `[header NAME: VALUE*]` conditions on
+  mock, fault and header rules. A project `.httpmon.toml` may not set
+  `Authorization`, `Cookie` or `Proxy-Authorization`.
+- **Windows arm64** release binary; `install.ps1` installs it.
+
+### Fixed
+
+- **`--append` reused ids**: every run numbered from #1, so `query --id`
+  matched several exchanges and MCP `get_exchange` returned the wrong one.
+  Ids now continue from the session's last run.
+- **`query --follow` stopped seeing traffic** when the session started again
+  (it kept reading the replaced file). It now moves to the new file and says
+  so, and carries on across rotation.
+- An MCP `get_exchange` call with an invalid `max_body` left the setting
+  changed for later calls.
+
+### Changed
+
+- CI runs once per commit: pull-request branches are tested on their pull
+  request only, and a newer push cancels a run still queued.
+
 ## [4.0.0] - 2026-11-14
 
 httpmon grows from a command wrapper into a traffic workbench: captures live in

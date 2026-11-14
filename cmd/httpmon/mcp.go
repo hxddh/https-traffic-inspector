@@ -24,8 +24,8 @@ import (
 // A Model Context Protocol server over stdio: an agent's client starts
 // "httpmon mcp" and gets tools to list sessions, query their exchanges, read
 // one in full, see what is in flight and compare two runs. With
-// --allow-mutations it can also add mock and fault rules to a running
-// session. Credentials are masked unless --show-secrets.
+// --allow-mutations it can also add rules to a running session and replay
+// recorded requests. Credentials are masked unless --show-secrets.
 
 const mcpProtocolVersion = "2025-06-18"
 
@@ -58,16 +58,17 @@ type mcpTool struct {
 
 func cmdMCP(args []string) int {
 	fs := flag.NewFlagSet("httpmon mcp", flag.ContinueOnError)
-	allowMut := fs.Bool("allow-mutations", false, "offer tools that change a running session: add_rule, clear_rules")
+	allowMut := fs.Bool("allow-mutations", false, "offer tools that change something: add_rule, clear_rules (a running session's rules), replay_exchange (sends traffic)")
 	show := fs.Bool("show-secrets", false, "show credentials instead of masking them")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: httpmon mcp [--allow-mutations] [--show-secrets]
 
 Runs a Model Context Protocol server on stdin and stdout, for an agent's
 MCP client. Its tools read httpmon sessions -- list_sessions,
-query_exchanges, get_exchange, get_body, in_flight, diff_sessions -- and,
-with --allow-mutations, add_rule and clear_rules change the rules of a
-running session.
+query_exchanges, get_exchange, get_body, wait_for_exchange, export_curl,
+in_flight, diff_sessions -- and, with --allow-mutations, add_rule and
+clear_rules change the rules of a running session and replay_exchange
+sends a recorded request again.
 
 Example client configuration:
   {"mcpServers": {"httpmon": {"command": "httpmon", "args": ["mcp"]}}}

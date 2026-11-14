@@ -251,12 +251,13 @@ func usage(fs *flag.FlagSet) {
   httpmon [options] <command> [args...]   run a command and show its HTTP(S) traffic
   httpmon proxy  [options]                run as a proxy for browsers, devices and services
   httpmon env    [--session NAME]         shell exports that route commands through a running proxy
-  httpmon query  <session> [filters]      list, search, expand or export captured exchanges
+  httpmon query  <session> [filters]      list, search, expand or export exchanges; --wait for one
+  httpmon ui     <session>                interactive UI on a session, live while it runs
   httpmon diff   <before> <after>         compare two sessions: what changed between runs
   httpmon replay <session> [options]      re-send recorded requests and compare responses
   httpmon mock   <session> [--port N]     serve recorded responses as an offline mock server
-  httpmon sessions                        list sessions
-  httpmon mcp    [--session NAME]         MCP server over stdio, for AI agents
+  httpmon sessions [rm NAME | prune]      list or remove sessions
+  httpmon mcp    [--allow-mutations]      MCP server over stdio, for AI agents
   httpmon ca     [--dir DIR]              create or show the persistent CA
   httpmon schema                          print the JSON Schema of an exchange
   httpmon help   [agents]                 this help, or a guide for AI agents
@@ -275,7 +276,10 @@ Examples:
   httpmon query test --status 5xx
   httpmon --mock 'GET api.example.com/v1/orders => 503 {"error":"maintenance"}' npm test
   httpmon --fault '* api.example.com/* => delay 2s 30%' pytest
+  httpmon --header '*/api/* => response remove Cache-Control' npm start
+  httpmon query test --wait --status 5xx --timeout 30s
   httpmon diff before after --ignore .updated_at
+  httpmon proxy --ui
   httpmon proxy --listen 0.0.0.0 --port 8080
   httpmon --ui curl https://api.github.com
 `)
