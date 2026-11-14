@@ -310,3 +310,17 @@ func errorsAs(err error, target **exec.ExitError) bool {
 	}
 	return ok
 }
+
+// Regression: "query --id N" printed the one-line summary although --id is
+// documented as showing the exchange in full.
+func TestQuery_IDDefaultsToFullText(t *testing.T) {
+	path := recordSample(t)
+	id := strconv.Itoa(readRecordFile(t, path)[1].ID)
+	out, _ := runQuery(t, path, "--id", id)
+	if !strings.Contains(out, "Response headers") && !strings.Contains(out, "Request headers") {
+		t.Errorf("--id without --format is not the full text:\n%s", out)
+	}
+	if out, _ := runQuery(t, path, "--id", id, "--format", "summary"); strings.Contains(out, "Request headers") {
+		t.Errorf("an explicit --format summary was overridden:\n%s", out)
+	}
+}

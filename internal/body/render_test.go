@@ -172,3 +172,33 @@ func TestRaw_RoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// Regression: Object had no UnmarshalJSON, so a record holding decoded gRPC
+// fields could not be read back by query or replay.
+func TestRendered_GRPCRoundTrips(t *testing.T) {
+	msgs, _ := DecodeGRPC(append([]byte{0, 0, 0, 0, 2}, 0x08, 0x05))
+	b, err := json.Marshal(Rendered{Size: 7, GRPC: msgs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Rendered
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("cannot read back %s: %v", b, err)
+	}
+	if v, _ := back.GRPC[0].Fields.Get("1"); v == nil {
+		t.Errorf("fields lost: %+v", back.GRPC[0].Fields)
+	}
+}
+
+// Regression: the budget only dropped whole messages, so a single large
+// message was rendered in full and not marked truncated.
+func TestRender_BoundsALargeGRPCMessage(t *testing.T) {
+	big := strings.Repeat("x", 10000)
+	pb := append([]byte{0x0a, 0x90, 0x4e}, big...) // field 1, length 10000 (varint 0x90 0x4e)
+	frame := append([]byte{0, 0, 0, byte(len(pb) >> 8), byte(len(pb))}, pb...)
+	r, _ := Render(http.Header{"Content-Type": {"application/grpc"}}, frame, false, int64(len(frame)), 100)
+	b, _ := json.Marshal(r.GRPC)
+	if len(b) > 400 || !r.Truncated {
+		t.Errorf("rendered %d bytes, truncated=%v; want it within budget and marked", len(b), r.Truncated)
+	}
+}

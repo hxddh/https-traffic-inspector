@@ -43,6 +43,21 @@ func (o Object) MarshalJSON() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+// UnmarshalJSON reads an object back in member order, so records holding
+// decoded fields can be read by query and replay.
+func (o *Object) UnmarshalJSON(data []byte) error {
+	v, err := ParseJSON(data)
+	if err != nil {
+		return err
+	}
+	obj, ok := v.(Object)
+	if !ok {
+		return fmt.Errorf("expected a JSON object, got %T", v)
+	}
+	*o = obj
+	return nil
+}
+
 // Get returns the value of the first member named key.
 func (o Object) Get(key string) (any, bool) {
 	for _, m := range o {

@@ -114,8 +114,9 @@ func PrintableType(ct string) bool {
 // bytes. rawTruncated reports that raw is only a prefix of the body; size is
 // the number of bytes that crossed the wire. It returns nil for an empty body.
 //
-// The result's Hint is filled from the whole JSON body, before it is cut to
-// the budget, so an error code deep in a large body is still found.
+// It also returns a short error description found in a JSON body (see
+// ErrorHint), taken from the whole body before it is cut to the budget, so an
+// error code deep in a large body is still found.
 func Render(h http.Header, raw []byte, rawTruncated bool, size int64, budget int) (*Rendered, string) {
 	if size == 0 && len(raw) == 0 {
 		return nil, ""
@@ -139,10 +140,25 @@ func Render(h http.Header, raw []byte, rawTruncated bool, size int64, budget int
 		msgs, partial := DecodeGRPC(data)
 		r.GRPC = msgs
 		r.Truncated = truncated || partial
-		// Keep the rendering within budget by dropping messages past it.
+		// Keep the rendering within budget: drop messages past it, then
+		// shorten the fields of those kept, so one large message cannot
+		// flood the output either.
 		for len(r.GRPC) > 1 && approxLen(r.GRPC) > budget {
 			r.GRPC = r.GRPC[:len(r.GRPC)/2]
 			r.Truncated = true
+		}
+		if len(r.GRPC) > 0 {
+			per := budget / len(r.GRPC)
+			for i := range r.GRPC {
+				if r.GRPC[i].Fields == nil {
+					continue
+				}
+				v, cut := TruncateJSON(r.GRPC[i].Fields, per)
+				if obj, ok := v.(Object); ok && cut {
+					r.GRPC[i].Fields = obj
+					r.Truncated = true
+				}
+			}
 		}
 		return r, ""
 

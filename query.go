@@ -60,7 +60,7 @@ func cmdQuery(args []string) int {
 	fs.StringVar(&q.url, "url", "", "only URLs containing this text (case-insensitive)")
 	fs.BoolVar(&q.errors, "error", false, "only exchanges that got no response")
 	bodyFlag := fs.String("body", "", "print one exchange's decoded body in full: request or response (needs --id)")
-	format := fs.String("format", "summary", "output format: summary | json | text")
+	format := fs.String("format", "summary", "output format: summary | json | text (default text with --id)")
 	maxBody := fs.Int("max-body", 4000, "approximate max bytes of each body shown")
 	follow := fs.Bool("follow", false, "keep reading as exchanges are appended to the record")
 	show := fs.Bool("show-secrets", false, "show credentials instead of masking them")
@@ -98,6 +98,13 @@ Options:
 	if *bodyFlag != "" && q.id == 0 {
 		fmt.Fprintf(os.Stderr, "httpmon query: --body needs --id\n")
 		return 1
+	}
+	// One exchange is asked for to be read in full: unless a format was
+	// chosen, show it as text rather than as its one-line summary.
+	formatSet := false
+	fs.Visit(func(f *flag.Flag) { formatSet = formatSet || f.Name == "format" })
+	if q.id != 0 && !formatSet {
+		*format = "text"
 	}
 	switch *format {
 	case "summary", "json", "text":
