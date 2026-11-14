@@ -106,9 +106,9 @@ httpmon mock trace.ndjson --port 9000   # 用一份 record 当离线的 mock 服
 | 项 | 内容 |
 |---|---|
 | 二进制名 | ⚠ `main` 移到 `cmd/httpmon`：`go install github.com/hxddh/https-traffic-inspector/v4/cmd/httpmon@latest` 装出的就叫 `httpmon` |
-| 安装渠道 | Homebrew tap、Scoop bucket、`ghcr.io` 容器镜像（多架构）、安装脚本（自动选平台、校验 SHA256） |
+| 安装渠道 | 安装脚本 `curl -fsSL …/install.sh \| sh`（自动选平台和架构，校验 SHA256 和来源证明，安装到 `~/.local/bin`）、PowerShell 版 `install.ps1`、`ghcr.io` 容器镜像（多架构）、`go install …/cmd/httpmon`。**不提供 Homebrew 和 Scoop**（维护者决定：不新建包管理器仓库） |
 | 完整性 | 每个 Release 带 `SHA256SUMS`，用 GitHub Artifact Attestations 生成构建来源证明（`gh attestation verify` 可验证）、SBOM |
-| macOS | 代码签名和公证（**需要维护者提供 Apple Developer 账号，是唯一需要外部资源的一项**；没有账号时先提供 Homebrew，它会处理隔离属性） |
+| macOS | **暂不签名、不公证**（维护者决定：暂无 Apple Developer 账号）。从浏览器下载的二进制会被 Gatekeeper 加上隔离属性而无法运行，因此 macOS 的推荐安装方式是安装脚本（用 curl 下载的文件不带隔离属性）、`go install`（本机编译）或容器镜像；README 和 Release 说明写明浏览器下载后用 `xattr -d com.apple.quarantine httpmon` 解除。这些安装方式都要在 macOS CI 上实际跑一遍 |
 | 跨平台 CI | ubuntu、macOS、Windows 三平台跑完整测试，外加每个平台一组端到端测试（curl、Python、Node） |
 | 质量门 | fuzz 目标进入仓库，CI 每次跑 30 秒，每晚跑 10 分钟；用 benchmark 守住性能基线（单请求开销、50 并发吞吐），回退超过 20% 时 CI 失败 |
 
@@ -159,13 +159,15 @@ v4.0 用 A 的独立代理加 `env`，覆盖"能配置代理但不是被 httpmon
 
 | 版本 | 内容 |
 |---|---|
-| **v4.0.0** | A 独立代理 / 会话 / env / 实时状态；B mock、fault、map、`httpmon mock`；C 二进制名、校验和、来源证明、SBOM、Homebrew、Scoop、容器镜像、三平台 CI、fuzz 和性能门；D grep、导出 curl 和 HAR；E 配置文件；F MCP |
-| v4.0.x | macOS 签名和公证（在维护者提供 Apple Developer 账号后） |
+| **v4.0.0** | A 独立代理 / 会话 / env / 实时状态；B mock、fault、map、`httpmon mock`；C 二进制名、校验和、来源证明、SBOM、安装脚本（sh / PowerShell）、容器镜像、三平台 CI（含安装脚本在 macOS 上的验证）、fuzz 和性能门；D grep、导出 curl 和 HAR；E 配置文件；F MCP |
+| 以后 | macOS 签名和公证（如果以后有了 Apple Developer 账号）；包管理器渠道（如果以后决定建仓库） |
 | v4.1 | 根据 v4.0 的使用反馈打磨规则语法；评估 G 系统层拦截 |
 
-**v4.0 需要维护者决定的只有两件事**：
-1. **是否提供 Apple Developer 账号**用于 macOS 签名和公证。不提供的话，其余部分照常发布，macOS 用户通过 Homebrew 安装。
-2. **Homebrew tap 和 Scoop bucket 需要新建仓库**（例如 `hxddh/homebrew-tap`），由维护者创建，或授权创建。
+**维护者的决定（已确认）**：
+1. 暂时没有 Apple Developer 账号：macOS 二进制不签名、不公证，改用安装脚本、`go install` 和容器镜像这些不受 Gatekeeper 隔离影响的方式交付（见 C）。
+2. 不走 Homebrew：不新建 tap 仓库。Scoop bucket 同样需要新建仓库，一并不做。Windows 用 PowerShell 安装脚本和直接下载。
+
+因此 v4.0 不依赖任何外部账号或新仓库，可以完全在这个仓库内完成。
 
 一句话总结：v3 让 httpmon 成为"包装命令抓流量"这件事上最好的工具，而且对 agent 友好；
 v4 要补齐顶级产品的三块基本盘——**任何来源都能接**、**能改流量**、**像产品一样交付**——
