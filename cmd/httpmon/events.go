@@ -46,6 +46,17 @@ func trackUnfinished(id int, method, url string, start time.Time) {
 	unfinishedMu.Lock()
 	unfinished[id] = unfinishedReq{pending: exchange.Pending{ID: id, Method: method, URL: url}, start: start}
 	unfinishedMu.Unlock()
+	notifyLive()
+}
+
+// liveChanged wakes the session's live-view writer.
+var liveChanged = make(chan struct{}, 1)
+
+func notifyLive() {
+	select {
+	case liveChanged <- struct{}{}:
+	default:
+	}
 }
 
 // markResponding records that an unfinished exchange's response has started.
@@ -56,12 +67,14 @@ func markResponding(id, status int) {
 		unfinished[id] = u
 	}
 	unfinishedMu.Unlock()
+	notifyLive()
 }
 
 func untrack(id int) {
 	unfinishedMu.Lock()
 	delete(unfinished, id)
 	unfinishedMu.Unlock()
+	notifyLive()
 }
 
 // unfinishedExchanges lists, in id order, the exchanges still waiting.

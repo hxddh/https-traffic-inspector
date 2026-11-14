@@ -26,8 +26,8 @@ const (
 	KindProxy        = "proxy"
 	KindCanceled     = "canceled"
 	// KindInjected is a failure a --fault rule caused on purpose.
-	KindInjected     = "injected"
-	KindOther        = "other"
+	KindInjected = "injected"
+	KindOther    = "other"
 )
 
 // Kinds lists every error kind.

@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 
@@ -45,12 +47,12 @@ type Config struct {
 func Load() (Config, error) {
 	var c Config
 	if h, err := session.Home(); err == nil {
-		if err := c.merge(filepath.Join(h, "config.toml")); err != nil {
+		if err := c.merge(filepath.Join(h, "config.toml"), false); err != nil {
 			return c, err
 		}
 	}
 	if p := findProject(); p != "" {
-		if err := c.merge(p); err != nil {
+		if err := c.merge(p, true); err != nil {
 			return c, err
 		}
 	}
@@ -77,7 +79,39 @@ func findProject() string {
 	return ""
 }
 
-func (c *Config) merge(path string) error {
+// A project file comes with whatever repository is checked out, so it may not
+// change where traffic goes or how it is verified: no upstream proxy, no
+// skipped verification, no other CA, no unmasked credentials, and map rules
+// only to this machine.
+func checkProject(f *Config) error {
+	switch {
+	case f.UpstreamProxy != "":
+		return errors.New("upstream_proxy may only be set in the user config")
+	case f.InsecureUpstream != nil:
+		return errors.New("insecure_upstream may only be set in the user config")
+	case f.CADir != "":
+		return errors.New("ca_dir may only be set in the user config")
+	case f.ShowSecrets != nil:
+		return errors.New("show_secrets may only be set in the user config")
+	}
+	for _, m := range f.Map {
+		_, to, _ := strings.Cut(m, "=>")
+		to = strings.TrimSpace(to)
+		if i := strings.Index(to, "://"); i >= 0 {
+			to = to[i+3:]
+		}
+		host := to
+		if h, _, err := net.SplitHostPort(to); err == nil {
+			host = h
+		}
+		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("map %q: a project file may only map to this machine (localhost, 127.0.0.1, ::1)", m)
+		}
+	}
+	return nil
+}
+
+func (c *Config) merge(path string, project bool) error {
 	var f Config
 	md, err := toml.DecodeFile(path, &f)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -88,6 +122,11 @@ func (c *Config) merge(path string) error {
 	}
 	if und := md.Undecoded(); len(und) > 0 {
 		return fmt.Errorf("%s: unknown setting %q", path, und[0].String())
+	}
+	if project {
+		if err := checkProject(&f); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
 	}
 	c.Files = append(c.Files, path)
 	if f.Format != "" {

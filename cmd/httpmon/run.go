@@ -302,27 +302,29 @@ func startSessionWatchers() {
 		noticef("session: %v", err)
 	}
 	go func() {
+		// The live view is rewritten soon after the in-flight set changes,
+		// and every few seconds regardless, so a reader can tell a running
+		// session from one whose process died. Rules are polled.
 		t := time.NewTicker(500 * time.Millisecond)
 		defer t.Stop()
-		var lastLive string
 		var lastRules time.Time
+		lastLive := time.Time{}
+		dirty := true
 		for {
 			select {
 			case <-sessionStop:
 				return
+			case <-liveChanged:
+				dirty = true
+				// Coalesce a burst of changes into one write.
+				time.Sleep(50 * time.Millisecond)
 			case <-t.C:
 			}
-			pending := unfinishedExchanges()
-			key := fmt.Sprint(len(pending))
-			for _, p := range pending {
-				key += "," + strconv.Itoa(p.ID)
-			}
-			// Refresh at least every few seconds, so a reader can tell a
-			// running session from one whose process died.
-			if key != lastLive || time.Now().Second()%5 == 0 {
-				lastLive = key
+			if dirty || time.Since(lastLive) > 3*time.Second {
+				dirty = false
+				lastLive = time.Now()
 				session.WriteJSON(sessionPath, session.LiveFile, session.Live{ //nolint:errcheck
-					PID: os.Getpid(), Updated: time.Now(), InFlight: pending,
+					PID: os.Getpid(), Updated: lastLive, InFlight: unfinishedExchanges(),
 				})
 			}
 			if fi, err := os.Stat(filepath.Join(sessionPath, session.RulesFile)); err == nil && fi.ModTime() != lastRules {
@@ -654,7 +656,7 @@ func cmdSessions(args []string) int {
 		}
 		what := s.Meta.Kind
 		if len(s.Meta.Command) > 0 {
-			what = strings.Join(s.Meta.Command, " ")
+			what = clipText(strings.Join(s.Meta.Command, " "), 60)
 		}
 		fmt.Printf("%-20s %-8s %8s  %s  %s\n", s.Name, state, humanBytes(s.Exchanges), s.Modified.Format("2006-01-02 15:04"), what)
 	}
@@ -669,4 +671,11 @@ func humanBytes(n int64) string {
 		return fmt.Sprintf("%d KB", n>>10)
 	}
 	return fmt.Sprintf("%d B", n)
+}
+
+func clipText(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
 }

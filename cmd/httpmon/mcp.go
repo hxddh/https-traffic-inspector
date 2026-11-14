@@ -156,8 +156,12 @@ func schema(props map[string]any, required ...string) map[string]any {
 	return s
 }
 
-func strProp(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
-func intProp(desc string) map[string]any { return map[string]any{"type": "integer", "description": desc} }
+func strProp(desc string) map[string]any {
+	return map[string]any{"type": "string", "description": desc}
+}
+func intProp(desc string) map[string]any {
+	return map[string]any{"type": "integer", "description": desc}
+}
 
 func argString(a map[string]any, k string) string {
 	if v, ok := a[k].(string); ok {
@@ -284,7 +288,7 @@ func mcpListSessions(map[string]any) (string, error) {
 		}
 		what := s.Meta.Kind
 		if len(s.Meta.Command) > 0 {
-			what = strings.Join(s.Meta.Command, " ")
+			what = clipText(strings.Join(s.Meta.Command, " "), 60)
 		}
 		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%s\n", s.Name, state, humanBytes(s.Exchanges), s.Modified.Format("2006-01-02 15:04"), textsafe.Line(what))
 	}

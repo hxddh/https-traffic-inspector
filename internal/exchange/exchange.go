@@ -140,12 +140,6 @@ func FormatTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05
 func (e *Exchange) SummaryLine() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "#%d %s %s → ", e.ID, e.Method, ShortURL(e.URL))
-	defer func() {
-		if e.Rule != "" {
-			kind, _, _ := strings.Cut(e.Rule, ":")
-			fmt.Fprintf(&b, " [%s]", kind)
-		}
-	}()
 	dur := formatMs(e.DurationMs)
 	switch {
 	case e.Error != nil:
@@ -169,6 +163,10 @@ func (e *Exchange) SummaryLine() string {
 			size = e.Response.Body.Size
 		}
 		fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(size))
+	}
+	if e.Rule != "" {
+		kind, _, _ := strings.Cut(e.Rule, ":")
+		fmt.Fprintf(&b, " [%s]", kind)
 	}
 	return b.String()
 }

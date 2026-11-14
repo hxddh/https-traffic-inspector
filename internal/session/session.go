@@ -116,7 +116,7 @@ func Create(dir string, keep bool) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: a directory needs x
 		return err
 	}
 	// Rules added at run time belong to the run that added them.

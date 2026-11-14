@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/config"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
@@ -33,7 +34,11 @@ func cmdDiff(args []string) int {
 	fs := flag.NewFlagSet("httpmon diff", flag.ContinueOnError)
 	var out outputFlags
 	out.register(fs)
+	// Paths ignored in every comparison can be set in the settings files.
 	var ignore []string
+	if cfg, err := config.Load(); err == nil {
+		ignore = append(ignore, cfg.Ignore...)
+	}
 	fs.Func("ignore", "JSON paths not to compare, comma-separated; a path matches any path ending in it (e.g. .updated_at,.request_id)", func(s string) error {
 		for _, p := range strings.Split(s, ",") {
 			if p = strings.TrimSpace(p); p != "" {

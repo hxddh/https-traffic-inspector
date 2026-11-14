@@ -45,10 +45,9 @@ const maxInjectedTimeout = 10 * time.Minute
 
 // ruleOutcome is what applyRules decided.
 type ruleOutcome struct {
-	done  bool   // the request has been answered (or failed); stop
-	mapTo *url2  // send the request here instead
-	reset int64  // reset the connection after this many response body bytes (>0)
-	label string // rules applied, for the record
+	done  bool  // the request has been answered (or failed); stop
+	mapTo *url2 // send the request here instead
+	reset int64 // reset the connection after this many response body bytes (>0)
 }
 
 // url2 is a scheme and host to send a mapped request to.
@@ -264,6 +263,6 @@ func mockHandler(rec *rules.Recorded) http.Handler {
 			b = nil
 		}
 		w.WriteHeader(status)
-		w.Write(b) //nolint:errcheck
+		w.Write(b) //nolint:errcheck,gosec // G705: replays a recorded response, as asked
 	})
 }

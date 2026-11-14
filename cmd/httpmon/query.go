@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -357,7 +356,7 @@ func curlForExchange(e *exchange.Exchange) string {
 			data, whole = []byte{0}, false
 		}
 	}
-	head := "# #" + strconv.Itoa(e.ID) + " " + textsafe.Line(e.SummaryLine())
+	head := "# " + textsafe.Line(e.SummaryLine())
 	return head + "\n" + curlFor(e.Method, e.URL, e.Request.Headers.HTTP(), data, whole)
 }
 
@@ -390,6 +389,7 @@ func writeLive(arg string, asJSON bool) {
 		return
 	}
 	for _, p := range l.InFlight {
+		p.URL = displayURL(p.URL)
 		if asJSON {
 			emitJSON(struct {
 				Event string `json:"event"`
