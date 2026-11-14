@@ -30,12 +30,7 @@ func TestExit_DrainWaitsForFinalExchange(t *testing.T) {
 	defer upstream.Close()
 	useInsecureUpstream(t)
 
-	savedHM, savedCaptures := harMode, captures
-	harMode, captures = true, newExchangeJoiner()
-	harEntriesMu.Lock()
-	harEntries = nil
-	harEntriesMu.Unlock()
-	defer func() { harMode, captures = savedHM, savedCaptures }()
+	mem := useMemoryHAR(t)
 
 	client, cleanup := proxiedClient(t) // HTTP/1.1 to httpmon, HTTP/2 upstream
 	defer cleanup()
@@ -49,19 +44,15 @@ func TestExit_DrainWaitsForFinalExchange(t *testing.T) {
 		t.Fatalf("body = %q", body)
 	}
 
-	harEntriesMu.Lock()
-	early := len(harEntries)
-	harEntriesMu.Unlock()
+	early := len(mem.entries())
 	if early != 0 {
 		t.Skip("the exchange completed before the client did; the race was not exercised")
 	}
 
 	drainInflight(3 * time.Second)
 
-	harEntriesMu.Lock()
-	defer harEntriesMu.Unlock()
-	if len(harEntries) != 1 {
-		t.Errorf("HAR has %d entries after draining, want 1", len(harEntries))
+	if n := len(mem.entries()); n != 1 {
+		t.Errorf("HAR has %d entries after draining, want 1", n)
 	}
 }
 

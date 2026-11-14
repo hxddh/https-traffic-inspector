@@ -1,23 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/base64"
-	"encoding/json"
-	"encoding/pem"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,28 +19,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode/utf8"
+
+	"github.com/mattn/go-isatty"
 )
 
-// certEntry wraps a TLS certificate with an expiry time for cache TTL enforcement.
-type certEntry struct {
-	cert      *tls.Certificate
-	expiresAt time.Time
-}
-
 var (
-	requestCounter int
-	counterMu      sync.Mutex
-	proxyPort      string
-	caCert         *x509.Certificate
-	caKey          *ecdsa.PrivateKey
-	certCache      = make(map[string]*certEntry)
-	certMu         sync.Mutex
-	certTTL        = time.Hour // overridden by --cert-ttl flag
-	upstreamClient *http.Client
-	// h2cClient speaks cleartext HTTP/2 upstream, for clients that spoke it
-	// to httpmon: an insecure gRPC server accepts nothing else.
-	h2cClient *http.Client
+	proxyPort string
 
 	// set by flags
 	filterPattern    string
@@ -65,10 +37,6 @@ var (
 	upstreamProxy    *url.URL  // --upstream-proxy; nil means use the environment
 	displayMaxBody   = 1000    // --max-body: bytes of body shown in text/JSON/TUI output
 	captureMaxBody   = 1 << 20 // --max-capture: bytes of body kept for --record/--har/decompression
-
-	// per-request start times for duration tracking (used in TUI and text mode)
-	reqStartTimes = make(map[int]time.Time)
-	reqStartMu    sync.Mutex
 )
 
 // version is the released build identifier, injected at link time with
@@ -85,159 +53,6 @@ func init() {
 	// Verified by default; run() replaces this once --insecure-upstream is parsed.
 	upstreamClient = newUpstreamClient(false)
 	h2cClient = newH2CClient()
-}
-
-// newUpstreamClient builds the shared client used for all upstream requests.
-// When insecure is true, upstream certificates are not verified.
-//
-// Requests go through upstreamProxy, falling back to the environment's proxy
-// settings. httpmon only injects its own address into the *subprocess*
-// environment, so reading the environment here picks up the outer proxy rather
-// than looping back into httpmon.
-//
-// Every upstream path -- proxied requests, replay and WebSocket tunnels --
-// resolves its proxy through upstreamProxyFor, so none of them can bypass it.
-func newUpstreamClient(insecure bool) *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy:           func(r *http.Request) (*url.URL, error) { return upstreamProxyFor(r.URL) },
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec // opt-in via --insecure-upstream
-			// A custom TLS config otherwise turns HTTP/2 off. Without it gRPC
-			// cannot work, and every HTTP/2 client is silently downgraded.
-			ForceAttemptHTTP2:   true,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-}
-
-// newH2CClient builds the client for cleartext HTTP/2 upstreams.
-func newH2CClient() *http.Client {
-	p := new(http.Protocols)
-	p.SetUnencryptedHTTP2(true)
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy:     func(r *http.Request) (*url.URL, error) { return upstreamProxyFor(r.URL) },
-			Protocols: p,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-}
-
-// upstreamProxyFor returns the proxy httpmon's own traffic to u goes through,
-// or nil to connect directly: --upstream-proxy when set, else the environment.
-func upstreamProxyFor(u *url.URL) (*url.URL, error) {
-	if upstreamProxy != nil {
-		return upstreamProxy, nil
-	}
-	return http.ProxyFromEnvironment(&http.Request{URL: u})
-}
-
-// upstreamDialTimeout bounds connecting to an upstream or proxy and completing
-// the TLS handshake, matching what the upstream transport allows.
-const upstreamDialTimeout = 30 * time.Second
-
-// dialUpstreamTLS opens a TLS connection to hostport for a WebSocket splice,
-// tunnelling through the upstream proxy when one applies. The splice needs a
-// raw connection, which the shared http.Transport cannot hand out, but it must
-// follow the same route and verification policy as every other request.
-func dialUpstreamTLS(hostport, serverName string) (net.Conn, error) {
-	cfg := &tls.Config{
-		InsecureSkipVerify: insecureUpstream, //nolint:gosec // opt-in via --insecure-upstream
-		ServerName:         serverName,
-	}
-	d := &net.Dialer{Timeout: upstreamDialTimeout}
-
-	p, err := upstreamProxyFor(&url.URL{Scheme: "https", Host: hostport})
-	if err != nil {
-		return nil, err
-	}
-	if p == nil {
-		return tls.DialWithDialer(d, "tcp", hostport, cfg)
-	}
-
-	raw, err := dialProxyTunnel(d, p, hostport)
-	if err != nil {
-		return nil, err
-	}
-	tc := tls.Client(raw, cfg)
-	raw.SetDeadline(time.Now().Add(upstreamDialTimeout)) //nolint:errcheck
-	if err := tc.Handshake(); err != nil {
-		raw.Close() //nolint:errcheck
-		return nil, err
-	}
-	raw.SetDeadline(time.Time{}) //nolint:errcheck
-	return tc, nil
-}
-
-// dialProxyTunnel connects to proxy p and asks it, with CONNECT, for a tunnel
-// to target.
-func dialProxyTunnel(d *net.Dialer, p *url.URL, target string) (net.Conn, error) {
-	var (
-		conn net.Conn
-		err  error
-	)
-	switch p.Scheme {
-	case "http", "":
-		conn, err = d.Dial("tcp", hostPortDefault(p, "80"))
-	case "https":
-		conn, err = tls.DialWithDialer(d, "tcp", hostPortDefault(p, "443"), &tls.Config{ServerName: p.Hostname()})
-	default:
-		return nil, fmt.Errorf("upstream proxy scheme %q is not supported for WebSocket tunnels", p.Scheme)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	req := &http.Request{
-		Method: http.MethodConnect,
-		URL:    &url.URL{Opaque: target},
-		Host:   target,
-		Header: make(http.Header),
-	}
-	if p.User != nil {
-		pass, _ := p.User.Password()
-		cred := base64.StdEncoding.EncodeToString([]byte(p.User.Username() + ":" + pass))
-		req.Header.Set("Proxy-Authorization", "Basic "+cred)
-	}
-
-	conn.SetDeadline(time.Now().Add(upstreamDialTimeout)) //nolint:errcheck
-	if err := req.Write(conn); err != nil {
-		conn.Close() //nolint:errcheck
-		return nil, err
-	}
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, req)
-	if err != nil {
-		conn.Close() //nolint:errcheck
-		return nil, err
-	}
-	resp.Body.Close() //nolint:errcheck
-	if resp.StatusCode != http.StatusOK {
-		conn.Close() //nolint:errcheck
-		return nil, fmt.Errorf("upstream proxy refused CONNECT %s: %s", target, resp.Status)
-	}
-	// The server speaks first only after our TLS ClientHello, so anything
-	// already buffered here would be lost; treat it as a protocol error.
-	if br.Buffered() > 0 {
-		conn.Close() //nolint:errcheck
-		return nil, fmt.Errorf("upstream proxy sent unexpected data after CONNECT %s", target)
-	}
-	conn.SetDeadline(time.Time{}) //nolint:errcheck
-	return conn, nil
-}
-
-func hostPortDefault(u *url.URL, port string) string {
-	if u.Port() != "" {
-		return u.Host
-	}
-	return net.JoinHostPort(u.Hostname(), port)
 }
 
 // ---- cleanup ----
@@ -267,169 +82,6 @@ func runCleanups() {
 	}
 }
 
-// isTLSVerificationError reports whether err came from upstream certificate
-// verification, so the user can be pointed at --insecure-upstream.
-func isTLSVerificationError(err error) bool {
-	var certErr *tls.CertificateVerificationError
-	if errors.As(err, &certErr) {
-		return true
-	}
-	var unknownAuthority x509.UnknownAuthorityError
-	var hostnameErr x509.HostnameError
-	var invalidErr x509.CertificateInvalidError
-	return errors.As(err, &unknownAuthority) ||
-		errors.As(err, &hostnameErr) ||
-		errors.As(err, &invalidErr)
-}
-
-// warnTLSVerification prints an actionable hint when an upstream request fails
-// certificate verification.
-func warnTLSVerification(host string, err error) {
-	if insecureUpstream || !isTLSVerificationError(err) {
-		return
-	}
-	fmt.Fprintf(os.Stderr,
-		"httpmon: upstream TLS verification failed for %s; re-run with --insecure-upstream to bypass\n",
-		host)
-}
-
-func randSerial() *big.Int {
-	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		log.Fatal("Failed to generate serial number:", err)
-	}
-	return n
-}
-
-func generateCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	template := x509.Certificate{
-		SerialNumber: randSerial(),
-		Subject: pkix.Name{
-			Organization: []string{"HTTP Monitor CA"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(10, 0, 0),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cert, err := x509.ParseCertificate(certDER)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return cert, key, nil
-}
-
-// generateCert returns a cached or newly-created leaf cert for host.
-// Key generation runs outside the mutex so concurrent requests for different
-// hosts proceed in parallel. A double-checked store ensures only one cert per
-// host ends up in the cache even if two goroutines race on the same host.
-func generateCert(host string) (*tls.Certificate, error) {
-	// Fast path: return cached cert without generating.
-	certMu.Lock()
-	if e, ok := certCache[host]; ok && time.Now().Before(e.expiresAt) {
-		cert := e.cert
-		certMu.Unlock()
-		return cert, nil
-	}
-	certMu.Unlock()
-
-	// Slow path: generate outside the lock so other hosts are not blocked.
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-
-	template := x509.Certificate{
-		SerialNumber: randSerial(),
-		Subject: pkix.Name{
-			Organization: []string{"HTTP Monitor"},
-		},
-		NotBefore:   time.Now(),
-		NotAfter:    time.Now().AddDate(1, 0, 0),
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-
-	// An IP-literal host needs an IP SAN; a DNS name must not be put in one.
-	if ip := net.ParseIP(host); ip != nil {
-		template.IPAddresses = []net.IP{ip}
-	} else {
-		template.DNSNames = []string{host}
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, caCert, &key.PublicKey, caKey)
-	if err != nil {
-		return nil, err
-	}
-
-	cert := &tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  key,
-	}
-
-	if certTTL > 0 {
-		certMu.Lock()
-		// Re-check: another goroutine may have stored a cert while we were generating.
-		if e, ok := certCache[host]; ok && time.Now().Before(e.expiresAt) {
-			cert = e.cert
-		} else {
-			certCache[host] = &certEntry{cert: cert, expiresAt: time.Now().Add(certTTL)}
-		}
-		certMu.Unlock()
-	}
-
-	return cert, nil
-}
-
-// startCertJanitor evicts expired cert cache entries every sweepInterval.
-func startCertJanitor(sweepInterval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(sweepInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			certMu.Lock()
-			for host, e := range certCache {
-				if now.After(e.expiresAt) {
-					delete(certCache, host)
-				}
-			}
-			certMu.Unlock()
-		}
-	}()
-}
-
-func nextReqID() int {
-	counterMu.Lock()
-	defer counterMu.Unlock()
-	requestCounter++
-	return requestCounter
-}
-
-// discardReqID cleans up per-request state when a request cannot be completed
-// and logResponse will never be called for this ID.
-func discardReqID(reqID int) {
-	reqStartMu.Lock()
-	delete(reqStartTimes, reqID)
-	reqStartMu.Unlock()
-	if recordMode || harMode {
-		captures.drop(reqID)
-	}
-}
-
 // matchesFilter reports whether the request URL or host contains filterPattern.
 // When filterPattern is empty every request matches.
 func matchesFilter(req *http.Request) bool {
@@ -440,518 +92,6 @@ func matchesFilter(req *http.Request) bool {
 	return strings.Contains(strings.ToLower(req.URL.String()), p) ||
 		strings.Contains(strings.ToLower(req.Host), p) ||
 		strings.Contains(strings.ToLower(req.URL.Path), p)
-}
-
-// ---- JSON output types ----
-
-type jsonRequest struct {
-	ID      int               `json:"id"`
-	Time    string            `json:"time"`
-	Method  string            `json:"method"`
-	URL     string            `json:"url"`
-	Proto   string            `json:"proto"`
-	Host    string            `json:"host"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body,omitempty"`
-}
-
-type jsonResponse struct {
-	ReqID   int               `json:"req_id"`
-	Status  int               `json:"status"`
-	Proto   string            `json:"proto"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body,omitempty"`
-	// Trailers follow the body; gRPC reports its status here.
-	Trailers map[string]string `json:"trailers,omitempty"`
-}
-
-var (
-	jsonEnc   = json.NewEncoder(os.Stdout)
-	jsonEncMu sync.Mutex
-)
-
-func flattenHeaders(h http.Header) map[string]string {
-	m := make(map[string]string, len(h))
-	for k, v := range h {
-		m[k] = strings.Join(v, ", ")
-	}
-	return m
-}
-
-// bodyAllowedForStatus mirrors net/http's unexported helper of the same name:
-// 1xx, 204 and 304 responses carry no body, so they must not be given body
-// framing headers.
-func bodyAllowedForStatus(status int) bool {
-	switch {
-	case status >= 100 && status <= 199:
-		return false
-	case status == http.StatusNoContent, status == http.StatusNotModified:
-		return false
-	}
-	return true
-}
-
-// hopByHopHeaders lists the standard hop-by-hop headers defined in RFC 7230 §6.1.
-var hopByHopHeaders = []string{
-	"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
-	"TE", "Trailer", "Transfer-Encoding", "Upgrade",
-}
-
-// removeHopByHopHeaders strips hop-by-hop headers from h per RFC 7230 §6.1.
-// It also removes any headers named in the Connection header value.
-//
-// "TE: trailers" survives: it is the one TE value HTTP/2 permits, and gRPC
-// servers reject a call without it.
-func removeHopByHopHeaders(h http.Header) {
-	wantsTrailers := false
-	for _, v := range h.Values("TE") {
-		for _, f := range strings.Split(v, ",") {
-			if strings.EqualFold(strings.TrimSpace(f), "trailers") {
-				wantsTrailers = true
-			}
-		}
-	}
-	defer func() {
-		if wantsTrailers {
-			h.Set("TE", "trailers")
-		}
-	}()
-
-	for _, v := range h["Connection"] {
-		for _, f := range strings.Split(v, ",") {
-			h.Del(strings.TrimSpace(f))
-		}
-	}
-	for _, hdr := range hopByHopHeaders {
-		h.Del(hdr)
-	}
-}
-
-// ---- logging ----
-
-// logRequest logs the request and returns the assigned request ID.
-func logRequest(req *http.Request) int {
-	reqID := nextReqID()
-
-	startTime := time.Now()
-	reqStartMu.Lock()
-	reqStartTimes[reqID] = startTime
-	reqStartMu.Unlock()
-
-	// Capture what the body sample will need later; req is reused downstream.
-	hdr := req.Header.Clone()
-	method, rawURL, proto, host := req.Method, req.URL.String(), req.Proto, req.Host
-
-	// Sample the body alongside delivery instead of reading a prefix up front.
-	// Reading first would hold a chunked upload until the client finished it.
-	sampleBody(&req.Body, hdr, req.ContentLength, func(v bodyView) {
-		onRequestBody(reqID, requestFacts{
-			method: method, rawURL: rawURL, proto: proto, host: host,
-			headers: hdr, startTime: startTime,
-		}, v)
-	})
-
-	if tuiMode {
-		entry := &tuiEntry{
-			id:         reqID,
-			startTime:  startTime,
-			method:     req.Method,
-			host:       req.Host,
-			path:       req.URL.Path,
-			rawURL:     rawURL,
-			reqHeaders: flattenHeaders(hdr),
-			pending:    true,
-		}
-		tuiSend(tuiReqMsg{entry})
-		return reqID
-	}
-
-	// JSON emits one object per request, so it waits for the body sample.
-	if jsonMode {
-		return reqID
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "\n\033[36m=== REQUEST #%d ===\033[0m\n", reqID)
-	fmt.Fprintf(&b, "Time: %s\n", startTime.Format("15:04:05"))
-	fmt.Fprintf(&b, "%s %s %s\n", method, rawURL, proto)
-	fmt.Fprintf(&b, "Host: %s\n", host)
-
-	if strings.Contains(host, ".amazonaws.com") {
-		writeS3Info(&b, req)
-	}
-
-	if req.URL.RawQuery != "" {
-		b.WriteString("\nQuery Parameters:\n")
-		params, _ := url.ParseQuery(req.URL.RawQuery)
-		for k, v := range params {
-			fmt.Fprintf(&b, "  %s: %s\n", k, strings.Join(v, ", "))
-		}
-	}
-
-	b.WriteString("\nHeaders:\n")
-	writeHeaders(&b, hdr)
-	b.WriteString("\n")
-	emitText(b.String())
-	return reqID
-}
-
-// requestFacts carries the request details needed once its body has been
-// sampled, since the request itself is forwarded in the meantime.
-type requestFacts struct {
-	method    string
-	rawURL    string
-	proto     string
-	host      string
-	headers   http.Header
-	startTime time.Time
-}
-
-// onRequestBody runs when a request body finishes streaming.
-func onRequestBody(reqID int, f requestFacts, v bodyView) {
-	if recordMode || harMode {
-		captures.addRequest(reqID, capturedRequest{facts: f, body: v})
-	}
-
-	bodyStr := truncateForDisplay(v)
-
-	if tuiMode {
-		if bodyStr != "" {
-			tuiSend(tuiReqBodyMsg{reqID: reqID, body: bodyStr})
-		}
-		return
-	}
-
-	if jsonMode {
-		jsonEncMu.Lock()
-		jsonEnc.Encode(jsonRequest{ //nolint:errcheck
-			ID:      reqID,
-			Time:    f.startTime.Format(time.RFC3339),
-			Method:  f.method,
-			URL:     f.rawURL,
-			Proto:   f.proto,
-			Host:    f.host,
-			Headers: flattenHeaders(f.headers),
-			Body:    bodyStr,
-		})
-		jsonEncMu.Unlock()
-		return
-	}
-
-	if bodyStr != "" {
-		emitText(fmt.Sprintf("\n\033[36m--- REQUEST #%d body ---\033[0m\n%s\n\n", reqID, bodyStr))
-	}
-}
-
-// ---- text output ----
-
-var (
-	// textOut receives text-mode output; tests swap it for a buffer.
-	textOut   io.Writer = os.Stdout
-	textOutMu sync.Mutex
-)
-
-// emitText writes one complete output block. Each block goes out under a
-// single lock so concurrent exchanges never interleave inside one another.
-func emitText(s string) {
-	textOutMu.Lock()
-	io.WriteString(textOut, s) //nolint:errcheck
-	textOutMu.Unlock()
-}
-
-func writeHeaders(b *strings.Builder, h http.Header) {
-	for k, v := range h {
-		fmt.Fprintf(b, "  %s: %s\n", k, strings.Join(v, ", "))
-	}
-}
-
-func writeS3Info(b *strings.Builder, req *http.Request) {
-	host := req.Host
-	// virtual-hosted style: <bucket>.s3[.<region>].amazonaws.com/<key>
-	if idx := strings.Index(host, ".s3."); idx > 0 {
-		fmt.Fprintf(b, "\033[93mS3 Bucket: %s\033[0m\n", host[:idx])
-		if key := strings.TrimPrefix(req.URL.Path, "/"); key != "" {
-			fmt.Fprintf(b, "\033[93mS3 Key/Prefix: %s\033[0m\n", key)
-		}
-		return
-	}
-	// path-style: s3[.<region>].amazonaws.com/<bucket>/<key>
-	pathParts := strings.SplitN(req.URL.Path, "/", 3)
-	if len(pathParts) >= 2 && pathParts[1] != "" {
-		fmt.Fprintf(b, "\033[93mS3 Bucket: %s\033[0m\n", pathParts[1])
-		if len(pathParts) > 2 && pathParts[2] != "" {
-			fmt.Fprintf(b, "\033[93mS3 Key/Prefix: %s\033[0m\n", pathParts[2])
-		}
-	}
-}
-
-func logResponse(resp *http.Response, reqID int) {
-	reqStartMu.Lock()
-	start := reqStartTimes[reqID]
-	delete(reqStartTimes, reqID)
-	reqStartMu.Unlock()
-	var dur time.Duration
-	if !start.IsZero() {
-		dur = time.Since(start)
-	}
-
-	hdr := resp.Header.Clone()
-	status, statusText, proto := resp.StatusCode, resp.Status, resp.Proto
-	contentLength := resp.ContentLength
-
-	// Sample alongside delivery. Reading a prefix first would withhold an SSE
-	// feed or any slow response until the upstream closed the stream.
-	//
-	// Trailers are read when the body completes: the transport fills
-	// resp.Trailer in place just before the body reports EOF.
-	sampleBody(&resp.Body, hdr, contentLength, func(v bodyView) {
-		onResponseBody(reqID, responseFacts{
-			status: status, statusText: statusText, proto: proto,
-			headers: hdr, trailers: resp.Trailer.Clone(),
-			contentLength: contentLength, duration: dur,
-		}, v)
-	})
-
-	if tuiMode {
-		tuiSend(tuiRespMsg{
-			reqID:      reqID,
-			status:     status,
-			statusText: statusText,
-			headers:    flattenHeaders(hdr),
-			duration:   dur,
-		})
-		return
-	}
-
-	// JSON emits one object per response, so it waits for the body sample.
-	if jsonMode {
-		return
-	}
-
-	// Every block carries the request number: with concurrent requests the
-	// response to #2 may well print before the one to #1.
-	var b strings.Builder
-	fmt.Fprintf(&b, "\n\033[32m=== RESPONSE #%d ===\033[0m\n", reqID)
-	fmt.Fprintf(&b, "%s %s (%s)\n", proto, statusText, dur.Round(time.Millisecond))
-	b.WriteString("\nHeaders:\n")
-	writeHeaders(&b, hdr)
-	emitText(b.String())
-}
-
-// responseFacts carries the response details needed once its body has been
-// sampled, since the response is forwarded in the meantime.
-type responseFacts struct {
-	status        int
-	statusText    string
-	proto         string
-	headers       http.Header
-	trailers      http.Header
-	contentLength int64
-	duration      time.Duration
-}
-
-// onResponseBody runs when a response body finishes streaming.
-func onResponseBody(reqID int, f responseFacts, v bodyView) {
-	if recordMode || harMode {
-		captures.addResponse(reqID, capturedResponse{facts: f, body: v})
-	}
-
-	bodyStr := truncateForDisplay(v)
-
-	if tuiMode {
-		tuiSend(tuiRespBodyMsg{reqID: reqID, body: bodyStr, trailers: flattenHeaders(f.trailers)})
-		return
-	}
-
-	if jsonMode {
-		var trailers map[string]string
-		if len(f.trailers) > 0 {
-			trailers = flattenHeaders(f.trailers)
-		}
-		jsonEncMu.Lock()
-		jsonEnc.Encode(jsonResponse{ //nolint:errcheck
-			ReqID:    reqID,
-			Status:   f.status,
-			Proto:    f.proto,
-			Headers:  flattenHeaders(f.headers),
-			Body:     bodyStr,
-			Trailers: trailers,
-		})
-		jsonEncMu.Unlock()
-		return
-	}
-
-	var b strings.Builder
-	if bodyStr != "" {
-		fmt.Fprintf(&b, "\n\033[32m--- RESPONSE #%d body ---\033[0m\n%s\n", reqID, bodyStr)
-	}
-	if len(f.trailers) > 0 {
-		fmt.Fprintf(&b, "\nTrailers:\n")
-		writeHeaders(&b, f.trailers)
-	}
-	if st := grpcStatusLine(f.headers, f.trailers); st != "" {
-		fmt.Fprintf(&b, "\n%s\n", st)
-	}
-	fmt.Fprintf(&b, "\n%s #%d end\n", strings.Repeat("-", 52), reqID)
-	emitText(b.String())
-}
-
-// truncationMarker is appended whenever displayed content is incomplete, so a
-// cut-off body is never mistaken for the whole thing.
-const truncationMarker = "\n… [truncated]"
-
-// bodyView is a captured body together with whether more data existed past the
-// capture limit. Text carries no truncation marker so that recordings and HAR
-// entries stay verbatim; the marker is added only when rendering for display.
-type bodyView struct {
-	Text      string
-	Truncated bool
-}
-
-// truncateForDisplay caps v at displayMaxBody bytes, backing off to a rune
-// boundary so multi-byte characters are never split. Content cut here, or
-// already cut at capture time, is marked so it is never read as complete.
-func truncateForDisplay(v bodyView) string {
-	s := v.Text
-	if len(s) > displayMaxBody {
-		cut := displayMaxBody
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
-		}
-		return s[:cut] + truncationMarker
-	}
-	if v.Truncated {
-		return s + truncationMarker
-	}
-	return s
-}
-
-// isPrintableContentType returns true when the MIME type suggests human-readable text.
-func isPrintableContentType(ct string) bool {
-	ct = strings.ToLower(ct)
-	if ct == "" {
-		return true
-	}
-	return strings.HasPrefix(ct, "text/") ||
-		strings.Contains(ct, "json") ||
-		strings.Contains(ct, "xml") ||
-		strings.Contains(ct, "html") ||
-		strings.Contains(ct, "javascript") ||
-		strings.Contains(ct, "form")
-}
-
-// isPrintable returns true when the Content-Type suggests human-readable text
-// AND the Content-Encoding is not a compression scheme.
-func isPrintable(header http.Header) bool {
-	if len(splitEncodings(header.Get("Content-Encoding"))) > 0 {
-		return false
-	}
-	return isPrintableContentType(header.Get("Content-Type"))
-}
-
-// writeConnError writes an HTTP error response directly onto a raw connection.
-// Used inside a CONNECT tunnel where http.ResponseWriter is no longer available.
-func writeConnError(w io.Writer, statusCode int, msg string) {
-	resp := &http.Response{
-		StatusCode: statusCode,
-		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Body:       io.NopCloser(strings.NewReader(msg)),
-		Header:     make(http.Header),
-		Close:      true,
-	}
-	resp.Header.Set("Content-Type", "text/plain")
-	resp.Write(w) //nolint:errcheck
-}
-
-// systemCABundle returns the path of the OS trusted CA bundle, or "" if not found.
-var systemCAPaths = []string{
-	"/etc/ssl/certs/ca-certificates.crt",     // Debian / Ubuntu / Alpine
-	"/etc/pki/tls/certs/ca-bundle.crt",       // RHEL / CentOS / Fedora
-	"/etc/ssl/cert.pem",                      // macOS / OpenBSD
-	"/usr/local/share/certs/ca-root-nss.crt", // FreeBSD
-	"/etc/ssl/ca-bundle.pem",                 // openSUSE
-}
-
-func systemCABundle() string {
-	for _, p := range systemCAPaths {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
-}
-
-// buildCABundle writes a PEM file that contains the system CAs (if found) followed
-// by the proxy CA, so the subprocess can verify both proxied and direct TLS connections.
-func buildCABundle(proxyCAPEM []byte) (string, error) {
-	f, err := os.CreateTemp("", "httpmon-ca-*.crt")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	if sysCA := systemCABundle(); sysCA != "" {
-		data, err := os.ReadFile(sysCA)
-		if err == nil {
-			f.Write(data) //nolint:errcheck
-		}
-	}
-
-	if _, err := f.Write(proxyCAPEM); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-// subprocessEnv builds the environment for the wrapped command: it points the
-// command at httpmon and at the generated CA bundle.
-//
-// The inherited no-proxy list is cleared. A host named there would bypass
-// httpmon completely and its traffic would go uncaptured with no indication
-// that anything was missed — and the tools people wrap most often (go, pip,
-// npm) are exactly the ones such lists tend to name. httpmon's own upstream
-// client still applies the real NO_PROXY, so where the traffic ultimately goes
-// is unchanged; it just passes through httpmon on the way.
-//
-// Most tools read SSL_CERT_FILE, but several keep their own variable and
-// ignore it, failing verification or — worse — silently bypassing httpmon.
-// Each variable here overrides an inherited value of the same name, which
-// would otherwise point the tool at a bundle without httpmon's CA.
-func subprocessEnv(base []string, proxyURL, caCertPath string) []string {
-	env := append([]string{}, base...)
-	env = append(env,
-		"HTTP_PROXY="+proxyURL,
-		"HTTPS_PROXY="+proxyURL,
-		"http_proxy="+proxyURL,
-		"https_proxy="+proxyURL,
-		"NO_PROXY=",
-		"no_proxy=",
-		// Node's built-in fetch ignores the proxy variables unless told
-		// otherwise, so its requests went straight past httpmon.
-		"NODE_USE_ENV_PROXY=1",
-	)
-	for _, k := range caBundleEnvVars {
-		env = append(env, k+"="+caCertPath)
-	}
-	return env
-}
-
-// caBundleEnvVars name every variable httpmon sets to its CA bundle.
-var caBundleEnvVars = []string{
-	"SSL_CERT_FILE",       // OpenSSL-based tools, Go, Ruby, Python ssl
-	"REQUESTS_CA_BUNDLE",  // Python requests
-	"PIP_CERT",            // pip, which otherwise prefers its vendored certifi
-	"AWS_CA_BUNDLE",       // botocore (aws CLI, boto3), which ignores the above
-	"NODE_EXTRA_CA_CERTS", // Node.js
-	"CURL_CA_BUNDLE",      // curl run from scripts, where -x/--cacert are not injected
-	"GIT_SSL_CAINFO",      // git, whose libcurl ignores SSL_CERT_FILE
-	"CARGO_HTTP_CAINFO",   // cargo
-	"DENO_CERT",           // Deno
-	// gRPC C-core (Python grpcio, Ruby, PHP…), which ships its own roots.
-	"GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
 }
 
 // isLoopbackHost reports whether a listen address only accepts local
@@ -984,19 +124,29 @@ func proxyDialHost(listenHost string) string {
 
 func main() { os.Exit(run()) }
 
+// stringFlag registers one string flag under several names, such as -o and
+// --output.
+func stringFlag(p *string, names []string, value, usage string) {
+	for _, n := range names {
+		flag.StringVar(p, n, value, usage)
+	}
+}
+
 // run holds the whole program body so that every exit path returns a code
 // instead of calling os.Exit directly, which would skip cleanup.
 func run() int {
 	defer runCleanups()
 
+	var outputPath string
 	portFlag := flag.String("port", "0", "proxy listen port; 0 picks a random free port")
 	listenFlag := flag.String("listen", "127.0.0.1", "address the proxy listens on; anything other than loopback exposes it to the network")
 	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
 	formatFlag := flag.String("format", "text", "output format: text | json")
+	stringFlag(&outputPath, []string{"o", "output"}, "", "write httpmon's output to this file instead of stderr; \"-\" for stdout")
 	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
 	uiFlag := flag.Bool("ui", false, "launch interactive terminal UI (TUI)")
 	recordFlag := flag.String("record", "", "path to write recorded traffic as NDJSON (appends if file exists)")
-	harFlag := flag.String("har", "", "write captured traffic as HAR 1.2 JSON on exit")
+	harFlag := flag.String("har", "", "write captured traffic as HAR 1.2 JSON")
 	replayFlag := flag.String("replay", "", "path of a recorded NDJSON file to replay (skips proxy, no <command> needed)")
 	replayTargetFlag := flag.String("replay-target", "", "override base URL for replay (e.g. https://staging.example.com)")
 	replayDelayFlag := flag.Duration("replay-delay", 0, "pause between replayed requests")
@@ -1005,19 +155,26 @@ func run() int {
 	upstreamProxyFlag := flag.String("upstream-proxy", "", "proxy for httpmon's own upstream requests (default: HTTP(S)_PROXY from the environment)")
 	maxBodyFlag := flag.Int("max-body", 1000, "max bytes of each body shown in output")
 	maxCaptureFlag := flag.Int("max-capture", 1<<20, "max bytes of each body kept for --record/--har and decompression")
+	showSecretsFlag := flag.Bool("show-secrets", false, "show credentials (Authorization, cookies, API keys, signed URLs) in output instead of masking them")
+	redactFlag := flag.Bool("redact", false, "mask credentials in --record and --har files too")
+	caDirFlag := flag.String("ca-dir", os.Getenv("HTTPMON_CA_DIR"), "keep the CA in this directory across runs, creating it on first use (default $HTTPMON_CA_DIR)")
+	noColorFlag := flag.Bool("no-color", false, "disable coloured output")
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
 		fmt.Fprintln(os.Stderr, "       httpmon --replay <file> [--replay-target <url>]")
+		fmt.Fprintln(os.Stderr, "       httpmon --ca-dir <dir>        (create or show a persistent CA)")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "httpmon's output goes to stderr (or -o <file>); the command's stdout is left untouched.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Options:")
 		flag.PrintDefaults()
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Examples:")
 		fmt.Fprintln(os.Stderr, "  httpmon curl https://api.github.com")
-		fmt.Fprintln(os.Stderr, "  httpmon --port 9090 aws s3 ls")
+		fmt.Fprintln(os.Stderr, "  httpmon curl -s https://api.github.com | jq .   # jq gets curl's output")
 		fmt.Fprintln(os.Stderr, "  httpmon --filter /api curl https://example.com/api/v1/users")
-		fmt.Fprintln(os.Stderr, "  httpmon --format json curl https://api.github.com | jq .")
+		fmt.Fprintln(os.Stderr, "  httpmon --format json -o trace.ndjson curl https://api.github.com")
 		fmt.Fprintln(os.Stderr, "  httpmon --ui curl https://api.github.com")
 		fmt.Fprintln(os.Stderr, "  httpmon --record traffic.ndjson curl https://api.github.com")
 		fmt.Fprintln(os.Stderr, "  httpmon --har traffic.har curl https://api.github.com")
@@ -1040,6 +197,8 @@ func run() int {
 	}
 	displayMaxBody = *maxBodyFlag
 	captureMaxBody = *maxCaptureFlag
+	showSecrets = *showSecretsFlag
+	redactCaptures = *redactFlag
 
 	if *upstreamProxyFlag != "" {
 		u, err := url.Parse(*upstreamProxyFlag)
@@ -1050,14 +209,58 @@ func run() int {
 		upstreamProxy = u
 	}
 
+	switch *formatFlag {
+	case "text", "json":
+	default:
+		fmt.Fprintf(os.Stderr, "httpmon: unknown --format %q (want text or json)\n", *formatFlag)
+		return 1
+	}
 	jsonMode = *formatFlag == "json"
 	// Assigned before the replay branch so replay honours it too: a recording
 	// captured from a self-signed or internal-CA host must be replayable.
 	insecureUpstream = *insecureFlag
+	upstreamClient = newUpstreamClient(insecureUpstream)
+	h2cClient = newH2CClient()
+
+	// ── Output channel ───────────────────────────────────────────────────────
+	// Replay has no wrapped command, so its results are its stdout.
+	defaultOut := os.Stderr
+	if *replayFlag != "" {
+		defaultOut = os.Stdout
+	}
+	out, closeOut, err := openOutput(outputPath, defaultOut)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "httpmon: cannot open output %s: %v\n", outputPath, err)
+		return 1
+	}
+	addCleanup(closeOut)
+	setOutput(out)
+	useColor = !*noColorFlag && os.Getenv("NO_COLOR") == "" && isTerminal(out)
 
 	// ── Replay mode: no proxy, no subprocess ─────────────────────────────────
 	if *replayFlag != "" {
 		return replayFile(*replayFlag, *replayTargetFlag, *replayDelayFlag, *replayFailFlag)
+	}
+
+	// ── CA ───────────────────────────────────────────────────────────────────
+	cmdArgs := flag.Args()
+	if *caDirFlag != "" {
+		certPath, created, err := loadOrCreateCA(*caDirFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon: --ca-dir: %v\n", err)
+			return 1
+		}
+		if len(cmdArgs) == 0 {
+			verb := "Using"
+			if created {
+				verb = "Created"
+			}
+			fmt.Printf("%s httpmon CA: %s\n", verb, certPath)
+			fmt.Printf("  %s\n  valid until %s\n", caCert.Subject.CommonName, caCert.NotAfter.Format("2006-01-02"))
+			fmt.Println("Import this certificate into a device or trust store to let it trust httpmon.")
+			fmt.Println("Keep the directory private: its key can intercept every connection that trusts this CA.")
+			return 0
+		}
 	}
 
 	filterPattern = *filterFlag
@@ -1066,8 +269,11 @@ func run() int {
 	harMode = *harFlag != ""
 	harPath = *harFlag
 	certTTL = *certTTLFlag
-	upstreamClient = newUpstreamClient(insecureUpstream)
-	h2cClient = newH2CClient()
+
+	if len(cmdArgs) < 1 {
+		flag.Usage()
+		return 1
+	}
 
 	if recordMode {
 		if err := openRecordFile(*recordFlag); err != nil {
@@ -1075,6 +281,14 @@ func run() int {
 			return 1
 		}
 		addCleanup(func() { recordFile.Close() }) //nolint:errcheck
+	}
+	if harMode {
+		if err := openHARFile(harPath); err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon: cannot create HAR file %s: %v\n", harPath, err)
+			return 1
+		}
+		// finishHAR normally closes it; this covers the early exits.
+		addCleanup(func() { closeHAR() }) //nolint:errcheck
 	}
 	if certTTL > 0 {
 		// Sweep expired entries at 1/6 of the TTL interval, minimum every minute.
@@ -1085,24 +299,20 @@ func run() int {
 		startCertJanitor(sweep)
 	}
 
-	cmdArgs := flag.Args()
-	if len(cmdArgs) < 1 {
-		flag.Usage()
-		return 1
-	}
-
-	proxyCAPEM := &bytes.Buffer{}
-	pem.Encode(proxyCAPEM, &pem.Block{ //nolint:errcheck
-		Type:  "CERTIFICATE",
-		Bytes: caCert.Raw,
-	})
-
-	caCertPath, err := buildCABundle(proxyCAPEM.Bytes())
+	caCertPath, err := buildCABundle(caPEM())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon: failed to build CA bundle: %v\n", err)
 		return 1
 	}
 	addCleanup(func() { os.Remove(caCertPath) }) //nolint:errcheck
+
+	trustStore, err := buildJavaTrustStore(caCertPath)
+	if err != nil {
+		// Only Java needs it; everything else can still be inspected.
+		fmt.Fprintf(os.Stderr, "httpmon: Java truststore not created, JVM tools will not be configured: %v\n", err)
+	} else {
+		addCleanup(func() { os.Remove(trustStore) }) //nolint:errcheck
+	}
 
 	listenAddr := net.JoinHostPort(*listenFlag, *portFlag)
 	ln, err := net.Listen("tcp", listenAddr)
@@ -1117,7 +327,8 @@ func run() int {
 			ln.Addr())
 	}
 	// What the wrapped command dials. A wildcard bind is reached via loopback.
-	proxyURL := "http://" + net.JoinHostPort(proxyDialHost(*listenFlag), proxyPort)
+	dialHost := proxyDialHost(*listenFlag)
+	proxyURL := "http://" + net.JoinHostPort(dialHost, proxyPort)
 
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1131,22 +342,9 @@ func run() int {
 		// hijacked CONNECT tunnels are unaffected, so long-lived streams and
 		// WebSocket splices still work.
 		ReadHeaderTimeout: 30 * time.Second,
+		ErrorLog:          log.New(io.Discard, "", 0),
 	}
-
 	go func() {
-		if !jsonMode {
-			fmt.Printf("Starting MITM proxy on %s\n", ln.Addr())
-			fmt.Printf("CA bundle written to: %s\n", caCertPath)
-			if sysCA := systemCABundle(); sysCA != "" {
-				fmt.Printf("System CA bundle merged from: %s\n", sysCA)
-			}
-			if filterPattern != "" {
-				fmt.Printf("Filter: %q\n", filterPattern)
-			}
-			if insecureUpstream {
-				fmt.Println("Upstream TLS verification: DISABLED (--insecure-upstream)")
-			}
-		}
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			// Print rather than exit: the subprocess is already running and
 			// os.Exit here would skip cleanup of the CA bundle.
@@ -1154,84 +352,45 @@ func run() int {
 		}
 	}()
 
-	cmdName := filepath.Base(cmdArgs[0])
-
-	if cmdName == "curl" {
-		hasProxy := false
-		hasCACert := false
-		hasInsecure := false
-
-		for _, arg := range cmdArgs {
-			switch arg {
-			case "-x", "--proxy":
-				hasProxy = true
-			case "--cacert":
-				hasCACert = true
-			case "-k", "--insecure":
-				hasInsecure = true
-			}
+	if strings.EqualFold(strings.TrimSuffix(filepath.Base(cmdArgs[0]), ".exe"), "curl") {
+		cmdArgs, err = curlArgs(cmdArgs, proxyURL, caCertPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "httpmon: %v\n", err)
+			return 1
 		}
-
-		newArgs := []string{cmdArgs[0]}
-		if !hasProxy {
-			newArgs = append(newArgs, "-x", proxyURL)
-		}
-		if !hasCACert && !hasInsecure {
-			newArgs = append(newArgs, "--cacert", caCertPath)
-		}
-		newArgs = append(newArgs, cmdArgs[1:]...)
-		cmdArgs = newArgs
 	}
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-
 	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath)
+	if trustStore != "" {
+		cmd.Env = append(cmd.Env, "JAVA_TOOL_OPTIONS="+
+			javaToolOptions(lookupEnv(os.Environ(), "JAVA_TOOL_OPTIONS"), dialHost, proxyPort, trustStore))
+	}
+
+	// The banner is diagnostic, so it goes to stderr whatever -o says.
+	if !tuiMode {
+		var b strings.Builder
+		fmt.Fprintf(&b, "httpmon %s: proxy on %s, CA bundle %s\n", version, ln.Addr(), caCertPath)
+		if filterPattern != "" {
+			fmt.Fprintf(&b, "httpmon: filter %q\n", filterPattern)
+		}
+		if insecureUpstream {
+			b.WriteString("httpmon: upstream TLS verification DISABLED (--insecure-upstream)\n")
+		}
+		if outputPath != "" && outputPath != "-" {
+			fmt.Fprintf(&b, "httpmon: writing output to %s\n", outputPath)
+		}
+		fmt.Fprintf(&b, "httpmon: running %s\n", strings.Join(cmdArgs, " "))
+		fmt.Fprint(os.Stderr, b.String())
+	}
 
 	if tuiMode {
-		// In TUI mode the subprocess output is captured and shown after the UI exits.
-		var subOut bytes.Buffer
-		cmd.Stdout = &subOut
-		cmd.Stderr = &subOut
-		cmd.Stdin = os.Stdin
-
-		exitCh := make(chan int, 1)
-		go func() {
-			code := 0
-			if err := cmd.Run(); err != nil {
-				if exitErr, ok := err.(*exec.ExitError); ok {
-					code = exitErr.ExitCode()
-				} else {
-					code = 1
-				}
-			}
-			tuiSend(tuiDoneMsg{code})
-			exitCh <- code
-		}()
-
-		runTUI()
-
-		// Kill subprocess if user quit the TUI before it finished.
-		if cmd.Process != nil {
-			cmd.Process.Kill() //nolint:errcheck
-		}
-		code := <-exitCh
-		drainInflight(exitDrainTimeout)
-
-		if out := subOut.String(); out != "" {
-			fmt.Fprintln(os.Stderr, "\n── Command Output ─────────────────────────────────────")
-			fmt.Fprint(os.Stderr, out)
-		}
-		return finishHAR(code)
+		return runWithTUI(cmd)
 	}
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-
-	if !jsonMode {
-		fmt.Printf("\nRunning: %s\n", strings.Join(cmdArgs, " "))
-		fmt.Println(strings.Repeat("=", 60))
-	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1247,7 +406,7 @@ func run() int {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "httpmon: %v\n", err)
 			exitCode = 1
 		}
 	}
@@ -1256,17 +415,199 @@ func run() int {
 	return finishHAR(exitCode)
 }
 
+// runWithTUI runs cmd behind the interactive UI. The command's output is held
+// back while the UI owns the terminal and replayed afterwards, stdout to
+// stdout and stderr to stderr. It gets no stdin: the UI reads the keyboard.
+func runWithTUI(cmd *exec.Cmd) int {
+	var subOut, subErr bytes.Buffer
+	cmd.Stdout = &subOut
+	cmd.Stderr = &subErr
+	cmd.Stdin = nil
+
+	// Draw on the terminal. When stdout is redirected it is the command's
+	// output, so draw on stderr.
+	if !isTerminal(os.Stdout) {
+		tuiOut = os.Stderr
+	}
+
+	exitCh := make(chan int, 1)
+	go func() {
+		code := 0
+		if err := cmd.Run(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				code = exitErr.ExitCode()
+			} else {
+				noticef("%v", err)
+				code = 1
+			}
+		}
+		tuiSend(tuiDoneMsg{code})
+		exitCh <- code
+	}()
+
+	runTUI()
+
+	// Kill subprocess if user quit the TUI before it finished.
+	if cmd.Process != nil {
+		cmd.Process.Kill() //nolint:errcheck
+	}
+	code := <-exitCh
+	drainInflight(exitDrainTimeout)
+
+	printTUINotices(os.Stderr)
+	os.Stdout.Write(subOut.Bytes()) //nolint:errcheck
+	os.Stderr.Write(subErr.Bytes()) //nolint:errcheck
+	return finishHAR(code)
+}
+
+// openOutput opens httpmon's output destination: def when path is empty,
+// stdout for "-", otherwise the named file.
+func openOutput(path string, def *os.File) (io.Writer, func(), error) {
+	switch path {
+	case "":
+		return def, func() {}, nil
+	case "-":
+		return os.Stdout, func() {}, nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, func() { f.Close() }, nil //nolint:errcheck
+}
+
+// isTerminal reports whether w is a terminal.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	return ok && (isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd()))
+}
+
+// curlArgs points a curl command line at httpmon: -x for the proxy and a CA
+// bundle that includes httpmon's CA. Options the user already gave are
+// respected -- their own -x means they chose another route, -k means no
+// verification is wanted -- but their own --cacert is merged with httpmon's CA
+// rather than left to fail against httpmon's certificates.
+func curlArgs(args []string, proxyURL, caBundle string) ([]string, error) {
+	hasProxy, hasInsecure := false, false
+	caIdx, caInline := -1, false // position of the user's --cacert value
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			break
+		}
+		switch {
+		case a == "--proxy" || a == "-x" || strings.HasPrefix(a, "--proxy="):
+			hasProxy = true
+			if !strings.Contains(a, "=") {
+				i++
+			}
+		case a == "--insecure":
+			hasInsecure = true
+		case a == "--cacert":
+			caIdx = i + 1
+			i++
+		case strings.HasPrefix(a, "--cacert="):
+			caIdx, caInline = i, true
+		case strings.HasPrefix(a, "--"):
+			if curlLongTakesValue[strings.SplitN(a[2:], "=", 2)[0]] && !strings.Contains(a, "=") {
+				i++
+			}
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			// A cluster of short options; the first one that takes a value
+			// consumes the rest of the cluster, or the next argument.
+			for j := 1; j < len(a); j++ {
+				c := a[j]
+				if c == 'k' {
+					hasInsecure = true
+				}
+				if strings.IndexByte(curlShortTakesValue, c) >= 0 {
+					if c == 'x' {
+						hasProxy = true
+					}
+					if j == len(a)-1 {
+						i++
+					}
+					break
+				}
+			}
+		}
+	}
+
+	out := []string{args[0]}
+	if !hasProxy {
+		out = append(out, "-x", proxyURL)
+	}
+	rest := append([]string(nil), args[1:]...)
+	if caIdx > 0 && caIdx < len(args) && !hasInsecure {
+		userCA := args[caIdx]
+		if caInline {
+			userCA = strings.TrimPrefix(args[caIdx], "--cacert=")
+		}
+		merged, err := mergeCABundle(userCA, caBundle)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read --cacert %s: %w", userCA, err)
+		}
+		addCleanup(func() { os.Remove(merged) }) //nolint:errcheck
+		if caInline {
+			rest[caIdx-1] = "--cacert=" + merged
+		} else {
+			rest[caIdx-1] = merged
+		}
+	} else if caIdx < 0 && !hasInsecure {
+		out = append(out, "--cacert", caBundle)
+	}
+	return append(out, rest...), nil
+}
+
+// curlShortTakesValue lists curl's short options that take an argument.
+const curlShortTakesValue = "AbcCdDeEFHKmoPQrtTuUwxXyYz"
+
+// curlLongTakesValue lists common long options that take an argument, so
+// their value is not mistaken for an option.
+var curlLongTakesValue = map[string]bool{
+	"data": true, "data-binary": true, "data-raw": true, "data-urlencode": true, "data-ascii": true,
+	"header": true, "output": true, "user": true, "user-agent": true, "referer": true,
+	"request": true, "form": true, "upload-file": true, "write-out": true, "max-time": true,
+	"connect-timeout": true, "cookie": true, "cookie-jar": true, "cert": true, "key": true,
+	"resolve": true, "connect-to": true, "proxy-user": true, "json": true, "url": true,
+	"capath": true, "config": true, "range": true, "retry": true, "limit-rate": true,
+	"noproxy": true, "proxy-header": true, "variable": true, "aws-sigv4": true, "oauth2-bearer": true,
+}
+
+// mergeCABundle writes a bundle holding the user's CA file and httpmon's.
+func mergeCABundle(userCA, ours string) (string, error) {
+	a, err := os.ReadFile(userCA)
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(ours)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp("", "httpmon-curl-ca-*.crt")
+	if err != nil {
+		return "", err
+	}
+	data := append(append(a, '\n'), b...)
+	if _, err := f.Write(data); err != nil {
+		f.Close() //nolint:errcheck
+		return "", err
+	}
+	return f.Name(), f.Close()
+}
+
 // exitDrainTimeout bounds how long httpmon waits, once the wrapped command
 // has exited, for exchanges still in flight to be logged and recorded.
 const exitDrainTimeout = 3 * time.Second
 
-// finishHAR writes the HAR file when --har is active, promoting a write failure
-// to a non-zero exit code so a silent loss of captured traffic is impossible.
+// finishHAR completes the HAR file when --har is active, promoting a write
+// failure to a non-zero exit code so a silent loss of captured traffic is
+// impossible.
 func finishHAR(exitCode int) int {
 	if !harMode {
 		return exitCode
 	}
-	if err := writeHARFile(harPath); err != nil {
+	if err := closeHAR(); err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon: failed to write HAR file %s: %v\n", harPath, err)
 		if exitCode == 0 {
 			return 1

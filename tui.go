@@ -2,16 +2,25 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	osc52 "github.com/aymanbagabas/go-osc52/v2"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// tuiEntry holds one HTTP transaction displayed in the TUI.
+// tuiEntry holds one HTTP transaction displayed in the TUI. Every string in
+// it has already been masked for display; rawReqHeaders keeps the real values
+// for "copy as curl", which the user asks for explicitly.
 type tuiEntry struct {
 	id          int
 	startTime   time.Time
@@ -28,7 +37,28 @@ type tuiEntry struct {
 	respTrailer map[string]string
 	duration    time.Duration
 	pending     bool
+
+	// for copy-as-curl
+	curlURL       string
+	rawReqHeaders http.Header
+	reqBodyRaw    []byte
+	reqBodyWhole  bool
+
+	failed   string // the error, when the exchange got no response
+	grpcLine string
+
+	ws       bool     // an upgraded WebSocket connection
+	wsLines  []string // most recent messages, rendered
+	wsCount  int
+	wsClosed string // summary, once closed
 }
+
+// maxTUIEntries bounds the TUI's memory in a long session; the oldest entries
+// are dropped first. maxWSLines bounds the messages kept per connection.
+const (
+	maxTUIEntries = 5000
+	maxWSLines    = 200
+)
 
 // Messages exchanged with the TUI model via tuiQueue.
 type tuiReqMsg struct{ entry *tuiEntry }
@@ -39,6 +69,7 @@ type tuiRespMsg struct {
 	headers    map[string]string
 	body       string
 	duration   time.Duration
+	upgraded   bool
 }
 type tuiDoneMsg struct{ exitCode int }
 
@@ -47,12 +78,29 @@ type tuiDoneMsg struct{ exitCode int }
 type tuiReqBodyMsg struct {
 	reqID int
 	body  string
+	raw   []byte
+	whole bool
 }
 type tuiRespBodyMsg struct {
 	reqID    int
 	body     string
 	trailers map[string]string
+	grpcLine string
 }
+type tuiFailMsg struct {
+	reqID    int
+	err      string
+	duration time.Duration
+}
+type tuiWSMsg struct {
+	reqID int
+	line  string
+}
+type tuiWSClosedMsg struct {
+	reqID   int
+	summary string
+}
+type tuiNoticeMsg struct{ text string }
 
 // tuiQueue carries proxy events to the TUI. It is unbounded: proxy
 // goroutines must never block on the display, and a fixed-size channel with a
@@ -99,6 +147,93 @@ func (q *eventQueue) pop() tea.Msg {
 	}
 }
 
+// ---- sink ----
+
+type tuiSink struct{}
+
+var tuiOutput = tuiSink{}
+
+func displayFlat(h http.Header) map[string]string { return flattenHeaders(displayHeaders(h)) }
+
+func (tuiSink) requestHead(id int, f *requestFacts) {
+	tuiSend(tuiReqMsg{&tuiEntry{
+		id:            id,
+		startTime:     f.startTime,
+		method:        f.method,
+		host:          f.host,
+		path:          f.path,
+		rawURL:        displayURL(f.rawURL),
+		reqHeaders:    displayFlat(f.headers),
+		pending:       true,
+		curlURL:       f.rawURL,
+		rawReqHeaders: f.headers,
+	}})
+}
+
+func (tuiSink) requestBody(id int, _ *requestFacts, v bodyView) {
+	tuiSend(tuiReqBodyMsg{reqID: id, body: truncateForDisplay(v), raw: v.Raw, whole: !v.RawTruncated})
+}
+
+func (tuiSink) responseHead(id int, f *responseFacts) {
+	tuiSend(tuiRespMsg{
+		reqID:      id,
+		status:     f.status,
+		statusText: f.statusText,
+		headers:    displayFlat(f.headers),
+		duration:   f.duration,
+		upgraded:   f.upgraded,
+	})
+}
+
+func (tuiSink) responseBody(id int, f *responseFacts, v bodyView) {
+	var trailers map[string]string
+	if len(f.trailers) > 0 {
+		trailers = displayFlat(f.trailers)
+	}
+	tuiSend(tuiRespBodyMsg{reqID: id, body: truncateForDisplay(v), trailers: trailers, grpcLine: grpcStatusLine(f.headers, f.trailers)})
+}
+
+func (tuiSink) failed(id int, _ *requestFacts, err string, dur time.Duration) {
+	tuiSend(tuiFailMsg{reqID: id, err: err, duration: dur})
+}
+
+func (tuiSink) wsMessage(id int, m wsMessage) {
+	line := fmt.Sprintf("%s %s %s", m.at.Format("15:04:05.000"), m.direction(), m.describe())
+	if s := m.displayText(); s != "" {
+		line += "\n  " + strings.ReplaceAll(s, "\n", "\n  ")
+	}
+	tuiSend(tuiWSMsg{reqID: id, line: line})
+}
+
+func (tuiSink) wsClosed(id int, s wsSummary) {
+	tuiSend(tuiWSClosedMsg{reqID: id, summary: s.describe()})
+}
+
+func (tuiSink) connect(string) {}
+
+// tuiNotices keeps every notice so they can be printed once the TUI exits;
+// on screen only the latest fits.
+var (
+	tuiNotices   []string
+	tuiNoticesMu sync.Mutex
+)
+
+func (tuiSink) notice(msg string) {
+	tuiNoticesMu.Lock()
+	tuiNotices = append(tuiNotices, msg)
+	tuiNoticesMu.Unlock()
+	tuiSend(tuiNoticeMsg{msg})
+}
+
+// printTUINotices writes the notices collected during the session to w.
+func printTUINotices(w io.Writer) {
+	tuiNoticesMu.Lock()
+	defer tuiNoticesMu.Unlock()
+	for _, n := range tuiNotices {
+		fmt.Fprintf(w, "httpmon: %s\n", sanitizeLine(n)) //nolint:errcheck // stderr
+	}
+}
+
 // ── Styles ───────────────────────────────────────────────────────────────────
 
 var (
@@ -107,27 +242,43 @@ var (
 	stylePending  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	styleErr      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	styleOK       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	styleWS       = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
 	styleDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	styleSep      = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	styleWarn     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 // ── Model ────────────────────────────────────────────────────────────────────
 
 type tuiModel struct {
 	entries    []*tuiEntry
-	cursor     int
+	byID       map[int]*tuiEntry
+	cursor     int // index into visible()
 	vp         viewport.Model
 	showDetail bool
 	width      int
 	height     int
 	ready      bool
 	doneMsg    string
+
+	filter    string // applied search
+	searching bool   // typing a search
+	input     string // search being typed
+
+	notice   string // latest notice
+	notices  int
+	flash    string // short-lived feedback, e.g. "copied"
+	flashFor int    // entry the flash refers to
 }
 
-func newTUIModel() tuiModel { return tuiModel{} }
+func newTUIModel() tuiModel { return tuiModel{byID: map[int]*tuiEntry{}} }
+
+// tuiOut is where the TUI draws: the terminal. When stdout is redirected the
+// wrapped command's output goes there, so the TUI draws on stderr instead.
+var tuiOut io.Writer = os.Stdout
 
 func runTUI() {
-	tea.NewProgram(newTUIModel(), tea.WithAltScreen()).Run() //nolint:errcheck
+	tea.NewProgram(newTUIModel(), tea.WithAltScreen(), tea.WithOutput(tuiOut)).Run() //nolint:errcheck
 }
 
 func (m tuiModel) Init() tea.Cmd { return listenTUI() }
@@ -136,12 +287,50 @@ func listenTUI() tea.Cmd {
 	return func() tea.Msg { return tuiQueue.pop() }
 }
 
+// visible returns the entries matching the current search.
+func (m *tuiModel) visible() []*tuiEntry {
+	if m.filter == "" {
+		return m.entries
+	}
+	var out []*tuiEntry
+	for _, e := range m.entries {
+		if m.matches(e) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// matches reports whether e matches the search: a case-insensitive substring
+// of its method, URL, status or error.
+func (m *tuiModel) matches(e *tuiEntry) bool {
+	q := strings.ToLower(m.filter)
+	hay := strings.ToLower(fmt.Sprintf("%s %s %d %s", e.method, e.rawURL, e.status, e.failed))
+	return strings.Contains(hay, q)
+}
+
+func (m *tuiModel) selected() *tuiEntry {
+	v := m.visible()
+	if m.cursor < 0 || m.cursor >= len(v) {
+		return nil
+	}
+	return v[m.cursor]
+}
+
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var vpCmd tea.Cmd
+	if m.byID == nil {
+		m.byID = map[int]*tuiEntry{}
+	}
 
 	switch msg := msg.(type) {
 
 	case tea.KeyMsg:
+		if m.searching {
+			return m.updateSearch(msg), nil
+		}
+		m.flash = ""
+		n := len(m.visible())
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -152,7 +341,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "down", "j":
-			if m.cursor < len(m.entries)-1 {
+			if m.cursor < n-1 {
 				m.cursor++
 				m.refreshDetail(true)
 			}
@@ -162,20 +351,33 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshDetail(true)
 			return m, nil
 		case "G":
-			if len(m.entries) > 0 {
-				m.cursor = len(m.entries) - 1
+			if n > 0 {
+				m.cursor = n - 1
 				m.refreshDetail(true)
 			}
 			return m, nil
 		case "enter", " ":
-			if len(m.entries) > 0 {
+			if n > 0 {
 				m.showDetail = !m.showDetail
 				m.applySize()
 			}
 			return m, nil
 		case "esc":
-			m.showDetail = false
+			if m.showDetail {
+				m.showDetail = false
+			} else if m.filter != "" {
+				m.setFilter("")
+			}
 			m.applySize()
+			return m, nil
+		case "/":
+			m.searching, m.input = true, m.filter
+			return m, nil
+		case "c":
+			m.copyAsCurl()
+			return m, nil
+		case "e":
+			m.exportSelected()
 			return m, nil
 		}
 		// Keys the list does not use (pgup/pgdn, ctrl+u/ctrl+d, home/end)
@@ -196,23 +398,24 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tuiReqMsg:
+		// Auto-follow if the cursor was on the newest visible entry.
+		follow := m.cursor >= len(m.visible())-1
 		m.entries = append(m.entries, msg.entry)
-		// Auto-follow if cursor was already at the last entry.
-		if m.cursor == len(m.entries)-2 {
-			m.cursor = len(m.entries) - 1
+		m.byID[msg.entry.id] = msg.entry
+		m.trim()
+		if n := len(m.visible()); follow && n > 0 && (m.cursor != n-1 || n == 1) {
+			m.cursor = n - 1
 			m.refreshDetail(true)
 		}
 		return m, listenTUI()
 
 	case tuiRespMsg:
-		for _, e := range m.entries {
-			if e.id == msg.reqID {
-				e.pending = false
-				e.status, e.statusText = msg.status, msg.statusText
-				e.respHeaders, e.respBody = msg.headers, msg.body
-				e.duration = msg.duration
-				break
-			}
+		if e := m.byID[msg.reqID]; e != nil {
+			e.pending = false
+			e.status, e.statusText = msg.status, msg.statusText
+			e.respHeaders, e.respBody = msg.headers, msg.body
+			e.duration = msg.duration
+			e.ws = msg.upgraded
 		}
 		// Keep the scroll position: the user may be reading the request half
 		// of the panel when the response lands.
@@ -220,24 +423,51 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenTUI()
 
 	case tuiReqBodyMsg:
-		for _, e := range m.entries {
-			if e.id == msg.reqID {
-				e.reqBody = msg.body
-				break
-			}
+		if e := m.byID[msg.reqID]; e != nil {
+			e.reqBody, e.reqBodyRaw, e.reqBodyWhole = msg.body, msg.raw, msg.whole
 		}
 		m.refreshDetail(false)
 		return m, listenTUI()
 
 	case tuiRespBodyMsg:
-		for _, e := range m.entries {
-			if e.id == msg.reqID {
-				e.respBody = msg.body
-				e.respTrailer = msg.trailers
-				break
+		if e := m.byID[msg.reqID]; e != nil {
+			e.respBody = msg.body
+			e.respTrailer = msg.trailers
+			e.grpcLine = msg.grpcLine
+		}
+		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiFailMsg:
+		if e := m.byID[msg.reqID]; e != nil {
+			e.pending = false
+			e.failed = msg.err
+			e.duration = msg.duration
+		}
+		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiWSMsg:
+		if e := m.byID[msg.reqID]; e != nil {
+			e.wsCount++
+			e.wsLines = append(e.wsLines, msg.line)
+			if len(e.wsLines) > maxWSLines {
+				e.wsLines = e.wsLines[len(e.wsLines)-maxWSLines:]
 			}
 		}
 		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiWSClosedMsg:
+		if e := m.byID[msg.reqID]; e != nil {
+			e.wsClosed = msg.summary
+		}
+		m.refreshDetail(false)
+		return m, listenTUI()
+
+	case tuiNoticeMsg:
+		m.notice = msg.text
+		m.notices++
 		return m, listenTUI()
 
 	case tuiDoneMsg:
@@ -249,6 +479,62 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.vp, vpCmd = m.vp.Update(msg)
 	}
 	return m, vpCmd
+}
+
+// updateSearch handles keys while a search is being typed.
+func (m tuiModel) updateSearch(msg tea.KeyMsg) tuiModel {
+	switch msg.Type {
+	case tea.KeyEnter:
+		m.searching = false
+		m.setFilter(m.input)
+	case tea.KeyEsc:
+		m.searching = false
+		m.setFilter("")
+	case tea.KeyBackspace:
+		if r := []rune(m.input); len(r) > 0 {
+			m.input = string(r[:len(r)-1])
+		}
+	case tea.KeyRunes, tea.KeySpace:
+		m.input += string(msg.Runes)
+	}
+	return m
+}
+
+// setFilter applies a search, keeping the selected entry selected when it
+// still matches.
+func (m *tuiModel) setFilter(f string) {
+	sel := m.selected()
+	m.filter = f
+	m.cursor = 0
+	v := m.visible()
+	for i, e := range v {
+		if e == sel {
+			m.cursor = i
+		}
+	}
+	if len(v) > 0 && sel == nil {
+		m.cursor = len(v) - 1
+	}
+	m.refreshDetail(true)
+}
+
+// trim drops the oldest entries beyond maxTUIEntries.
+func (m *tuiModel) trim() {
+	over := len(m.entries) - maxTUIEntries
+	if over <= 0 {
+		return
+	}
+	sel := m.selected()
+	for _, e := range m.entries[:over] {
+		delete(m.byID, e.id)
+	}
+	m.entries = append([]*tuiEntry(nil), m.entries[over:]...)
+	m.cursor = 0
+	for i, e := range m.visible() {
+		if e == sel {
+			m.cursor = i
+		}
+	}
 }
 
 func (m *tuiModel) listH() int {
@@ -282,55 +568,160 @@ func (m *tuiModel) applySize() {
 // to the top, which is wanted when the selected entry changes but not when the
 // current entry is merely updated in place.
 func (m *tuiModel) refreshDetail(resetScroll bool) {
-	if !m.ready || len(m.entries) == 0 || m.cursor >= len(m.entries) {
+	e := m.selected()
+	if !m.ready || e == nil {
 		return
 	}
-	m.vp.SetContent(renderEntryDetail(m.entries[m.cursor]))
+	m.vp.SetContent(renderEntryDetail(e, true))
 	if resetScroll {
 		m.vp.GotoTop()
 	}
 }
 
-// ── Detail panel renderer ─────────────────────────────────────────────────────
+// ── Actions ──────────────────────────────────────────────────────────────────
 
-func renderEntryDetail(e *tuiEntry) string {
+// copyAsCurl puts a curl command reproducing the selected request on the
+// clipboard, using OSC 52 so it works over SSH too.
+func (m *tuiModel) copyAsCurl() {
+	e := m.selected()
+	if e == nil {
+		return
+	}
+	cmd := curlCommand(e)
+	seq := osc52.New(cmd)
+	if os.Getenv("TMUX") != "" {
+		seq = seq.Tmux()
+	} else if strings.HasPrefix(os.Getenv("TERM"), "screen") {
+		seq = seq.Screen()
+	}
+	seq.WriteTo(tuiOut) //nolint:errcheck
+	m.flash = fmt.Sprintf("copied #%d as curl (%d chars)", e.id, len(cmd))
+	m.flashFor = e.id
+}
+
+// exportSelected writes the selected entry's detail to a file in the current
+// directory.
+func (m *tuiModel) exportSelected() {
+	e := m.selected()
+	if e == nil {
+		return
+	}
+	name := fmt.Sprintf("httpmon-%d-%d.txt", os.Getpid(), e.id)
+	err := os.WriteFile(name, []byte(renderEntryDetail(e, false)), 0o600)
+	if err != nil {
+		m.flash = "export failed: " + err.Error()
+		return
+	}
+	if abs, err := filepath.Abs(name); err == nil {
+		name = abs
+	}
+	m.flash = "exported #" + fmt.Sprint(e.id) + " to " + name
+	m.flashFor = e.id
+}
+
+// curlSkipHeaders are not worth reproducing: curl sets them itself, or they
+// describe the hop to httpmon rather than the request.
+var curlSkipHeaders = map[string]bool{
+	"Content-Length": true, "Host": true, "Connection": true, "Proxy-Connection": true,
+	"Keep-Alive": true, "Transfer-Encoding": true, "Te": true, "Upgrade": true,
+	"Proxy-Authorization": true,
+}
+
+// curlCommand builds a shell command that reproduces e's request.
+func curlCommand(e *tuiEntry) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\033[36m━━ REQUEST #%d ━━\033[0m\n", e.id))
-	b.WriteString(fmt.Sprintf("%s %s\n", e.method, e.rawURL))
-	b.WriteString(fmt.Sprintf("Host: %s    Time: %s\n", e.host, e.startTime.Format("15:04:05")))
-
-	if len(e.reqHeaders) > 0 {
-		b.WriteString("\nRequest Headers:\n")
-		for k, v := range e.reqHeaders {
-			b.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
+	b.WriteString("curl")
+	if e.method != http.MethodGet {
+		b.WriteString(" -X " + shellQuote(e.method))
+	}
+	b.WriteString(" " + shellQuote(e.curlURL))
+	for _, k := range sortedKeys(e.rawReqHeaders) {
+		if curlSkipHeaders[k] {
+			continue
+		}
+		for _, v := range e.rawReqHeaders[k] {
+			b.WriteString(" \\\n  -H " + shellQuote(k+": "+v))
 		}
 	}
+	if len(e.reqBodyRaw) > 0 {
+		if e.reqBodyWhole && utf8.Valid(e.reqBodyRaw) {
+			b.WriteString(" \\\n  --data-binary " + shellQuote(string(e.reqBodyRaw)))
+		} else {
+			fmt.Fprintf(&b, "\n# request body (%d+ bytes) omitted: binary or only partly captured", len(e.reqBodyRaw))
+		}
+	}
+	return b.String()
+}
+
+var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_./:=@%+-]+$`)
+
+// shellQuote quotes s for a POSIX shell.
+func shellQuote(s string) string {
+	if s != "" && shellSafe.MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// ── Detail panel renderer ─────────────────────────────────────────────────────
+
+// renderEntryDetail renders an entry's detail. Every value came from the
+// network and is sanitised; colour is our own and only added when asked.
+func renderEntryDetail(e *tuiEntry, color bool) string {
+	c := func(code, s string) string {
+		if !color {
+			return s
+		}
+		return "\033[" + code + "m" + s + "\033[0m"
+	}
+	var b strings.Builder
+	b.WriteString(c(colCyan, fmt.Sprintf("━━ REQUEST #%d ━━", e.id)) + "\n")
+	fmt.Fprintf(&b, "%s %s\n", sanitizeLine(e.method), sanitizeLine(e.rawURL))
+	fmt.Fprintf(&b, "Host: %s    Time: %s\n", sanitizeLine(e.host), e.startTime.Format("15:04:05"))
+
+	writeMap := func(title string, h map[string]string) {
+		if len(h) == 0 {
+			return
+		}
+		b.WriteString("\n" + title + ":\n")
+		for _, k := range sortedKeys(h) {
+			fmt.Fprintf(&b, "  %s: %s\n", sanitizeLine(k), sanitizeLine(h[k]))
+		}
+	}
+	writeMap("Request Headers", e.reqHeaders)
 	if e.reqBody != "" {
-		b.WriteString(fmt.Sprintf("\nRequest Body:\n%s\n", e.reqBody))
+		b.WriteString("\nRequest Body:\n" + sanitizeTerminal(e.reqBody) + "\n")
 	}
 
-	if e.pending {
-		b.WriteString("\n\033[33m⏳ waiting for response…\033[0m\n")
+	switch {
+	case e.failed != "":
+		b.WriteString("\n" + c(colRed, fmt.Sprintf("━━ FAILED (%v) ━━", e.duration.Round(time.Millisecond))) + "\n")
+		b.WriteString(sanitizeTerminal(e.failed) + "\n")
+		return b.String()
+	case e.pending:
+		b.WriteString("\n" + c(colYellow, "⏳ waiting for response…") + "\n")
 		return b.String()
 	}
 
-	b.WriteString(fmt.Sprintf(
-		"\n\033[32m━━ RESPONSE: %s  (%v) ━━\033[0m\n",
-		e.statusText, e.duration.Round(time.Millisecond),
-	))
-	if len(e.respHeaders) > 0 {
-		b.WriteString("\nResponse Headers:\n")
-		for k, v := range e.respHeaders {
-			b.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
-		}
-	}
+	b.WriteString("\n" + c(colGreen, fmt.Sprintf("━━ RESPONSE: %s  (%v) ━━", sanitizeLine(e.statusText), e.duration.Round(time.Millisecond))) + "\n")
+	writeMap("Response Headers", e.respHeaders)
 	if e.respBody != "" {
-		b.WriteString(fmt.Sprintf("\nResponse Body:\n%s\n", e.respBody))
+		b.WriteString("\nResponse Body:\n" + sanitizeTerminal(e.respBody) + "\n")
 	}
-	if len(e.respTrailer) > 0 {
-		b.WriteString("\nResponse Trailers:\n")
-		for k, v := range e.respTrailer {
-			b.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
+	writeMap("Response Trailers", e.respTrailer)
+	if e.grpcLine != "" {
+		b.WriteString("\n" + sanitizeLine(e.grpcLine) + "\n")
+	}
+	if e.ws {
+		b.WriteString("\n" + c(colCyan, fmt.Sprintf("━━ WEBSOCKET: %d messages ━━", e.wsCount)) + "\n")
+		if hidden := e.wsCount - len(e.wsLines); hidden > 0 {
+			fmt.Fprintf(&b, "(%d earlier messages not shown)\n", hidden)
+		}
+		for _, l := range e.wsLines {
+			b.WriteString(sanitizeTerminal(l) + "\n")
+		}
+		if e.wsClosed != "" {
+			b.WriteString(c(colDim, "closed: "+e.wsClosed) + "\n")
 		}
 	}
 	return b.String()
@@ -366,14 +757,21 @@ func (m tuiModel) View() string {
 		return "starting…\n"
 	}
 	var b strings.Builder
+	vis := m.visible()
 
 	// ── Header bar
 	title := fmt.Sprintf("httpmon  proxy :%s", proxyPort)
 	if filterPattern != "" {
-		title += fmt.Sprintf("  filter:%q", filterPattern)
+		title += fmt.Sprintf("  filter:%q", sanitizeLine(filterPattern))
+	}
+	if m.filter != "" {
+		title += fmt.Sprintf("  search:%q", sanitizeLine(m.filter))
 	}
 	right := fmt.Sprintf("%d requests ", len(m.entries))
-	pad := m.width - len(title) - len(right) - 2
+	if m.filter != "" {
+		right = fmt.Sprintf("%d of %d requests ", len(vis), len(m.entries))
+	}
+	pad := m.width - lipgloss.Width(title) - len(right) - 2
 	if pad < 1 {
 		pad = 1
 	}
@@ -398,28 +796,37 @@ func (m tuiModel) View() string {
 		start = m.cursor - lh + 1
 	}
 	shown := 0
-	for i := start; i < len(m.entries) && shown < lh; i++ {
-		e := m.entries[i]
+	for i := start; i < len(vis) && shown < lh; i++ {
+		e := vis[i]
 		statusStr, durStr := "…", "pending"
-		if !e.pending {
+		switch {
+		case e.failed != "":
+			statusStr, durStr = "ERR", e.duration.Round(time.Millisecond).String()
+		case e.ws && e.wsClosed == "":
+			statusStr, durStr = "WS", fmt.Sprintf("%d msgs", e.wsCount)
+		case e.ws:
+			statusStr, durStr = "101", fmt.Sprintf("%d msgs", e.wsCount)
+		case !e.pending:
 			statusStr = fmt.Sprintf("%d", e.status)
 			durStr = e.duration.Round(time.Millisecond).String()
 		}
-		urlStr := truncateDisplay(e.host+e.path, urlW)
+		urlStr := truncateDisplay(sanitizeLine(e.host+e.path), urlW)
 		pad := urlW - lipgloss.Width(urlStr)
 		if pad < 0 {
 			pad = 0
 		}
 		line := fmt.Sprintf(" %-5d %-8s %-6s %s%s %s",
-			e.id, e.method, statusStr, urlStr, strings.Repeat(" ", pad), durStr)
+			e.id, sanitizeLine(e.method), statusStr, urlStr, strings.Repeat(" ", pad), durStr)
 		line = truncateDisplay(line, m.width)
 		switch {
 		case i == m.cursor:
 			b.WriteString(styleSelected.Width(m.width).Render(line))
+		case e.failed != "" || e.status >= 400:
+			b.WriteString(styleErr.Render(line))
 		case e.pending:
 			b.WriteString(stylePending.Render(line))
-		case e.status >= 400:
-			b.WriteString(styleErr.Render(line))
+		case e.ws:
+			b.WriteString(styleWS.Render(line))
 		default:
 			b.WriteString(styleOK.Render(line))
 		}
@@ -432,7 +839,7 @@ func (m tuiModel) View() string {
 	}
 
 	// ── Detail panel
-	if m.showDetail && len(m.entries) > 0 {
+	if m.showDetail && len(vis) > 0 {
 		b.WriteString(styleSep.Render(strings.Repeat("─", m.width)))
 		b.WriteByte('\n')
 		b.WriteString(m.vp.View())
@@ -440,17 +847,31 @@ func (m tuiModel) View() string {
 	}
 
 	// ── Status bar
-	hint := " [↑↓/jk] navigate  [enter] detail  [g/G] top/bottom  [q] quit"
+	hint := " [↑↓/jk] move  [enter] detail  [/] search  [c] copy curl  [e] export  [q] quit"
 	if m.showDetail {
-		hint = " [↑↓/jk] navigate  [pgup/pgdn] scroll  [esc] close  [q] quit"
+		hint = " [↑↓/jk] move  [pgup/pgdn] scroll  [/] search  [c] copy curl  [esc] close  [q] quit"
 		if !m.vp.AtBottom() {
 			hint += "  ▼"
 		}
 	}
-	if m.doneMsg != "" {
+	switch {
+	case m.searching:
+		hint = " search: " + sanitizeLine(m.input) + "█   [enter] apply  [esc] clear"
+	case m.flash != "":
+		hint = " " + sanitizeLine(m.flash)
+	case m.doneMsg != "":
 		hint = m.doneMsg
 	}
-	b.WriteString(styleDim.Render(hint))
+	if m.notice != "" && !m.searching {
+		warn := fmt.Sprintf("  ⚠ %s", sanitizeLine(m.notice))
+		if m.notices > 1 {
+			warn = fmt.Sprintf("  ⚠ (%d) %s", m.notices, sanitizeLine(m.notice))
+		}
+		hint = truncateDisplay(hint, m.width/2) + styleWarn.Render(truncateDisplay(warn, m.width-lipgloss.Width(truncateDisplay(hint, m.width/2))))
+		b.WriteString(hint)
+		return b.String()
+	}
+	b.WriteString(styleDim.Render(truncateDisplay(hint, m.width)))
 
 	return b.String()
 }

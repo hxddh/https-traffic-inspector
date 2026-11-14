@@ -63,7 +63,7 @@ func TestRecord_ResponseBeforeRequestFinishes(t *testing.T) {
 	resp.Body.Close()              //nolint:errcheck
 
 	// The request half lands once the upload is abandoned or finishes.
-	var recs []recordedExchange
+	var recs []recordV2
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		recs = readRecords(t, recPath)
@@ -75,7 +75,7 @@ func TestRecord_ResponseBeforeRequestFinishes(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("recorded %d exchanges, want 1", len(recs))
 	}
-	if recs[0].Status != http.StatusRequestEntityTooLarge || recs[0].RespBody != "too large" {
+	if recs[0].Status != http.StatusRequestEntityTooLarge || recs[0].RespBody == nil || recs[0].RespBody.Data != "too large" {
 		t.Errorf("record = %+v", recs[0])
 	}
 	if n := captures.pending(); n != 0 {
@@ -83,17 +83,18 @@ func TestRecord_ResponseBeforeRequestFinishes(t *testing.T) {
 	}
 }
 
-func readRecords(t *testing.T, path string) []recordedExchange {
+func readRecords(t *testing.T, path string) []recordV2 {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	var out []recordedExchange
+	var out []recordV2
 	sc := bufio.NewScanner(f)
+	sc.Buffer(nil, 64<<20)
 	for sc.Scan() {
-		var e recordedExchange
+		var e recordV2
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
 			t.Fatalf("bad record line %q: %v", sc.Text(), err)
 		}
@@ -231,23 +232,17 @@ func TestForward_ResponseLoggedWhenCopyStopsBeforeEOF(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	savedHM, savedCaptures := harMode, captures
-	harMode, captures = true, newExchangeJoiner()
-	harEntriesMu.Lock()
-	harEntries = nil
-	harEntriesMu.Unlock()
-	defer func() { harMode, captures = savedHM, savedCaptures }()
+	mem := useMemoryHAR(t)
 
 	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/", nil)
 	req.RequestURI = ""
-	forwardRequest(failingWriter{httptest.NewRecorder()}, req, upstreamClient)
+	forwardRequest(failingWriter{httptest.NewRecorder()}, req, upstreamClient, false)
 
-	harEntriesMu.Lock()
-	defer harEntriesMu.Unlock()
-	if len(harEntries) != 1 {
-		t.Fatalf("HAR has %d entries, want 1", len(harEntries))
+	entries := mem.entries()
+	if len(entries) != 1 {
+		t.Fatalf("HAR has %d entries, want 1", len(entries))
 	}
-	if c := harEntries[0].Response.Content; c.Comment == "" {
+	if c := entries[0].Response.Content; c.Comment == "" {
 		t.Errorf("a body cut short should be marked truncated, got %+v", c)
 	}
 }

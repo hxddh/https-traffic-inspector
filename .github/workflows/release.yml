@@ -59,7 +59,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # The newest 1.26 patch release, not go.mod's minimum: release
+          # binaries embed the standard library's TLS and HTTP code, so they
+          # should carry its latest security fixes.
+          go-version: "1.26.x"
+          check-latest: true
           cache: true
 
       - name: Set version

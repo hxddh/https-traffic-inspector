@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,8 +37,16 @@ func drainInflight(max time.Duration) {
 // forwardRequest sends req upstream through client and relays the response to
 // w. Every proxied request takes this path, whether it arrived as a plain
 // proxy request or inside a CONNECT tunnel, over HTTP/1.1 or HTTP/2.
-// req.URL must already be absolute.
-func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Client) {
+// req.URL must already be absolute; its host is where the request is sent.
+//
+// keepHost sends the client's own Host (or :authority) upstream rather than
+// the URL's host. Inside a tunnel the URL holds the CONNECT target, host:port,
+// while the request names the site it wants; rewriting Host to the target
+// made every HTTPS upstream see "Host: example.com:443" and sent requests whose
+// Host differs from the tunnel to the wrong virtual host. A plain proxy
+// request is addressed by its absolute URI (RFC 9112 §3.2.2), so there the
+// URL's host is the right one.
+func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Client, keepHost bool) {
 	inflight.Add(1)
 	defer inflight.Add(-1)
 
@@ -54,17 +61,24 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 
 	shouldLog := matchesFilter(req)
 	var reqID int
+	var facts *requestFacts
 	if shouldLog {
-		reqID = logRequest(req)
+		reqID, facts = logRequestFacts(req)
 	}
 
 	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), req.Body)
 	if err != nil {
+		if req.Body != nil {
+			req.Body.Close() //nolint:errcheck
+		}
 		if shouldLog {
-			discardReqID(reqID)
+			logFailure(reqID, facts, err)
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if keepHost && req.Host != "" {
+		proxyReq.Host = req.Host
 	}
 	proxyReq.Header = req.Header.Clone()
 	proxyReq.ContentLength = req.ContentLength
@@ -75,11 +89,11 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
+		canceled := errors.Is(err, context.Canceled)
 		if shouldLog {
-			discardReqID(reqID)
-		}
-		if !tuiMode && !errors.Is(err, context.Canceled) {
-			fmt.Fprintf(os.Stderr, "httpmon: upstream request to %s failed: %v\n", req.URL.Host, err)
+			logFailure(reqID, facts, err)
+		} else if !canceled {
+			noticef("upstream request to %s failed: %v", req.URL.Host, err)
 		}
 		warnTLSVerification(req.URL.Hostname(), err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -128,7 +142,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request) {
 		handleWebSocket(w, req, false)
 		return
 	}
-	forwardRequest(w, req, upstreamClient)
+	forwardRequest(w, req, upstreamClient, false)
 }
 
 // ---- WebSocket ----
@@ -141,15 +155,21 @@ func isWebSocketUpgrade(req *http.Request) bool {
 // splices the two connections. An upgraded connection is no longer HTTP, so it
 // cannot go through the shared transport.
 func handleWebSocket(w http.ResponseWriter, req *http.Request, useTLS bool) {
+	inflight.Add(1)
+	defer inflight.Add(-1)
+
 	shouldLog := matchesFilter(req)
 	var reqID int
+	var facts *requestFacts
 	if shouldLog {
-		reqID = logRequest(req)
-		defer discardReqID(reqID)
+		reqID, facts = logRequestFacts(req)
 	}
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		if shouldLog {
+			discardReqID(reqID)
+		}
 		http.Error(w, "WebSocket upgrade requires HTTP/1.1", http.StatusHTTPVersionNotSupported)
 		return
 	}
@@ -161,6 +181,9 @@ func handleWebSocket(w http.ResponseWriter, req *http.Request, useTLS bool) {
 	hostport := hostPortDefault(req.URL, port)
 	upConn, err := dialUpstream(hostport, req.URL.Hostname(), useTLS)
 	if err != nil {
+		if shouldLog {
+			logFailure(reqID, facts, err)
+		}
 		warnTLSVerification(req.URL.Hostname(), err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -169,10 +192,14 @@ func handleWebSocket(w http.ResponseWriter, req *http.Request, useTLS bool) {
 
 	clientConn, rw, err := hj.Hijack()
 	if err != nil {
+		if shouldLog {
+			logFailure(reqID, facts, err)
+		}
 		return
 	}
 	defer clientConn.Close()
-	spliceWebSocket(upConn, req, clientConn, rw.Writer, rw.Reader)
+	// The upstream sees the request as the client sent it, Host included.
+	spliceWebSocket(upConn, req, clientConn, rw.Writer, rw.Reader, reqID, facts)
 }
 
 // ---- CONNECT tunnels ----
@@ -182,9 +209,7 @@ func handleWebSocket(w http.ResponseWriter, req *http.Request, useTLS bool) {
 // (HTTP/1.1, or HTTP/2 with prior knowledge, which is how an insecure gRPC
 // client talks through a proxy).
 func handleConnect(w http.ResponseWriter, r *http.Request) {
-	if !jsonMode && !tuiMode {
-		emitText(fmt.Sprintf("\n\033[33m=== CONNECT %s ===\033[0m\n\n", r.Host))
-	}
+	currentSink().connect(r.Host)
 
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -200,7 +225,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hijack error for %s: %v\n", host, err)
+		noticef("hijack error for %s: %v", host, err)
 		return
 	}
 
@@ -244,7 +269,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	cert, err := generateCert(host)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: certificate for %s: %v\n", host, err)
+		noticef("certificate for %s: %v", host, err)
 		clientConn.Close() //nolint:errcheck
 		return
 	}
@@ -253,7 +278,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		NextProtos:   []string{"h2", "http/1.1"},
 	})
 	if err := tlsConn.Handshake(); err != nil {
-		fmt.Fprintf(os.Stderr, "TLS handshake error for %s: %v\n", host, err)
+		noticef("TLS handshake with the client for %s failed: %v (does the client trust httpmon's CA?)", host, err)
 		clientConn.Close() //nolint:errcheck
 		return
 	}
@@ -281,11 +306,11 @@ func looksLikeHTTP(first byte) bool {
 // cannot show anyway.
 func relayOpaque(client net.Conn, target, host string) {
 	if !jsonMode && !tuiMode {
-		emitText(fmt.Sprintf("\033[33m    %s: not HTTP, relayed without inspection\033[0m\n\n", target))
+		emitText(paint(colYellow, fmt.Sprintf("    %s: not HTTP, relayed without inspection", sanitizeLine(target))) + "\n\n")
 	}
 	up, err := dialUpstream(target, host, false)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: tunnel to %s failed: %v\n", target, err)
+		noticef("tunnel to %s failed: %v", target, err)
 		client.Close() //nolint:errcheck
 		return
 	}
@@ -395,7 +420,7 @@ func handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		// an insecure gRPC server does not speak HTTP/1.1 at all.
 		client = h2cClient
 	}
-	forwardRequest(w, r, client)
+	forwardRequest(w, r, client, true)
 }
 
 // connListener is a net.Listener fed by hand, so an http.Server can serve

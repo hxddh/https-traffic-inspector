@@ -4,6 +4,123 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-11-14
+
+2.0 changes where httpmon's output goes, what a recording holds and what the
+terminal shows. The fixes planned for 1.4.2 are included here. See
+"Migrating from 1.x" in the README.
+
+### ⚠ Breaking
+
+- **httpmon's output goes to stderr**, along with the startup banner. In 1.x it
+  shared stdout with the wrapped command, so `httpmon --format json curl … | jq`
+  fed jq curl's response as well, and `httpmon curl … > page.html` saved the
+  capture into the page. The command's stdout is now untouched. New
+  `-o, --output <file>` writes the output to a file; `-o -` restores the 1.x
+  behaviour.
+- **Credentials are masked in output** — text, `--format json` and the TUI:
+  `Authorization`, `Cookie`, `Set-Cookie`, API-key headers, and token and
+  signature parameters in URLs (`Bearer eyJh…(812 chars)`). `--show-secrets`
+  shows them. `--record` and `--har` keep them unless `--redact` is given.
+- **Record format v2.** v1 stored the human-readable view of each body — a
+  placeholder for anything binary — and flattened headers into a map. v2
+  stores raw bytes (base64 when not UTF-8, with the decoded text alongside for
+  compressed bodies), headers as ordered `[name, value]` pairs, a session id
+  and sequence number, millisecond timestamps, failed exchanges with their
+  error, and WebSocket messages. Replay still reads v1 files.
+- **Module path is `github.com/hxddh/https-traffic-inspector/v2`**, as Go
+  requires for a v2 release; `go install …/v2@latest`. Building needs Go 1.26.
+- Colour is used only when output is a terminal; `--no-color` and `NO_COLOR`
+  turn it off.
+
+### Security
+
+- **A server could inject terminal escape sequences.** Bodies, header values
+  and URLs were written to the terminal as received. Measured: a `text/plain`
+  body containing `OSC 52` (write the clipboard), `CSI 2J` (clear the screen)
+  and `OSC 0` (set the window title) reached the terminal byte for byte. All
+  control characters except newline and tab, C1 controls, invalid UTF-8 and
+  bidirectional overrides are now shown escaped (`\x1b`), in text output, the
+  TUI and replay output.
+- The HAR file was created with the default mode (0644 under a usual umask)
+  although it holds `Authorization` headers and cookies. It is now 0600, like
+  `--record`.
+
+### Added
+
+- **WebSocket messages.** Each message of a `ws://` or `wss://` connection is
+  decoded and shown as it passes: fragmented messages reassembled,
+  `permessage-deflate` decompressed with or without context takeover, close
+  codes and reasons. They appear in text, JSON and the TUI, in `--record`
+  (`ws_messages`) and in HAR (`_webSocketMessages`, as Chrome DevTools reads
+  them). The upgrade response itself is now logged; in 1.x the handshake
+  showed a request and no response.
+- **Java support.** The wrapped command gets `JAVA_TOOL_OPTIONS` with the proxy
+  properties and a PKCS#12 truststore holding the system CAs and httpmon's.
+  Measured with JDK 21: both `HttpClient` and `HttpURLConnection` go through
+  httpmon and trust it with no configuration; before, Java bypassed httpmon
+  entirely.
+- **Persistent CA** with `--ca-dir <dir>` (or `HTTPMON_CA_DIR`), for devices
+  and trust stores that cannot read httpmon's environment. `httpmon --ca-dir
+  <dir>` alone creates the CA and prints its path.
+- **TUI:** `/` to search, `c` to copy a request as a curl command (OSC 52),
+  `e` to export an entry; failed requests show `ERR` and their error;
+  warnings appear on the status bar instead of over the screen; the list is
+  capped at 5,000 entries.
+- **Failed exchanges are reported everywhere.** A request that got no response
+  — connection refused, DNS failure, TLS verification failure — is shown as
+  `=== RESPONSE #n FAILED ===`, emitted as `{"req_id":n,"error":…}` in JSON,
+  recorded with `error`, and written to HAR with status 0 and `_error`. In 1.x
+  it was missing from every output, and stayed pending forever in the TUI.
+- Replay re-sends gRPC calls recorded in v2 format, comparing `grpc-status`
+  as well as the body.
+- JSON responses carry `duration_ms` and `body_truncated`; requests carry
+  `body_truncated`.
+- HAR `timings` separate waiting for the response from receiving its body,
+  and `bodySize` is the number of bytes on the wire.
+
+### Changed
+
+- HAR entries are written to the file as each exchange completes, instead of
+  being held in memory until exit. A killed run keeps what it captured.
+- In TUI mode the wrapped command gets no stdin — the UI and the command were
+  both reading the keyboard — and its stdout and stderr are replayed to
+  stdout and stderr afterwards (1.x wrote both to stderr). When stdout is
+  redirected, the UI draws on stderr.
+- Headers and query parameters are listed in sorted order. In the TUI they
+  used to reshuffle on every redraw.
+- A curl command's own `--cacert` is merged with httpmon's CA instead of being
+  left to fail against httpmon's certificates, and `--proxy=…`, `-xURL` and
+  combined short options such as `-sk` are recognised.
+- CI and release builds use the newest Go 1.26 patch release, so released
+  binaries carry the standard library's latest TLS and HTTP security fixes.
+
+### Fixed
+
+- **HTTPS requests reached the upstream with `Host: example.com:443`.** Inside a
+  tunnel the upstream request took its Host from the CONNECT target, and the
+  client's own `Host` was discarded: a request whose Host differed from the
+  tunnel went to the wrong virtual host, and URLs in output, `--record` and HAR
+  read `https://host:443/…`. The client's Host now goes upstream, and URLs
+  drop the default port.
+- **Replay sent placeholders as request bodies.** A binary request body was
+  recorded as `[binary data, N+ bytes]` and replay sent that text — measured: a
+  300-byte upload was replayed as 25 bytes. Every binary response was also
+  reported as changed, so `--replay-fail-on-diff` always failed for such
+  endpoints. v2 recordings replay byte for byte; v1 recordings skip such
+  requests and compare responses view to view.
+- Replay of a v1 recording also skips requests whose body was truncated or
+  compressed, which it used to send cut short or decoded.
+- httpmon added `Accept-Encoding: gzip` to requests that had none and
+  decompressed the reply itself, so the upstream saw a request the client
+  never sent. `Proxy-Connection` reached HTTP/1.1 upstreams.
+- Repeated response headers such as `Set-Cookie` were merged into one value in
+  recordings and could not be told apart.
+- Appending several runs to one `--record` file repeated ids; records now
+  carry a session id.
+- A body with no `Content-Type` that is not valid UTF-8 is summarised as binary
+  instead of printed.
+
 ## [1.4.1] - 2026-09-29
 
 ### Fixed

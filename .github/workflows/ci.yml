@@ -13,7 +13,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # The newest 1.26 patch release, not go.mod's minimum: release
+          # binaries embed the standard library's TLS and HTTP code, so they
+          # should carry its latest security fixes.
+          go-version: "1.26.x"
+          check-latest: true
           cache: true
       - run: go vet ./...
       - run: go test -race -count=1 -timeout 300s -coverprofile=coverage.out ./...
@@ -30,12 +34,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # The newest 1.26 patch release, not go.mod's minimum: release
+          # binaries embed the standard library's TLS and HTTP code, so they
+          # should carry its latest security fixes.
+          go-version: "1.26.x"
+          check-latest: true
           cache: true
       # golangci-lint v2 requires action v7; v6 rejects a v2.x version string.
       - uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.1.0
+          version: v2.15.0
           # `config verify` downloads a JSON schema from golangci-lint.run on
           # every run, so a slow fetch fails the job for reasons unrelated to
           # the code. The config is validated by the lint run itself.
