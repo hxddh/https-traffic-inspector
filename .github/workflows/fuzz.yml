@@ -1,0 +1,33 @@
+name: Nightly fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { pkg: ./internal/body, name: FuzzRender }
+          - { pkg: ./internal/body, name: FuzzDecodeProtobuf }
+          - { pkg: ./internal/rules, name: FuzzParse }
+          - { pkg: ./internal/textsafe, name: FuzzLine }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache: true
+      - run: go test ${{ matrix.target.pkg }} -run '^$' -fuzz '^${{ matrix.target.name }}$' -fuzztime 10m
+      # A failing input is written under testdata/fuzz; keep it to add as a
+      # regression case.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target.name }}
+          path: "**/testdata/fuzz/**"

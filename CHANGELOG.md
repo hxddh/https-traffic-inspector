@@ -4,6 +4,81 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-11-14
+
+httpmon grows from a command wrapper into a traffic workbench: captures live in
+named sessions, a standing proxy captures programs httpmon does not start,
+rules mock endpoints and inject faults, settings files keep defaults, and an
+MCP server gives agents the sessions directly. Releases are now verifiable and
+installable with one command. Not compatible with 3.x options; see
+[Migrating from 3.x](README.md#migrating-from-3x).
+
+### Added
+
+- **Sessions.** `--session NAME` keeps every exchange, raw bytes included, in a
+  private directory under httpmon's home (`$HTTPMON_HOME`, else the user
+  config directory); `--session-dir` puts one anywhere and `--append` adds to
+  an earlier run. `query`, `diff`, `replay`, `mock` and `--mock-from` take a
+  session name, a directory or a file. `httpmon sessions` lists them.
+- **`httpmon proxy`**: a standing HTTP(S) proxy (default `127.0.0.1:8080`,
+  session `proxy`) for browsers, phones, containers and running services,
+  using the persistent CA. **`httpmon env`** prints the exports that route a
+  shell through it (`sh`, `fish`, `powershell`; `--unset`).
+- **Live view.** A running session publishes its in-flight exchanges;
+  `httpmon query NAME --live` lists them.
+- **Rules.** `--mock '[METHOD] PATTERN => STATUS [BODY|@FILE]'`,
+  `--fault '… => delay 2s | reset | reset after 1KB | timeout [N%]'` and
+  `--map 'HOST[:PORT] => [SCHEME://]HOST[:PORT]'` answer, break or redirect
+  matching requests. Touched exchanges are marked `[mock]`/`[fault]`/`[map]`,
+  carry a `rule` field, and are listed by `query --rule`; an injected failure
+  has the new error kind `injected`.
+- **Recorded mocks.** `--mock-from SESSION` answers requests a session has a
+  response for and forwards the rest; `httpmon mock SESSION` serves a session
+  as an offline mock server.
+- **Query**: `--grep REGEX` searches URLs, headers and decoded bodies;
+  `--format curl` prints commands that send requests again; `--format har`
+  writes HAR 1.2.
+- **Settings files**: `config.toml` in httpmon's home and a project's
+  `.httpmon.toml` set defaults for format, fail-on, limits, rules and diff's
+  ignored paths. A project file cannot set an upstream proxy, skip
+  verification, change the CA, unmask credentials, or map traffic off the
+  machine.
+- **`httpmon mcp`**: a Model Context Protocol server over stdio with tools
+  `list_sessions`, `query_exchanges`, `get_exchange`, `get_body`, `in_flight`,
+  `diff_sessions`, and — with `--allow-mutations` — `add_rule` and
+  `clear_rules` for a running session.
+- **Delivery**: `install.sh` and `install.ps1` (checksum-verified), a container
+  image at `ghcr.io/hxddh/https-traffic-inspector` (linux/amd64, arm64),
+  `SHA256SUMS`, an SPDX SBOM, and build-provenance attestations for every
+  binary and the image.
+- **Quality gates**: CI on Linux, macOS and Windows; fuzz targets for body
+  rendering, protobuf decoding, rule parsing and terminal escaping (short runs
+  on every change, ten minutes each nightly); a performance budget for added
+  latency and throughput.
+
+### Changed
+
+- **Breaking:** `--record FILE` is replaced by `--session`/`--session-dir`, and
+  `--har FILE` by `httpmon query … --format har`.
+- **Breaking:** the main package moved to `cmd/httpmon` and the module to
+  `…/v4`: `go install github.com/hxddh/https-traffic-inspector/v4/cmd/httpmon@latest`
+  installs a binary named `httpmon`.
+- **Breaking:** release files are named `httpmon-<os>-<arch>` without a
+  version, so `/releases/latest/download/…` links stay valid.
+- **Breaking:** `proxy`, `env`, `mock`, `sessions` and `mcp` are reserved
+  first arguments; wrap a command of that name with `httpmon -- <name>`.
+- `httpmon ca` no longer needs `--dir`: the persistent CA lives in httpmon's
+  home unless `--dir` or `$HTTPMON_CA_DIR` says otherwise.
+
+### Fixed
+
+- A `text/*` body that is not UTF-8 (another charset, or damaged) was put into
+  the record's `text` as invalid UTF-8; the invalid bytes are now replaced
+  with U+FFFD. Found by the new fuzz tests.
+- On Windows a refused or reset connection was reported as error kind
+  `other`: Winsock's error numbers are now classified as `refused` and
+  `reset`. Found by the new Windows CI.
+
 ## [3.1.0] - 2026-11-14
 
 Fixes found reviewing the published 3.0.0 — it could not be installed with

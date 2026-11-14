@@ -173,6 +173,9 @@ func Render(h http.Header, raw []byte, rawTruncated bool, size int64, budget int
 
 	if PrintableType(ct) && (ct != "" || utf8.Valid(trimPartialRune(data, truncated))) {
 		s := string(trimPartialRune(data, truncated))
+		// A text type in another charset, or a damaged body: keep it
+		// readable, with what is not UTF-8 replaced.
+		s = strings.ToValidUTF8(s, "\uFFFD")
 		if len(s) > budget {
 			cut := budget
 			for cut > 0 && !utf8.RuneStart(s[cut]) {

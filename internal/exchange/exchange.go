@@ -1,6 +1,6 @@
 // Package exchange defines httpmon's exchange record -- one HTTP exchange,
 // request and response together -- which is both the --format json output
-// and the --record format, and renders it as a one-line summary.
+// and the format sessions keep, and renders it as a one-line summary.
 package exchange
 
 import (
@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v3/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
 )
 
 // Version is the schema version written in every record.
@@ -45,6 +45,10 @@ type Exchange struct {
 	// Redacted marks a record made with --redact: credentials in headers and
 	// the URL are masked, so requests that carried them cannot be replayed.
 	Redacted bool `json:"redacted,omitempty"`
+
+	// Rule names the --mock, --fault or --map rule that touched the
+	// exchange, as written: "mock: GET */v1/orders => 500".
+	Rule string `json:"rule,omitempty"`
 
 	// Hint is a short error description found in a 4xx/5xx body, for the
 	// summary line. It is not part of the record.
@@ -159,6 +163,10 @@ func (e *Exchange) SummaryLine() string {
 			size = e.Response.Body.Size
 		}
 		fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(size))
+	}
+	if e.Rule != "" {
+		kind, _, _ := strings.Cut(e.Rule, ":")
+		fmt.Fprintf(&b, " [%s]", kind)
 	}
 	return b.String()
 }

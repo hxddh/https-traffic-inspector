@@ -25,11 +25,13 @@ const (
 	KindReset        = "reset"
 	KindProxy        = "proxy"
 	KindCanceled     = "canceled"
-	KindOther        = "other"
+	// KindInjected is a failure a --fault rule caused on purpose.
+	KindInjected = "injected"
+	KindOther    = "other"
 )
 
 // Kinds lists every error kind.
-var Kinds = []string{KindDNS, KindRefused, KindTimeout, KindTLSVerify, KindTLSHandshake, KindReset, KindProxy, KindCanceled, KindOther}
+var Kinds = []string{KindDNS, KindRefused, KindTimeout, KindTLSVerify, KindTLSHandshake, KindReset, KindProxy, KindCanceled, KindInjected, KindOther}
 
 // Classify returns the kind of an upstream failure.
 func Classify(err error) string {
@@ -45,7 +47,10 @@ func Classify(err error) string {
 	var recordErr tls.RecordHeaderError
 	var alert tls.AlertError
 	var netErr net.Error
+	var injected *InjectedError
 	switch {
+	case errors.As(err, &injected):
+		return KindInjected
 	case errors.Is(err, context.Canceled):
 		return KindCanceled
 	// The transport prefixes a failure to reach or negotiate with an
@@ -59,9 +64,9 @@ func Classify(err error) string {
 		return KindTLSVerify
 	case errors.As(err, &recordErr), errors.As(err, &alert), strings.Contains(msg, "tls: "):
 		return KindTLSHandshake
-	case errors.Is(err, syscall.ECONNREFUSED):
+	case errors.Is(err, syscall.ECONNREFUSED), isErrno(err, refusedErrnos):
 		return KindRefused
-	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE),
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE), isErrno(err, resetErrnos),
 		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
 		return KindReset
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded),
@@ -81,4 +86,23 @@ func Describe(err error, displayURL string) *Error {
 		msg = fmt.Sprintf("%s %s: %v", ue.Op, strconv.Quote(displayURL), ue.Err)
 	}
 	return &Error{Kind: Classify(err), Message: msg}
+}
+
+// InjectedError is a failure a --fault rule caused.
+type InjectedError struct{ Rule string }
+
+func (e *InjectedError) Error() string { return "injected by " + e.Rule }
+
+// isErrno reports whether err wraps one of these system error numbers.
+func isErrno(err error, nums []syscall.Errno) bool {
+	var e syscall.Errno
+	if !errors.As(err, &e) {
+		return false
+	}
+	for _, n := range nums {
+		if e == n {
+			return true
+		}
+	}
+	return false
 }

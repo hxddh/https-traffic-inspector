@@ -8,7 +8,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -20,13 +24,69 @@ jobs:
           check-latest: true
           cache: true
       - run: go vet ./...
-      - run: go test -race -count=1 -timeout 300s -coverprofile=coverage.out ./...
+      - run: go test -race -count=1 -timeout 300s "-coverprofile=coverage.out" ./...
       - name: Coverage summary
+        if: runner.os == 'Linux'
         run: go tool cover -func=coverage.out | tail -1
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
           name: coverage
           path: coverage.out
+
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache: true
+      - name: Performance budget
+        env:
+          HTTPMON_PERF: "1"
+        run: go test -count=1 -run TestPerfBudget -v ./cmd/httpmon
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache: true
+      # A short run on every change; the nightly workflow runs longer.
+      - name: Fuzz
+        run: |
+          go test ./internal/body -run '^$' -fuzz '^FuzzRender$' -fuzztime 20s
+          go test ./internal/body -run '^$' -fuzz '^FuzzDecodeProtobuf$' -fuzztime 20s
+          go test ./internal/rules -run '^$' -fuzz '^FuzzParse$' -fuzztime 20s
+          go test ./internal/textsafe -run '^$' -fuzz '^FuzzLine$' -fuzztime 20s
+
+  install-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache: true
+      - name: install.sh against a local mirror
+        run: |
+          mkdir -p mirror
+          CGO_ENABLED=0 go build -o mirror/httpmon-linux-amd64 ./cmd/httpmon
+          (cd mirror && sha256sum httpmon-linux-amd64 > SHA256SUMS)
+          (cd mirror && python3 -m http.server 18300 &) && sleep 1
+          HTTPMON_DOWNLOAD_BASE=http://127.0.0.1:18300 HTTPMON_INSTALL_DIR="$PWD/bin" sh install.sh
+          ./bin/httpmon --version
+      - name: Container image builds
+        run: |
+          mkdir -p dist && cp mirror/httpmon-linux-amd64 dist/
+          docker build --build-arg TARGETARCH=amd64 -t httpmon:ci .
+          docker run --rm httpmon:ci --version
 
   lint:
     runs-on: ubuntu-latest
