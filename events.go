@@ -6,6 +6,9 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
 )
 
 // ---- exchange events ----
@@ -87,17 +90,12 @@ type bodyView struct {
 	Size         int64 // bytes seen on the wire
 }
 
-// logRequest reports a request and returns its ID. The body is sampled as it
-// is forwarded; its event follows when it ends.
-func logRequest(req *http.Request) int {
-	id, _ := logRequestFacts(req)
-	return id
-}
-
-// logRequestFacts is logRequest, also returning the facts a later failure
-// report needs.
+// logRequestFacts reports a request and returns its ID, with the facts a
+// later failure report needs. The body is sampled as it is forwarded; its
+// event follows when it ends.
 func logRequestFacts(req *http.Request) (int, *requestFacts) {
 	reqID := nextReqID()
+	started.Add(1)
 
 	startTime := time.Now()
 	reqStartMu.Lock()
@@ -150,9 +148,7 @@ func stripDefaultPort(host, scheme string) string {
 
 // onRequestBody runs when a request body finishes streaming.
 func onRequestBody(reqID int, f *requestFacts, v bodyView) {
-	if recordMode || harMode {
-		captures.addRequest(reqID, capturedRequest{facts: *f, body: v})
-	}
+	captures.addRequest(reqID, capturedRequest{facts: *f, body: v})
 	currentSink().requestBody(reqID, f, v)
 }
 
@@ -195,7 +191,7 @@ func logResponse(resp *http.Response, reqID int) {
 
 // onResponseBody runs when a response body finishes streaming.
 func onResponseBody(reqID int, f *responseFacts, v bodyView) {
-	if (recordMode || harMode) && !f.upgraded {
+	if !f.upgraded {
 		captures.addResponse(reqID, capturedResponse{facts: *f, body: v})
 	}
 	currentSink().responseBody(reqID, f, v)
@@ -204,11 +200,9 @@ func onResponseBody(reqID int, f *responseFacts, v bodyView) {
 // logFailure reports an exchange that will get no response.
 func logFailure(reqID int, f *requestFacts, err error) {
 	dur := requestDuration(reqID)
-	msg := err.Error()
-	if recordMode || harMode {
-		captures.addFailure(reqID, msg, dur)
-	}
-	currentSink().failed(reqID, f, msg, dur)
+	info := exchange.Describe(err, f.rawURL)
+	captures.addFailure(reqID, info, dur)
+	currentSink().failed(reqID, f, info, dur)
 }
 
 // truncationMarker is appended whenever displayed content is incomplete, so a
@@ -250,7 +244,7 @@ func isPrintableContentType(ct string) bool {
 // isPrintable returns true when the Content-Type suggests human-readable text
 // AND the Content-Encoding is not a compression scheme.
 func isPrintable(header http.Header) bool {
-	if len(splitEncodings(header.Get("Content-Encoding"))) > 0 {
+	if len(body.SplitEncodings(header.Get("Content-Encoding"))) > 0 {
 		return false
 	}
 	return isPrintableContentType(header.Get("Content-Type"))

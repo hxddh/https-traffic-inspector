@@ -14,6 +14,14 @@ v3 有一项新能力是**对 agent 友好**：让 Claude Code、Codex 这类 AI
 
 token 数按 4 字节 ≈ 1 token 估算，只用于比较量级。
 
+> **实施状态（v3.0.0）**：第一部分的 P1-1～3、P2-1～6 和第三部分的 A0～A7、第四部分的 B1～B3 已实现。与计划不同的地方：
+>
+> - B1 拆出了三个包：`internal/textsafe`、`internal/body`、`internal/exchange`，内容是 record、`query`、`replay`
+>   共用的交换模型和 body 渲染。代理核心（转发、隧道、TUI）仍在 `package main`，相关测试没有重写。
+> - A7 的 skill 和 `AGENTS.md` 片段放在 `skills/` 目录下（`skills/httpmon/SKILL.md`、`skills/AGENTS.md`），
+>   避免仓库根目录的 `AGENTS.md` 被在本仓库工作的 agent 当成开发说明。
+> - `--fail-on` 保持显式开启（理由见 A3）。
+
 > **维护者决定：v3.0 不需要兼容历史版本，可以做破坏性变更。** 因此本文不安排兼容性补丁版本（原计划的 v2.0.1 并入 v3.0.0），
 > 也不保留兼容层：不再读取 v1 / v2 的 record，不保留旧的事件流格式和旧参数，CLI 按 v3 的需要重新设计。
 

@@ -4,6 +4,80 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-11-14
+
+3.0 makes httpmon usable by AI coding agents as well as people: compact
+output by default off a terminal, one structured exchange format, exit codes
+that report failed requests, a query command for recordings, and output that
+untrusted content cannot imitate. It is deliberately not compatible with 2.x;
+see "Migrating from 2.x" in the README.
+
+### ⚠ Breaking
+
+- **Subcommands.** `httpmon replay <record>`, `httpmon query <record>`,
+  `httpmon ca --dir <dir>`, `httpmon schema` and `httpmon help [agents]`
+  replace `--replay`, `--replay-target` (now `replay --target`),
+  `--replay-delay`, `--replay-fail-on-diff` and `--ca-dir` without a command.
+  Wrapping a command named like a subcommand needs `httpmon -- <name>`.
+- **The default format depends on where output goes:** full text on a
+  terminal, the new one-line-per-exchange summary anywhere else. `--format
+  text` restores the old behaviour; `$HTTPMON_FORMAT` sets a default.
+- **`--format json` writes one object per exchange** — request, response and
+  outcome together — instead of one object per request and one per response.
+  JSON bodies are embedded as JSON values. The start of the run, warnings and
+  the end-of-run digest are objects with an `"event"` field, so every line of
+  the stream parses.
+- **`--record` writes the same exchange object**, plus each body's raw bytes
+  (record version 3). Recordings from 1.x and 2.x are no longer read.
+- **Failures are `"error": {"kind", "message"}`**, kind one of `dns`,
+  `refused`, `timeout`, `tls_verify`, `tls_handshake`, `reset`, `proxy`,
+  `canceled`, `other`.
+- In text output every body line is prefixed with `│ `.
+
+### Security
+
+- **A response body could imitate httpmon's own output.** Body text started at
+  the first column like httpmon's headings, so a body could forge a block —
+  measured: a body produced a fake `=== RESPONSE #9 ===` and an instruction
+  addressed to an AI assistant that read as httpmon output. Body lines now
+  carry a prefix that headings never have, in text output, WebSocket messages
+  and `query --format text`.
+
+### Added
+
+- **`--format summary`**: one line per exchange with its outcome and, for an
+  error response, the code or message from its JSON body
+  (`#10 GET api.example.com/orders → 500 db_timeout (44ms, 105 B)`), then a
+  digest. Measured on 11 exchanges: 759 bytes against 15.5 KB of text output.
+- **`--fail-on 5xx,error`** (`$HTTPMON_FAIL_ON`): exit code 3 when the command
+  exited 0 but an exchange matched. The command's own failure still wins.
+- **`httpmon query`**: list, filter (`--status`, `--method`, `--url`,
+  `--error`) and expand (`--id`, `--body request|response`) the exchanges in a
+  record, with `--follow` for one still being written. Bodies are re-rendered
+  from the raw bytes and credentials masked unless `--show-secrets`.
+- **JSON bodies are shortened by structure**: long arrays keep their first
+  items (`"…(+37 more items)"`), long strings and large objects are cut, and
+  the result is always valid JSON. In 2.x a cut JSON body did not parse.
+- **gRPC messages are decoded without a schema** in JSON output and records:
+  fields by number, nested messages, strings and repeated fields.
+- **End-of-run digest** in every format: counts by status class, failures,
+  incomplete exchanges, the slowest exchange, and `--fail-on` matches.
+- **`httpmon help agents`**, a one-screen guide for AI agents;
+  **`httpmon schema`**, the JSON Schema of an exchange; and
+  `skills/httpmon/SKILL.md` and `skills/AGENTS.md` to copy into a project.
+- Replay compares `grpc-status` and re-sends gRPC calls from records.
+
+### Changed
+
+- The code is split into `internal/textsafe` (terminal escaping, credential
+  masking), `internal/body` (decoding and rendering bodies) and
+  `internal/exchange` (the exchange format, summary, digest, `--fail-on`,
+  error classification), shared by the proxy, `query` and `replay`.
+- Text output decompresses a body only as far as it can show, instead of up to
+  10 MB.
+- Failure messages name the URL the client used, not the address dialled
+  (which carried `:443` inside a tunnel).
+
 ## [2.0.0] - 2026-11-14
 
 2.0 changes where httpmon's output goes, what a recording holds and what the

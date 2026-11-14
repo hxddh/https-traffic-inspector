@@ -336,7 +336,7 @@ func writeRecording(t *testing.T, exchanges ...recordedExchange) string {
 	defer f.Close()
 	enc := json.NewEncoder(f)
 	for _, ex := range exchanges {
-		if err := enc.Encode(ex); err != nil {
+		if err := enc.Encode(ex.v3()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -406,7 +406,7 @@ func TestReplay_CompressedResponseComparesDecoded(t *testing.T) {
 	}
 }
 
-func TestDecodeForCompare(t *testing.T) {
+func TestDecodeContent(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	gz.Write([]byte("hello")) //nolint:errcheck
@@ -414,17 +414,17 @@ func TestDecodeForCompare(t *testing.T) {
 
 	h := http.Header{}
 	h.Set("Content-Encoding", "gzip")
-	if got := decodeForCompare(h, buf.Bytes()); got != "hello" {
+	if got := string(must(decodeContent(h.Get("Content-Encoding"), buf.Bytes(), false))); got != "hello" {
 		t.Errorf("got %q, want %q", got, "hello")
 	}
 
 	// Undecodable payloads fall back to a raw comparison rather than erroring.
 	plain := http.Header{}
-	if got := decodeForCompare(plain, []byte("raw")); got != "raw" {
+	if got := string(must(decodeContent(plain.Get("Content-Encoding"), []byte("raw"), false))); got != "raw" {
 		t.Errorf("got %q, want %q", got, "raw")
 	}
 	h.Set("Content-Encoding", "snappy")
-	if got := decodeForCompare(h, []byte("raw")); got != "raw" {
+	if got := string(must(decodeContent(h.Get("Content-Encoding"), []byte("raw"), false))); got != "raw" {
 		t.Errorf("got %q, want %q for an unsupported encoding", got, "raw")
 	}
 }
@@ -932,7 +932,7 @@ func TestTextOutput_ConcurrentResponsesAreAttributable(t *testing.T) {
 		t.Fatalf("found %d intact request blocks, want %d; output:\n%s", len(pathOf), n, text)
 	}
 
-	bodyRe := regexp.MustCompile(`--- RESPONSE #(\d+) body ---\nbody-for-(\d+)\n`)
+	bodyRe := regexp.MustCompile(`--- RESPONSE #(\d+) body ---\n│ body-for-(\d+)\n`)
 	bodies := bodyRe.FindAllStringSubmatch(text, -1)
 	if len(bodies) != n {
 		t.Fatalf("found %d intact response body blocks, want %d; output:\n%s", len(bodies), n, text)

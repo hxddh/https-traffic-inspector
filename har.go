@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"sync"
@@ -199,10 +200,13 @@ func closeHAR() error {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-func harHeaders(l headerList) []harNameValue {
-	out := make([]harNameValue, 0, len(l))
-	for _, kv := range l {
-		out = append(out, harNameValue{Name: kv[0], Value: kv[1]})
+// harHeaders lists h in a stable order, repeated headers kept separately.
+func harHeaders(h http.Header) []harNameValue {
+	out := make([]harNameValue, 0, len(h))
+	for _, k := range sortedKeys(h) {
+		for _, v := range h[k] {
+			out = append(out, harNameValue{Name: k, Value: v})
+		}
 	}
 	return out
 }
@@ -242,7 +246,8 @@ func addHAREntry(r capturedRequest, rs capturedResponse) {
 
 func buildHAREntry(r capturedRequest, rs capturedResponse) harEntry {
 	rf, sf := r.facts, rs.facts
-	rec := buildRecord(0, r, rs) // the same masked, ordered view --record uses
+	// The same masking --record applies.
+	reqURL := captureURL(rf.rawURL)
 
 	var postData *harPostData
 	if len(r.body.Raw) > 0 {
@@ -264,10 +269,10 @@ func buildHAREntry(r capturedRequest, rs capturedResponse) harEntry {
 		Time:            ms(total),
 		Request: harRequest{
 			Method:      rf.method,
-			URL:         rec.URL,
+			URL:         reqURL,
 			HTTPVersion: rf.proto,
-			Headers:     harHeaders(rec.ReqHeaders),
-			QueryString: harQueryString(rec.URL),
+			Headers:     harHeaders(captureHeaders(rf.headers)),
+			QueryString: harQueryString(reqURL),
 			Cookies:     []harNameValue{},
 			PostData:    postData,
 			HeadersSize: -1,
@@ -285,8 +290,8 @@ func buildHAREntry(r capturedRequest, rs capturedResponse) harEntry {
 		Timings: harTimings{Send: 0, Wait: ms(sf.duration), Receive: ms(total - sf.duration)},
 	}
 
-	if rs.err != "" {
-		e.Response.Error = rs.err
+	if rs.err != nil {
+		e.Response.Error = rs.err.Kind + ": " + rs.err.Message
 		e.Timings = harTimings{Send: 0, Wait: ms(total), Receive: 0}
 		return e
 	}
@@ -305,7 +310,7 @@ func buildHAREntry(r capturedRequest, rs capturedResponse) harEntry {
 		Status:      sf.status,
 		StatusText:  statusText,
 		HTTPVersion: sf.proto,
-		Headers:     harHeaders(rec.RespHeaders),
+		Headers:     harHeaders(captureHeaders(sf.headers)),
 		Cookies:     []harNameValue{},
 		Content: harContent{
 			Size:     int64(len(dec)),
@@ -318,7 +323,7 @@ func buildHAREntry(r capturedRequest, rs capturedResponse) harEntry {
 		// The bytes that crossed the wire, before any Content-Encoding was
 		// removed.
 		BodySize: rs.body.Size,
-		Trailers: harHeaders(rec.RespTrailers),
+		Trailers: harTrailers(captureHeaders(sf.trailers)),
 	}
 	if trunc {
 		e.Response.Content.Comment = harTruncatedComment
@@ -347,4 +352,12 @@ func buildHAREntry(r capturedRequest, rs capturedResponse) harEntry {
 		}
 	}
 	return e
+}
+
+// harTrailers is harHeaders, omitted when there are none.
+func harTrailers(h http.Header) []harNameValue {
+	if len(h) == 0 {
+		return nil
+	}
+	return harHeaders(h)
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -11,13 +10,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
-	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/mattn/go-isatty"
@@ -29,6 +23,7 @@ var (
 	// set by flags
 	filterPattern    string
 	jsonMode         bool
+	summaryMode      bool
 	tuiMode          bool
 	recordMode       bool
 	harMode          bool
@@ -124,297 +119,6 @@ func proxyDialHost(listenHost string) string {
 
 func main() { os.Exit(run()) }
 
-// stringFlag registers one string flag under several names, such as -o and
-// --output.
-func stringFlag(p *string, names []string, value, usage string) {
-	for _, n := range names {
-		flag.StringVar(p, n, value, usage)
-	}
-}
-
-// run holds the whole program body so that every exit path returns a code
-// instead of calling os.Exit directly, which would skip cleanup.
-func run() int {
-	defer runCleanups()
-
-	var outputPath string
-	portFlag := flag.String("port", "0", "proxy listen port; 0 picks a random free port")
-	listenFlag := flag.String("listen", "127.0.0.1", "address the proxy listens on; anything other than loopback exposes it to the network")
-	filterFlag := flag.String("filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
-	formatFlag := flag.String("format", "text", "output format: text | json")
-	stringFlag(&outputPath, []string{"o", "output"}, "", "write httpmon's output to this file instead of stderr; \"-\" for stdout")
-	certTTLFlag := flag.Duration("cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
-	uiFlag := flag.Bool("ui", false, "launch interactive terminal UI (TUI)")
-	recordFlag := flag.String("record", "", "path to write recorded traffic as NDJSON (appends if file exists)")
-	harFlag := flag.String("har", "", "write captured traffic as HAR 1.2 JSON")
-	replayFlag := flag.String("replay", "", "path of a recorded NDJSON file to replay (skips proxy, no <command> needed)")
-	replayTargetFlag := flag.String("replay-target", "", "override base URL for replay (e.g. https://staging.example.com)")
-	replayDelayFlag := flag.Duration("replay-delay", 0, "pause between replayed requests")
-	replayFailFlag := flag.Bool("replay-fail-on-diff", false, "exit with code 2 if any replayed response differs from the recording")
-	insecureFlag := flag.Bool("insecure-upstream", false, "skip TLS certificate verification for upstream servers")
-	upstreamProxyFlag := flag.String("upstream-proxy", "", "proxy for httpmon's own upstream requests (default: HTTP(S)_PROXY from the environment)")
-	maxBodyFlag := flag.Int("max-body", 1000, "max bytes of each body shown in output")
-	maxCaptureFlag := flag.Int("max-capture", 1<<20, "max bytes of each body kept for --record/--har and decompression")
-	showSecretsFlag := flag.Bool("show-secrets", false, "show credentials (Authorization, cookies, API keys, signed URLs) in output instead of masking them")
-	redactFlag := flag.Bool("redact", false, "mask credentials in --record and --har files too")
-	caDirFlag := flag.String("ca-dir", os.Getenv("HTTPMON_CA_DIR"), "keep the CA in this directory across runs, creating it on first use (default $HTTPMON_CA_DIR)")
-	noColorFlag := flag.Bool("no-color", false, "disable coloured output")
-	versionFlag := flag.Bool("version", false, "print version and exit")
-	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: httpmon [options] <command> [args...]")
-		fmt.Fprintln(os.Stderr, "       httpmon --replay <file> [--replay-target <url>]")
-		fmt.Fprintln(os.Stderr, "       httpmon --ca-dir <dir>        (create or show a persistent CA)")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "httpmon's output goes to stderr (or -o <file>); the command's stdout is left untouched.")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Options:")
-		flag.PrintDefaults()
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Examples:")
-		fmt.Fprintln(os.Stderr, "  httpmon curl https://api.github.com")
-		fmt.Fprintln(os.Stderr, "  httpmon curl -s https://api.github.com | jq .   # jq gets curl's output")
-		fmt.Fprintln(os.Stderr, "  httpmon --filter /api curl https://example.com/api/v1/users")
-		fmt.Fprintln(os.Stderr, "  httpmon --format json -o trace.ndjson curl https://api.github.com")
-		fmt.Fprintln(os.Stderr, "  httpmon --ui curl https://api.github.com")
-		fmt.Fprintln(os.Stderr, "  httpmon --record traffic.ndjson curl https://api.github.com")
-		fmt.Fprintln(os.Stderr, "  httpmon --har traffic.har curl https://api.github.com")
-		fmt.Fprintln(os.Stderr, "  httpmon --replay traffic.ndjson --replay-target https://staging.example.com")
-	}
-	flag.Parse()
-
-	if *versionFlag {
-		fmt.Printf("httpmon %s (%s, %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
-		return 0
-	}
-
-	if *maxBodyFlag <= 0 || *maxCaptureFlag <= 0 {
-		fmt.Fprintln(os.Stderr, "httpmon: --max-body and --max-capture must be greater than 0")
-		return 1
-	}
-	if *maxCaptureFlag < *maxBodyFlag {
-		fmt.Fprintln(os.Stderr, "httpmon: --max-capture must not be smaller than --max-body")
-		return 1
-	}
-	displayMaxBody = *maxBodyFlag
-	captureMaxBody = *maxCaptureFlag
-	showSecrets = *showSecretsFlag
-	redactCaptures = *redactFlag
-
-	if *upstreamProxyFlag != "" {
-		u, err := url.Parse(*upstreamProxyFlag)
-		if err != nil || u.Host == "" {
-			fmt.Fprintf(os.Stderr, "httpmon: invalid --upstream-proxy %q\n", *upstreamProxyFlag)
-			return 1
-		}
-		upstreamProxy = u
-	}
-
-	switch *formatFlag {
-	case "text", "json":
-	default:
-		fmt.Fprintf(os.Stderr, "httpmon: unknown --format %q (want text or json)\n", *formatFlag)
-		return 1
-	}
-	jsonMode = *formatFlag == "json"
-	// Assigned before the replay branch so replay honours it too: a recording
-	// captured from a self-signed or internal-CA host must be replayable.
-	insecureUpstream = *insecureFlag
-	upstreamClient = newUpstreamClient(insecureUpstream)
-	h2cClient = newH2CClient()
-
-	// ── Output channel ───────────────────────────────────────────────────────
-	// Replay has no wrapped command, so its results are its stdout.
-	defaultOut := os.Stderr
-	if *replayFlag != "" {
-		defaultOut = os.Stdout
-	}
-	out, closeOut, err := openOutput(outputPath, defaultOut)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: cannot open output %s: %v\n", outputPath, err)
-		return 1
-	}
-	addCleanup(closeOut)
-	setOutput(out)
-	useColor = !*noColorFlag && os.Getenv("NO_COLOR") == "" && isTerminal(out)
-
-	// ── Replay mode: no proxy, no subprocess ─────────────────────────────────
-	if *replayFlag != "" {
-		return replayFile(*replayFlag, *replayTargetFlag, *replayDelayFlag, *replayFailFlag)
-	}
-
-	// ── CA ───────────────────────────────────────────────────────────────────
-	cmdArgs := flag.Args()
-	if *caDirFlag != "" {
-		certPath, created, err := loadOrCreateCA(*caDirFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "httpmon: --ca-dir: %v\n", err)
-			return 1
-		}
-		if len(cmdArgs) == 0 {
-			verb := "Using"
-			if created {
-				verb = "Created"
-			}
-			fmt.Printf("%s httpmon CA: %s\n", verb, certPath)
-			fmt.Printf("  %s\n  valid until %s\n", caCert.Subject.CommonName, caCert.NotAfter.Format("2006-01-02"))
-			fmt.Println("Import this certificate into a device or trust store to let it trust httpmon.")
-			fmt.Println("Keep the directory private: its key can intercept every connection that trusts this CA.")
-			return 0
-		}
-	}
-
-	filterPattern = *filterFlag
-	tuiMode = *uiFlag
-	recordMode = *recordFlag != ""
-	harMode = *harFlag != ""
-	harPath = *harFlag
-	certTTL = *certTTLFlag
-
-	if len(cmdArgs) < 1 {
-		flag.Usage()
-		return 1
-	}
-
-	if recordMode {
-		if err := openRecordFile(*recordFlag); err != nil {
-			fmt.Fprintf(os.Stderr, "httpmon: cannot open record file %s: %v\n", *recordFlag, err)
-			return 1
-		}
-		addCleanup(func() { recordFile.Close() }) //nolint:errcheck
-	}
-	if harMode {
-		if err := openHARFile(harPath); err != nil {
-			fmt.Fprintf(os.Stderr, "httpmon: cannot create HAR file %s: %v\n", harPath, err)
-			return 1
-		}
-		// finishHAR normally closes it; this covers the early exits.
-		addCleanup(func() { closeHAR() }) //nolint:errcheck
-	}
-	if certTTL > 0 {
-		// Sweep expired entries at 1/6 of the TTL interval, minimum every minute.
-		sweep := certTTL / 6
-		if sweep < time.Minute {
-			sweep = time.Minute
-		}
-		startCertJanitor(sweep)
-	}
-
-	caCertPath, err := buildCABundle(caPEM())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: failed to build CA bundle: %v\n", err)
-		return 1
-	}
-	addCleanup(func() { os.Remove(caCertPath) }) //nolint:errcheck
-
-	trustStore, err := buildJavaTrustStore(caCertPath)
-	if err != nil {
-		// Only Java needs it; everything else can still be inspected.
-		fmt.Fprintf(os.Stderr, "httpmon: Java truststore not created, JVM tools will not be configured: %v\n", err)
-	} else {
-		addCleanup(func() { os.Remove(trustStore) }) //nolint:errcheck
-	}
-
-	listenAddr := net.JoinHostPort(*listenFlag, *portFlag)
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "httpmon: failed to bind proxy on %s: %v\n", listenAddr, err)
-		return 1
-	}
-	proxyPort = strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
-	if !isLoopbackHost(*listenFlag) {
-		fmt.Fprintf(os.Stderr,
-			"httpmon: WARNING: proxy listening on %s is reachable from the network; anyone who can reach it can use it, including to reach services bound to this machine's loopback\n",
-			ln.Addr())
-	}
-	// What the wrapped command dials. A wildcard bind is reached via loopback.
-	dialHost := proxyDialHost(*listenFlag)
-	proxyURL := "http://" + net.JoinHostPort(dialHost, proxyPort)
-
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodConnect {
-				handleConnect(w, r)
-			} else {
-				handleHTTP(w, r)
-			}
-		}),
-		// Bounds how long a connection may sit mid-header. Request bodies and
-		// hijacked CONNECT tunnels are unaffected, so long-lived streams and
-		// WebSocket splices still work.
-		ReadHeaderTimeout: 30 * time.Second,
-		ErrorLog:          log.New(io.Discard, "", 0),
-	}
-	go func() {
-		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			// Print rather than exit: the subprocess is already running and
-			// os.Exit here would skip cleanup of the CA bundle.
-			fmt.Fprintf(os.Stderr, "httpmon: proxy error: %v\n", err)
-		}
-	}()
-
-	if strings.EqualFold(strings.TrimSuffix(filepath.Base(cmdArgs[0]), ".exe"), "curl") {
-		cmdArgs, err = curlArgs(cmdArgs, proxyURL, caCertPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "httpmon: %v\n", err)
-			return 1
-		}
-	}
-
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	cmd.Env = subprocessEnv(os.Environ(), proxyURL, caCertPath)
-	if trustStore != "" {
-		cmd.Env = append(cmd.Env, "JAVA_TOOL_OPTIONS="+
-			javaToolOptions(lookupEnv(os.Environ(), "JAVA_TOOL_OPTIONS"), dialHost, proxyPort, trustStore))
-	}
-
-	// The banner is diagnostic, so it goes to stderr whatever -o says.
-	if !tuiMode {
-		var b strings.Builder
-		fmt.Fprintf(&b, "httpmon %s: proxy on %s, CA bundle %s\n", version, ln.Addr(), caCertPath)
-		if filterPattern != "" {
-			fmt.Fprintf(&b, "httpmon: filter %q\n", filterPattern)
-		}
-		if insecureUpstream {
-			b.WriteString("httpmon: upstream TLS verification DISABLED (--insecure-upstream)\n")
-		}
-		if outputPath != "" && outputPath != "-" {
-			fmt.Fprintf(&b, "httpmon: writing output to %s\n", outputPath)
-		}
-		fmt.Fprintf(&b, "httpmon: running %s\n", strings.Join(cmdArgs, " "))
-		fmt.Fprint(os.Stderr, b.String())
-	}
-
-	if tuiMode {
-		return runWithTUI(cmd)
-	}
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		if cmd.Process != nil {
-			cmd.Process.Signal(sig) //nolint:errcheck
-		}
-	}()
-
-	exitCode := 0
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			fmt.Fprintf(os.Stderr, "httpmon: %v\n", err)
-			exitCode = 1
-		}
-	}
-
-	drainInflight(exitDrainTimeout)
-	return finishHAR(exitCode)
-}
-
 // runWithTUI runs cmd behind the interactive UI. The command's output is held
 // back while the UI owns the terminal and replayed afterwards, stdout to
 // stdout and stderr to stderr. It gets no stdin: the UI reads the keyboard.
@@ -457,7 +161,7 @@ func runWithTUI(cmd *exec.Cmd) int {
 	printTUINotices(os.Stderr)
 	os.Stdout.Write(subOut.Bytes()) //nolint:errcheck
 	os.Stderr.Write(subErr.Bytes()) //nolint:errcheck
-	return finishHAR(code)
+	return finishRun(code)
 }
 
 // openOutput opens httpmon's output destination: def when path is empty,

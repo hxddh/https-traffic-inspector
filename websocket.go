@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/body"
 )
 
 // ---- splice ----
@@ -128,9 +130,7 @@ func observeHandshake(reqID int, resp *http.Response) *wsObserver {
 	s.responseHead(reqID, f)
 	s.responseBody(reqID, f, bodyView{})
 	if !f.upgraded {
-		if recordMode || harMode {
-			captures.addResponse(reqID, capturedResponse{facts: *f})
-		}
+		captures.addResponse(reqID, capturedResponse{facts: *f})
 		return nil
 	}
 
@@ -144,12 +144,10 @@ func observeHandshake(reqID int, resp *http.Response) *wsObserver {
 func (o *wsObserver) message(m wsMessage) {
 	o.mu.Lock()
 	o.count++
-	if recordMode || harMode {
-		if len(o.msgs) < maxWSRecorded {
-			o.msgs = append(o.msgs, m)
-		} else {
-			o.dropped++
-		}
+	if len(o.msgs) < maxWSRecorded {
+		o.msgs = append(o.msgs, m)
+	} else {
+		o.dropped++
 	}
 	o.mu.Unlock()
 	currentSink().wsMessage(o.reqID, m)
@@ -170,12 +168,10 @@ func (o *wsObserver) close() {
 	o.mu.Unlock()
 
 	sum := wsSummary{messages: count, duration: time.Since(o.start), dropped: dropped}
-	if recordMode || harMode {
-		f := *o.facts
-		f.duration += sum.duration
-		captures.addResponse(o.reqID, capturedResponse{facts: f, ws: msgs})
-	}
 	currentSink().wsClosed(o.reqID, sum)
+	f := *o.facts
+	f.duration += sum.duration
+	captures.addResponse(o.reqID, capturedResponse{facts: f, ws: msgs, wsDropped: dropped})
 }
 
 // parseDeflateExtension reports whether permessage-deflate was negotiated and
@@ -550,7 +546,7 @@ func (p *wsParser) inflate(data []byte, partial bool) (out []byte, truncated, un
 	}
 	src := io.MultiReader(bytes.NewReader(data), bytes.NewReader([]byte{0, 0, 0xff, 0xff}))
 	r := flate.NewReaderDict(src, dict)
-	out, err := io.ReadAll(io.LimitReader(r, maxDecompressed))
+	out, err := io.ReadAll(io.LimitReader(r, body.MaxDecompressed))
 	// The message ends with a sync flush, not a final block, so running out
 	// of input is the normal way for it to end.
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {

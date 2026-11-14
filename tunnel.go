@@ -15,6 +15,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hxddh/https-traffic-inspector/v2/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v2/internal/textsafe"
 )
 
 // ---- forwarding ----
@@ -96,7 +99,10 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 			noticef("upstream request to %s failed: %v", req.URL.Host, err)
 		}
 		warnTLSVerification(req.URL.Hostname(), err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		// The client gets the same description the output shows: its own
+		// URL rather than the dialled address, and the kind of failure.
+		info := exchange.Describe(err, requestDisplayURL(req))
+		http.Error(w, "httpmon: "+info.Kind+": "+info.Message, http.StatusBadGateway)
 		return
 	}
 	if shouldLog {
@@ -306,7 +312,7 @@ func looksLikeHTTP(first byte) bool {
 // cannot show anyway.
 func relayOpaque(client net.Conn, target, host string) {
 	if !jsonMode && !tuiMode {
-		emitText(paint(colYellow, fmt.Sprintf("    %s: not HTTP, relayed without inspection", sanitizeLine(target))) + "\n\n")
+		emitText(paint(colYellow, fmt.Sprintf("    %s: not HTTP, relayed without inspection", textsafe.Line(target))) + "\n\n")
 	}
 	up, err := dialUpstream(target, host, false)
 	if err != nil {
