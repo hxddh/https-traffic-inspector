@@ -181,6 +181,12 @@ func (o *captureOptions) openSession(name string) error {
 	if dir == "" {
 		return nil
 	}
+	// Check before Create, which replaces the exchanges: a session another
+	// process is writing must not lose them to a run that is then refused.
+	var m session.Meta
+	if session.ReadJSON(dir, session.MetaFile, &m) == nil && m.Running() && m.PID != os.Getpid() {
+		return fmt.Errorf("session %s is in use by process %d; choose another with --session", dir, m.PID)
+	}
 	if err := session.Create(dir, o.appendSession); err != nil {
 		return fmt.Errorf("session %s: %w", dir, err)
 	}
@@ -495,13 +501,6 @@ Options:
 	if err := o.apply(o.session); err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon proxy: %v\n", err)
 		return 1
-	}
-	if sessionPath != "" {
-		var m session.Meta
-		if session.ReadJSON(sessionPath, session.MetaFile, &m) == nil && m.Running() && m.PID != os.Getpid() {
-			fmt.Fprintf(os.Stderr, "httpmon proxy: session %q is in use by process %d; choose another with --session\n", sessionMeta.Name, m.PID)
-			return 1
-		}
 	}
 	rt, err := startProxy(o.listen, o.port)
 	if err != nil {

@@ -66,6 +66,9 @@ func TestLoad_ProjectCannotRedirectTraffic(t *testing.T) {
 		`ca_dir = "/tmp/x"`,
 		`map = ["api.stripe.com => evil.example.com"]`,
 		`map = ["api.stripe.com => https://10.0.0.5:443"]`,
+		// userinfo: url.Parse routes to attacker.example, not localhost
+		`map = ["api.example.com => http://localhost:80@attacker.example"]`,
+		`map = ["api.example.com => localhost:80@attacker.example"]`,
 	} {
 		setup(t, "", bad)
 		if _, err := Load(); err == nil {

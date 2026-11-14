@@ -353,3 +353,51 @@ func TestMCP_AddRuleNeedsRunningSession(t *testing.T) {
 		t.Errorf("rules = %+v, %v", r, err)
 	}
 }
+
+// Regression: a second run of a session in use replaced the first run's
+// exchanges before it was refused.
+func TestOpenSession_InUseKeepsExchanges(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	session.Create(dir, false) //nolint:errcheck
+	ex := filepath.Join(dir, session.ExchangesFile)
+	os.WriteFile(ex, []byte("{}\n"), 0o600)                                       //nolint:errcheck
+	other := os.Getppid()                                                         // a running process that is not this one
+	session.WriteJSON(dir, session.MetaFile, session.Meta{Name: "s", PID: other}) //nolint:errcheck
+	o := &captureOptions{sessionDir: dir}
+	if err := o.openSession("s"); err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("openSession = %v, want in use", err)
+	}
+	if _, err := os.Stat(ex); err != nil {
+		t.Error("the running session's exchanges were removed")
+	}
+}
+
+func TestMCP_BadLimitsAreToolErrors(t *testing.T) {
+	path := recordSample(t)
+	id := readRecordFile(t, path)[1].ID
+	call := func(args map[string]any, name string) string {
+		b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+			"params": map[string]any{"name": name, "arguments": args}})
+		return string(b)
+	}
+	res := mcpCall(t, mcpTools(false),
+		call(map[string]any{"session": path, "id": id, "which": "response", "max_bytes": -1}, "get_body"),
+		call(map[string]any{"session": path, "id": id, "max_body": -5}, "get_exchange"),
+		`{"jsonrpc":"2.0","id":2,"method":"ping"}`,
+	)
+	if len(res) != 3 {
+		t.Fatalf("the server stopped answering: %v", res)
+	}
+	for i := range 2 {
+		if _, isErr := toolText(t, res[i]); !isErr {
+			t.Errorf("call %d: a negative limit was accepted", i)
+		}
+	}
+}
+
+func TestCallTool_RecoversPanic(t *testing.T) {
+	_, err := callTool(mcpTool{Name: "boom", call: func(map[string]any) (string, error) { panic("x") }}, nil)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("err = %v", err)
+	}
+}

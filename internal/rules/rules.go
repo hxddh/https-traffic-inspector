@@ -224,7 +224,7 @@ func (r *Rule) parseMap(lhs, rhs string) error {
 		to = "http://" + to
 	}
 	u, err := url.Parse(to)
-	if err != nil || u.Host == "" || (u.Path != "" && u.Path != "/") {
+	if err != nil || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("map rule %q: bad target %q", r.Source, rhs)
 	}
 	r.To = u

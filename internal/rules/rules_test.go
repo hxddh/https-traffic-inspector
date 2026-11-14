@@ -84,6 +84,7 @@ func TestParse_Errors(t *testing.T) {
 		{KindFault, "*/x => reset after lots", "bad size"},
 		{KindMap, "a/b => c", "HOST"},
 		{KindMap, "a => c/path", "bad target"},
+		{KindMap, "a => http://localhost:80@evil.example", "bad target"},
 		{"other", "a => b", "unknown rule kind"},
 	} {
 		_, err := Parse(tc.kind, tc.in)

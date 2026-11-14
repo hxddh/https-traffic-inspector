@@ -132,7 +132,7 @@ func serveMCP(in io.Reader, out io.Writer, tools []mcpTool) int {
 				resp.Error = &mcpError{-32602, "unknown tool " + p.Name}
 				break
 			}
-			text, err := t.call(p.Arguments)
+			text, err := callTool(t, p.Arguments)
 			if err != nil {
 				resp.Result = map[string]any{"content": []map[string]any{{"type": "text", "text": err.Error()}}, "isError": true}
 				break
@@ -146,6 +146,17 @@ func serveMCP(in io.Reader, out io.Writer, tools []mcpTool) int {
 		}
 	}
 	return 0
+}
+
+// callTool runs a tool, turning a panic into a tool error: one bad call must
+// not end a server the client keeps running.
+func callTool(t mcpTool, args map[string]any) (text string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("httpmon: %s failed: %v", t.Name, r)
+		}
+	}()
+	return t.call(args)
 }
 
 func schema(props map[string]any, required ...string) map[string]any {
@@ -363,6 +374,9 @@ func mcpGetExchange(a map[string]any) (string, error) {
 		return "", err
 	}
 	displayMaxBody = argInt(a, "max_body", 4000)
+	if displayMaxBody <= 0 {
+		return "", errors.New("max_body must be greater than 0")
+	}
 	prepareForDisplay(e)
 	s := renderExchangeText(e)
 	if e.Rule != "" {
@@ -385,7 +399,11 @@ func mcpGetBody(a map[string]any) (string, error) {
 		return "", fmt.Errorf("exchange #%d has no %s body", e.ID, which)
 	}
 	s := textsafe.Terminal(sb.String())
-	if max := argInt(a, "max_bytes", 100000); len(s) > max {
+	max := argInt(a, "max_bytes", 100000)
+	if max <= 0 {
+		return "", errors.New("max_bytes must be greater than 0")
+	}
+	if len(s) > max {
 		s = s[:max] + truncationMarker
 	}
 	return s, nil

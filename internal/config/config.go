@@ -11,10 +11,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
 	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
 )
 
@@ -95,15 +95,13 @@ func checkProject(f *Config) error {
 		return errors.New("show_secrets may only be set in the user config")
 	}
 	for _, m := range f.Map {
-		_, to, _ := strings.Cut(m, "=>")
-		to = strings.TrimSpace(to)
-		if i := strings.Index(to, "://"); i >= 0 {
-			to = to[i+3:]
+		// Validate with the parser that routes, so the host checked is the
+		// host traffic goes to.
+		r, err := rules.Parse(rules.KindMap, m)
+		if err != nil {
+			return err
 		}
-		host := to
-		if h, _, err := net.SplitHostPort(to); err == nil {
-			host = h
-		}
+		host := r.To.Hostname()
 		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
 			return fmt.Errorf("map %q: a project file may only map to this machine (localhost, 127.0.0.1, ::1)", m)
 		}
