@@ -168,9 +168,12 @@ func (e *Exchange) SummaryLine() string {
 		}
 		fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(size))
 	}
+	// One tag per rule: "[header] [mock]".
 	if e.Rule != "" {
-		kind, _, _ := strings.Cut(e.Rule, ":")
-		fmt.Fprintf(&b, " [%s]", kind)
+		for _, part := range strings.Split(e.Rule, "; ") {
+			kind, _, _ := strings.Cut(part, ":")
+			fmt.Fprintf(&b, " [%s]", kind)
+		}
 	}
 	return b.String()
 }

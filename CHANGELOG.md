@@ -15,12 +15,12 @@ Compatible with 4.0: options, outputs and the exchange format are unchanged.
 
 - **Session index.** Each session keeps an index beside its exchanges. On a
   60,000-exchange, 165 MB session: `query --id` 1.67 s → 0.02 s, MCP
-  `get_exchange` 1.62 s / 364 MB → 0.02 s / 20 MB, MCP `query_exchanges`
-  1.70 s / 400 MB → 0.11 s / 67 MB. A 4.0 session is indexed the first time
+  `get_exchange` 1.62 s / 364 MB → 0.02 s / 21 MB, MCP `query_exchanges`
+  1.70 s / 400 MB → 0.14 s / 65 MB. A 4.0 session is indexed the first time
   it is read.
 - **Streaming HAR and light diff.** `--format har` writes entries one at a
-  time (peak 1360 MB → 73 MB on that session); `diff` holds light forms of the
-  exchanges and reads bodies back only where they differ (1047 MB → 143 MB).
+  time (peak 1360 MB → 66 MB on that session); `diff` holds light forms of the
+  exchanges and reads bodies back only where they differ (1047 MB → 144 MB).
 - **`--max-session-size`**: a session rotates into segments and drops its
   oldest when over the limit; `httpmon proxy` keeps at most 1 GB by default.
   `httpmon sessions rm` and `httpmon sessions prune --older-than 7d` remove
