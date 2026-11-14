@@ -64,9 +64,9 @@ func Classify(err error) string {
 		return KindTLSVerify
 	case errors.As(err, &recordErr), errors.As(err, &alert), strings.Contains(msg, "tls: "):
 		return KindTLSHandshake
-	case errors.Is(err, syscall.ECONNREFUSED):
+	case errors.Is(err, syscall.ECONNREFUSED), isErrno(err, refusedErrnos):
 		return KindRefused
-	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE),
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE), isErrno(err, resetErrnos),
 		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
 		return KindReset
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded),
@@ -92,3 +92,17 @@ func Describe(err error, displayURL string) *Error {
 type InjectedError struct{ Rule string }
 
 func (e *InjectedError) Error() string { return "injected by " + e.Rule }
+
+// isErrno reports whether err wraps one of these system error numbers.
+func isErrno(err error, nums []syscall.Errno) bool {
+	var e syscall.Errno
+	if !errors.As(err, &e) {
+		return false
+	}
+	for _, n := range nums {
+		if e == n {
+			return true
+		}
+	}
+	return false
+}

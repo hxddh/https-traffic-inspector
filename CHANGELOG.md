@@ -75,6 +75,9 @@ installable with one command. Not compatible with 3.x options; see
 - A `text/*` body that is not UTF-8 (another charset, or damaged) was put into
   the record's `text` as invalid UTF-8; the invalid bytes are now replaced
   with U+FFFD. Found by the new fuzz tests.
+- On Windows a refused or reset connection was reported as error kind
+  `other`: Winsock's error numbers are now classified as `refused` and
+  `reset`. Found by the new Windows CI.
 
 ## [3.1.0] - 2026-11-14
 

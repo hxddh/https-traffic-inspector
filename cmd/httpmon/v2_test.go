@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -451,7 +452,8 @@ func TestCA_PersistsAcrossRuns(t *testing.T) {
 		t.Fatalf("first use: created=%v err=%v", created, err)
 	}
 	first := caCert
-	if fi, _ := os.Stat(filepath.Join(dir, caKeyFile)); fi.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits; the key is private by its ACL.
+	if fi, _ := os.Stat(filepath.Join(dir, caKeyFile)); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Errorf("key mode = %v, want 0600", fi.Mode().Perm())
 	}
 
