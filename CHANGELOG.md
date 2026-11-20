@@ -4,6 +4,89 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0] - 2026-11-20
+
+Turns httpmon from a flat packet logger into a zero-config causal and
+protocol-intelligent traffic microscope for developers and AI coding agents —
+without adding mandatory flags or new subcommands — and fixes eight security,
+MCP, rule and session-lifecycle issues found reviewing 4.1.0.
+
+### Added
+
+- **Phase waterfall timings and connection/TLS X-ray.** Every upstream request
+  is traced with `net/http/httptrace`, recording `timings` (`dns_ms`,
+  `tcp_ms`, `tls_ms`, `send_ms`, `wait_ms` TTFB, `recv_ms`) and `conn`
+  (`id`, `reused`, `remote_addr`, `alpn`, `tls_version`, `cipher_suite`,
+  `cert_subject`, `cert_issuer`, `cert_days_left`). Slow requests dominated
+  by DNS or TLS surface the bottleneck inline in the summary; `query --id`,
+  the TUI and HAR 1.2 export (`dns`, `connect`, `ssl`, `send`, `wait`,
+  `receive`, `serverIPAddress`, `connection`) show the full breakdown.
+- **Native SSE, NDJSON and LLM stream decoding.** `text/event-stream` and
+  `application/x-ndjson` / `application/jsonl` bodies are decoded into
+  `body.stream` (`events`, `ttft_ms`, head + tail + error-frame windowing so
+  trailing errors and usage are never cut off by `--max-body`, plus
+  assembled LLM text, `model`, `tool_calls`, `stop_reason` and `usage` across
+  OpenAI, Anthropic and Gemini streams).
+- **HTTP-200 protocol soft errors (`app_error`).** Mid-stream SSE error
+  events, GraphQL `200` responses carrying `errors[]`, and JSON-RPC `2.0`
+  error objects populate `app_error` and appear directly on summary lines.
+  `--fail-on app_error` (and `query --status app_error`) matches them as well
+  as non-zero gRPC statuses.
+- **Tunnel and client-TLS visibility.** A `CONNECT` tunnel where the client
+  rejects httpmon's CA is recorded in the session as `kind: "connect"` with
+  error kind `client_tls_untrusted` instead of vanishing after a console
+  notice; non-HTTP `CONNECT` tunnels relayed untouched are recorded as
+  `kind: "tunnel"` with `bytes_up` and `bytes_down`.
+- **Zero-leak HTTP semantic X-ray (`meta`) and multipart dissection.**
+  `multipart/*` bodies are dissected into `body.parts` (field names,
+  filenames, types, sizes, text previews). Without unmasking secrets, `meta`
+  extracts JWT header/expiry claims (`expired`, `alg`, `iss`, `sub` — flagging
+  `401 jwt_expired` on summary lines), AWS SigV4 `region`/`service`,
+  normalised `rate_limit` headers, `cache` status, GraphQL operation names,
+  and browser `cors` mismatches.
+- **Cross-exchange causal engine and one-call session diagnosis.** Redirect
+  chains (`redirect_from`, flagging cross-host `Authorization` header drops),
+  retry chains (`retry_of`, `attempt`), unpooled HTTPS connections (`0 reused`),
+  and sequential N+1 request bursts are linked automatically and reported as
+  `! ` insights on the digest. `httpmon query <session> --diagnose` and MCP's
+  new `diagnose_session` return a complete health report in one call.
+- **Rule query-parameter matching.** Mock, fault and header patterns containing
+  `?` match against `path?query` (e.g. `'GET api.example.com/items?page=2 => 500'`).
+
+### Fixed
+
+- **Security:** a project `.httpmon.toml` could read arbitrary host files via
+  `mock = ["* => 200 @/path"]`, reference other sessions via `mock_from`, set
+  credential headers other than `Authorization`/`Cookie`/`Proxy-Authorization`,
+  and affect `httpmon proxy` started in that directory. Project `@FILE` mocks
+  are now confined inside the project directory (symlinks included),
+  `mock_from` is restricted to user config/flags, all 13 sensitive headers
+  are blocked, and `httpmon proxy` reads only the user config.
+- **MCP concurrency and isolation:** `wait_for_exchange` no longer blocks
+  concurrent MCP requests (`ping`, `in_flight`, `add_rule`…) on stdin and now
+  honours `notifications/cancelled`; `get_exchange`'s `max_body` and
+  `replay_exchange` no longer mutate process-global output state;
+  `diff_sessions` honours `.httpmon.toml` `ignore` and accepts an `ignore`
+  argument; `query_exchanges` and `wait_for_exchange` accept `rule`.
+- **Container / PID-reuse session lock:** `Meta.Running` now checks
+  `live.json`'s heartbeat timestamp so a dead session whose PID was reused
+  (such as PID 1 in a restarted container) can be replaced, removed or pruned.
+- **Schema and UTF-8 slicing:** `httpmon schema` covers every v4 field
+  (including `rule`, missing in 4.x), guarded by a reflection test; UTF-8
+  clipping in WebSocket display and MCP `get_body` never splits multi-byte
+  runes; truncated JSON error bodies still extract `ErrorHint` from their
+  captured prefix.
+- **UI replay & release workflow:** `httpmon ui` replay shares `sendReplay`'s
+  empty-body and cleartext-gRPC handling; `release.yml` checks out existing
+  tags in the `release` and `container` jobs on `workflow_dispatch`.
+
+### Changed
+
+- **Breaking:** module path is `github.com/hxddh/https-traffic-inspector/v5`
+  (`go install github.com/hxddh/https-traffic-inspector/v5/cmd/httpmon@latest`).
+- Exchange record version is now `v: 4`; `v: 3` sessions written by 4.x are
+  still read seamlessly.
+
 ## [4.1.0] - 2026-11-14
 
 Makes the scenarios 4.0 introduced — a standing proxy, long sessions, agents

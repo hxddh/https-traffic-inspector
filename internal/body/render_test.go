@@ -202,3 +202,65 @@ func TestRender_BoundsALargeGRPCMessage(t *testing.T) {
 		t.Errorf("rendered %d bytes, truncated=%v; want it within budget and marked", len(b), r.Truncated)
 	}
 }
+
+func TestRender_SSEAndLLMAssembly(t *testing.T) {
+	var sse strings.Builder
+	sse.WriteString("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":42}}}\n\n")
+	sse.WriteString("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"read_file\"}}\n\n")
+	for i := range 40 {
+		fmt.Fprintf(&sse, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"tok%d \"}}\n\n", i)
+	}
+	sse.WriteString("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":99}}\n\n")
+	sse.WriteString("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n")
+
+	h := http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}}
+	r, hint := Render(h, []byte(sse.String()), false, int64(sse.Len()), 600)
+	if r == nil || r.Stream == nil {
+		t.Fatalf("expected StreamInfo, got %+v", r)
+	}
+	st := r.Stream
+	if st.Format != "sse" || st.Events != 44 || st.Model != "claude-sonnet-4-6" || st.StopReason != "end_turn" {
+		t.Errorf("stream = %+v", st)
+	}
+	if !strings.HasPrefix(st.Assembled, "tok0 tok1 ") || len(st.ToolCalls) != 1 || st.ToolCalls[0] != "read_file" {
+		t.Errorf("assembled=%q tools=%v", st.Assembled, st.ToolCalls)
+	}
+	if st.Usage["input_tokens"] != 42 || st.Usage["output_tokens"] != 99 {
+		t.Errorf("usage = %v", st.Usage)
+	}
+	if st.Error != "overloaded_error" || hint != "overloaded_error" || r.SoftErrorKind != "sse" {
+		t.Errorf("error=%q hint=%q soft=%q", st.Error, hint, r.SoftErrorKind)
+	}
+	if len(st.Tail) == 0 || st.Omitted == 0 {
+		t.Errorf("expected head+tail windowing, got head=%d tail=%d omitted=%d", len(st.Head), len(st.Tail), st.Omitted)
+	}
+}
+
+func TestRender_MultipartAndSoftErrors(t *testing.T) {
+	mp := "--bnd\r\nContent-Disposition: form-data; name=\"meta\"\r\nContent-Type: application/json\r\n\r\n{\"role\":\"admin\"}\r\n" +
+		"--bnd\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n\x89PNG\x00\x01\x02\r\n--bnd--\r\n"
+	r, _ := Render(http.Header{"Content-Type": {"multipart/form-data; boundary=bnd"}}, []byte(mp), false, int64(len(mp)), 1000)
+	if r == nil || len(r.Parts) != 2 {
+		t.Fatalf("parts = %+v", r)
+	}
+	if r.Parts[0].Name != "meta" || r.Parts[0].Value != `{"role":"admin"}` || !r.Parts[1].Binary || r.Parts[1].Filename != "a.png" {
+		t.Errorf("parts = %+v", r.Parts)
+	}
+
+	gqlReq, _ := Render(http.Header{"Content-Type": {"application/json"}}, []byte(`{"query":"mutation CreateOrder($x: ID!) { createOrder(id: $x) }"}`), false, 64, 1000)
+	if gqlReq.GraphQLOp != "mutation CreateOrder" {
+		t.Errorf("GraphQLOp = %q", gqlReq.GraphQLOp)
+	}
+	gqlResp, _ := Render(http.Header{"Content-Type": {"application/json"}}, []byte(`{"data":null,"errors":[{"message":"Forbidden","extensions":{"code":"UNAUTHENTICATED"}}]}`), false, 90, 1000)
+	if gqlResp.SoftErrorKind != "graphql" || gqlResp.SoftErrorHint != "UNAUTHENTICATED" {
+		t.Errorf("graphql soft error = %q %q", gqlResp.SoftErrorKind, gqlResp.SoftErrorHint)
+	}
+	rpcResp, _ := Render(http.Header{"Content-Type": {"application/json"}}, []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`), false, 77, 1000)
+	if rpcResp.SoftErrorKind != "jsonrpc" || rpcResp.SoftErrorHint != "-32601" {
+		t.Errorf("jsonrpc soft error = %q %q", rpcResp.SoftErrorKind, rpcResp.SoftErrorHint)
+	}
+	_, truncHint := Render(http.Header{"Content-Type": {"application/json"}}, []byte(`{"error":{"code":"quota_exceeded","details":"`+strings.Repeat("a", 200)), true, 5000, 100)
+	if truncHint != "quota_exceeded" {
+		t.Errorf("truncated JSON error hint = %q, want quota_exceeded", truncHint)
+	}
+}

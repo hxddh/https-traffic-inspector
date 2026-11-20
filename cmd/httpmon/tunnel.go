@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ---- forwarding ----
@@ -78,7 +78,8 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 		return
 	}
 
-	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), req.Body)
+	traceCtx, tr := withUpstreamTrace(req.Context())
+	proxyReq, err := http.NewRequestWithContext(traceCtx, req.Method, req.URL.String(), req.Body)
 	if err != nil {
 		if req.Body != nil {
 			req.Body.Close() //nolint:errcheck
@@ -122,7 +123,7 @@ func forwardRequest(w http.ResponseWriter, req *http.Request, client *http.Clien
 	}
 	applyHeaderRules(rule.headers, "response", resp.Header)
 	if shouldLog {
-		logResponse(resp, reqID)
+		logResponseTraced(resp, reqID, tr)
 	}
 	// Close whatever resp.Body is by now: logResponse wraps it in a sampler,
 	// and a deferred resp.Body.Close() bound earlier would close the original
@@ -238,6 +239,8 @@ func handleWebSocket(w http.ResponseWriter, req *http.Request, useTLS bool) {
 // client talks through a proxy).
 func handleConnect(w http.ResponseWriter, r *http.Request) {
 	currentSink().connect(r.Host)
+	startTime := time.Now()
+	shouldLog := matchesFilter(r)
 
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -277,7 +280,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
 			clientConn.SetReadDeadline(time.Time{}) //nolint:errcheck
-			relayOpaque(conn, r.Host, host)
+			relayOpaque(conn, r.Host, host, shouldLog, startTime)
 			return
 		}
 		clientConn.Close() //nolint:errcheck
@@ -287,7 +290,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if first[0] != tlsHandshakeRecord {
 		clientConn.SetReadDeadline(time.Time{}) //nolint:errcheck
 		if !looksLikeHTTP(first[0]) {
-			relayOpaque(conn, r.Host, host)
+			relayOpaque(conn, r.Host, host, shouldLog, startTime)
 			return
 		}
 		plainTunnels.serve(conn, r.Host)
@@ -306,7 +309,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		NextProtos:   []string{"h2", "http/1.1"},
 	})
 	if err := tlsConn.Handshake(); err != nil {
-		noticef("TLS handshake with the client for %s failed: %v (does the client trust httpmon's CA?)", host, err)
+		msg := fmt.Sprintf("TLS handshake with the client for %s failed: %v (does the client trust httpmon's CA?)", host, err)
+		noticef("%s", msg)
+		if shouldLog {
+			recordTunnelExchange("connect", "https://"+stripDefaultPort(r.Host, "https"), 0, startTime, time.Since(startTime),
+				&exchange.Error{Kind: exchange.KindClientTLS, Message: msg}, nil)
+		}
 		clientConn.Close() //nolint:errcheck
 		return
 	}
@@ -332,23 +340,31 @@ func looksLikeHTTP(first byte) bool {
 // relayOpaque splices a tunnel that does not carry HTTP straight to its
 // target. Breaking it would break the wrapped command for traffic httpmon
 // cannot show anyway.
-func relayOpaque(client net.Conn, target, host string) {
-	if !jsonMode && !tuiMode {
+func relayOpaque(client net.Conn, target, host string, shouldLog bool, startTime time.Time) {
+	if !jsonMode && !tuiMode && !summaryMode {
 		emitText(paint(colYellow, fmt.Sprintf("    %s: not HTTP, relayed without inspection", textsafe.Line(target))) + "\n\n")
 	}
 	up, err := dialUpstream(target, host, false)
 	if err != nil {
 		noticef("tunnel to %s failed: %v", target, err)
+		if shouldLog {
+			recordTunnelExchange("connect", target, 0, startTime, time.Since(startTime), exchange.Describe(err, target), nil)
+		}
 		client.Close() //nolint:errcheck
 		return
 	}
+	var upBytes, downBytes int64
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(up, client); closeWrite(up); done <- struct{}{} }()     //nolint:errcheck
-	go func() { io.Copy(client, up); closeWrite(client); done <- struct{}{} }() //nolint:errcheck
+	go func() { n, _ := io.Copy(up, client); upBytes = n; closeWrite(up); done <- struct{}{} }()       //nolint:errcheck
+	go func() { n, _ := io.Copy(client, up); downBytes = n; closeWrite(client); done <- struct{}{} }() //nolint:errcheck
 	<-done
 	<-done
 	up.Close()     //nolint:errcheck
 	client.Close() //nolint:errcheck
+	if shouldLog {
+		recordTunnelExchange("tunnel", target, http.StatusOK, startTime, time.Since(startTime), nil,
+			&exchange.TunnelInfo{Target: target, BytesUp: upBytes, BytesDown: downBytes})
+	}
 }
 
 // closeWrite half-closes c when it supports it, so each direction of a

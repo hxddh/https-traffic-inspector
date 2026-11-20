@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/rules"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/session"
 )
 
 // useRules sets the active rules for a test.

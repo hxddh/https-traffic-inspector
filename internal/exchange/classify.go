@@ -27,11 +27,13 @@ const (
 	KindCanceled     = "canceled"
 	// KindInjected is a failure a --fault rule caused on purpose.
 	KindInjected = "injected"
-	KindOther    = "other"
+	// KindClientTLS is a CONNECT tunnel where the client rejected httpmon's TLS certificate.
+	KindClientTLS = "client_tls_untrusted"
+	KindOther     = "other"
 )
 
 // Kinds lists every error kind.
-var Kinds = []string{KindDNS, KindRefused, KindTimeout, KindTLSVerify, KindTLSHandshake, KindReset, KindProxy, KindCanceled, KindInjected, KindOther}
+var Kinds = []string{KindDNS, KindRefused, KindTimeout, KindTLSVerify, KindTLSHandshake, KindReset, KindProxy, KindCanceled, KindInjected, KindClientTLS, KindOther}
 
 // Classify returns the kind of an upstream failure.
 func Classify(err error) string {

@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
 )
 
 // capturedRequest and capturedResponse are the two halves of an exchange as
@@ -115,12 +115,48 @@ func (j *exchangeJoiner) pending() int {
 func completeExchange(id int, r capturedRequest, rs capturedResponse) {
 	untrack(id)
 	e := buildExchange(id, r, rs, false)
-	runStats.add(e)
+	hasAuth := len(r.facts.headers.Values("Authorization")) > 0
+	loc := ""
+	if rs.err == nil && rs.facts.headers != nil {
+		loc = rs.facts.headers.Get("Location")
+	}
+	runStats.observeAndAdd(e, hasAuth, loc)
 	currentSink().exchange(e)
 	if recordMode {
-		writeRecord(buildExchange(id, r, rs, true))
+		rec := buildExchange(id, r, rs, true)
+		rec.Cause = e.Cause
+		writeRecord(rec)
 	}
 	ruleLabels.Delete(id)
+}
+
+// recordTunnelExchange records a CONNECT tunnel event (a client TLS handshake
+// rejection, or a relayed non-HTTP tunnel) as a first-class exchange.
+func recordTunnelExchange(kind, targetURL string, status int, startTime time.Time, dur time.Duration, errInfo *exchange.Error, tun *exchange.TunnelInfo) {
+	id := nextReqID()
+	e := &exchange.Exchange{
+		V:          exchange.Version,
+		Session:    recordSession,
+		ID:         id,
+		Time:       exchange.FormatTime(startTime),
+		Kind:       kind,
+		Method:     "CONNECT",
+		URL:        targetURL,
+		Status:     status,
+		DurationMs: millis(dur),
+		Request:    exchange.Message{Headers: exchange.Headers{}},
+		Error:      errInfo,
+		Tunnel:     tun,
+	}
+	runStats.observeAndAdd(e, false, "")
+	if tuiMode {
+		tuiSend(tuiReqMsg{tuiEntryFrom(e)})
+	} else {
+		currentSink().exchange(e)
+	}
+	if recordMode {
+		writeRecord(e)
+	}
 }
 
 // discardReqID cleans up per-request state when a request was logged but will

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ---- httpmon ui ----
@@ -74,7 +73,7 @@ Options:
 	running := false
 	var m session.Meta
 	if st.Dir != "" && session.ReadJSON(st.Dir, session.MetaFile, &m) == nil {
-		running = m.Running()
+		running = m.RunningIn(st.Dir)
 	}
 	name := pos[0]
 	if st.Dir != "" {
@@ -156,15 +155,21 @@ func tuiEntryFrom(e *exchange.Exchange) *tuiEntry {
 		}
 	}
 	prepareForDisplay(e)
+	en.extraMeta = strings.TrimSpace(formatExchangeXRay(e))
 	en.rawURL = e.URL
 	// The list shows host and path: take them from the masked URL, so a
 	// token in the query is not shown. The real URL stays in curlURL.
-	if u, err := url.Parse(e.URL); err == nil {
+	if u, err := url.Parse(e.URL); err == nil && u.Host != "" {
 		en.host, en.path = u.Host, u.RequestURI()
+	} else {
+		en.host = e.URL
 	}
 	en.reqHeaders = flattenHeaders(e.Request.Headers.HTTP())
 	en.reqBody = renderedText(e.Request.Body)
 	switch {
+	case e.Kind == "tunnel" && e.Tunnel != nil:
+		en.status = 200
+		en.statusText = fmt.Sprintf("TUNNEL (%d B↑ %d B↓)", e.Tunnel.BytesUp, e.Tunnel.BytesDown)
 	case e.Error != nil:
 		en.failed = e.Error.Kind + ": " + e.Error.Message
 	case e.Response != nil:
@@ -249,14 +254,11 @@ func (m *tuiModel) replaySelected() {
 
 // replayOnce sends one request and describes the outcome.
 func replayOnce(id int, method, target string, headers http.Header, reqBody []byte) string {
-	req, err := http.NewRequest(method, target, bytes.NewReader(reqBody))
-	if err != nil {
-		return fmt.Sprintf("replay #%d: %v", id, err)
+	c := newUpstreamClient(insecureUpstream)
+	if body.IsGRPC(headers.Get("Content-Type")) && strings.HasPrefix(target, "http://") {
+		c = h2cClient
 	}
-	req.Header = headers
-	removeHopByHopHeaders(req.Header)
-	start := time.Now()
-	resp, err := newUpstreamClient(insecureUpstream).Do(req)
+	resp, dur, err := sendReplay(c, method, target, headers, reqBody)
 	if err != nil {
 		var ue *url.Error
 		if errors.As(err, &ue) {
@@ -266,5 +268,5 @@ func replayOnce(id int, method, target string, headers http.Header, reqBody []by
 	}
 	n, _ := io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	return fmt.Sprintf("replay #%d → %d (%s, %d B)", id, resp.StatusCode, time.Since(start).Round(time.Millisecond), n)
+	return fmt.Sprintf("replay #%d → %d (%s, %d B)", id, resp.StatusCode, dur.Round(time.Millisecond), n)
 }

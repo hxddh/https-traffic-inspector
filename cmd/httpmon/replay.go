@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // replayResult is the outcome of replaying a single recorded exchange.
@@ -145,10 +145,18 @@ func rebase(u, targetBase string) string {
 // replayExchange re-sends one recorded exchange byte for byte and compares
 // the response after removing its Content-Encoding.
 func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string) replayResult {
+	return replayExchangeOpt(client, e, targetBase, true)
+}
+
+func replayExchangeQuiet(client *http.Client, e *exchange.Exchange, targetBase string) replayResult {
+	return replayExchangeOpt(client, e, targetBase, false)
+}
+
+func replayExchangeOpt(client *http.Client, e *exchange.Exchange, targetBase string, emit bool) replayResult {
 	res := replayResult{ID: e.ID, Session: e.Session, Method: e.Method, RecordedStatus: e.Status}
 	replayURL := rebase(e.URL, targetBase)
 	res.URL = replayURL
-	if !jsonMode {
+	if emit && !jsonMode {
 		var b strings.Builder
 		fmt.Fprintf(&b, "\n%s\n", paint(colCyan, fmt.Sprintf("── REPLAY #%d (session %s) ──", e.ID, textsafe.Line(e.Session))))
 		fmt.Fprintf(&b, "Original:  %s %s  →  %d %s\n", textsafe.Line(e.Method), textsafe.Line(e.URL), e.Status, textsafe.Line(e.StatusText))
@@ -159,8 +167,11 @@ func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string
 	reqHeader := e.Request.Headers.HTTP()
 	rb := e.Request.Body
 	switch {
-	case e.Kind == "websocket":
+	case e.Kind == "websocket" || e.Kind == "tunnel" || e.Kind == "connect":
 		res.Skipped = websocketReplaySkip
+		if e.Kind != "websocket" {
+			res.Skipped = "CONNECT tunnel"
+		}
 	case e.Error != nil:
 		res.Skipped = failedReplaySkip
 	case rb != nil && rb.Size > 0 && rb.Raw == nil:
@@ -171,7 +182,9 @@ func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string
 		res.Skipped = redactedReplaySkip
 	}
 	if res.Skipped != "" {
-		emitReplayResult(res, "")
+		if emit {
+			emitReplayResult(res, "")
+		}
 		return res
 	}
 
@@ -180,7 +193,9 @@ func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string
 		b, err := rb.Raw.Bytes()
 		if err != nil {
 			res.Err = "request body: " + err.Error()
-			emitReplayResult(res, "")
+			if emit {
+				emitReplayResult(res, "")
+			}
 			return res
 		}
 		reqBody = b
@@ -196,7 +211,9 @@ func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string
 	res.DurationMs = dur.Milliseconds()
 	if err != nil {
 		res.Err = err.Error()
-		emitReplayResult(res, "")
+		if emit {
+			emitReplayResult(res, "")
+		}
 		return res
 	}
 	defer resp.Body.Close()
@@ -216,7 +233,9 @@ func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string
 		rr, err := e.Response.Body.Raw.Bytes()
 		if err != nil {
 			res.Err = "recorded response body: " + err.Error()
-			emitReplayResult(res, "")
+			if emit {
+				emitReplayResult(res, "")
+			}
 			return res
 		}
 		recorded, recTruncated = decodeContent(e.Response.Body.ContentEncoding, rr, e.Response.Body.Raw.Truncated)
@@ -228,7 +247,9 @@ func replayExchange(client *http.Client, e *exchange.Exchange, targetBase string
 		res.BodyMatch = bytes.Equal(bytes.TrimSpace(recorded), bytes.TrimSpace(actual))
 	}
 
-	emitReplayResult(res, decodeBody(resp.Header, raw, overflow).Text)
+	if emit {
+		emitReplayResult(res, decodeBody(resp.Header, raw, overflow).Text)
+	}
 	return res
 }
 
@@ -244,13 +265,16 @@ func hasSensitiveHeader(h http.Header) bool {
 // sendReplay sends one replayed request. Hop-by-hop headers and framing are
 // left to the transport, as they would be for any new request.
 func sendReplay(client *http.Client, method, u string, h http.Header, reqBody []byte) (*http.Response, time.Duration, error) {
-	var r io.Reader
+	var r io.Reader = http.NoBody
 	if len(reqBody) > 0 {
 		r = bytes.NewReader(reqBody)
 	}
 	req, err := http.NewRequest(method, u, r)
 	if err != nil {
 		return nil, 0, err
+	}
+	if len(reqBody) == 0 {
+		req.ContentLength = 0
 	}
 	for k, vs := range h {
 		for _, v := range vs {

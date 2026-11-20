@@ -13,19 +13,23 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
 )
 
 // Version is the schema version written in every record.
-const Version = 3
+const Version = 4
 
-// Exchange is one HTTP exchange, or one WebSocket connection.
+// SupportedVersion reports whether httpmon can read a record of version v.
+// Version 3 (written by httpmon 3.x and 4.x) is a strict subset of version 4.
+func SupportedVersion(v int) bool { return v == 3 || v == Version }
+
+// Exchange is one HTTP exchange, WebSocket connection, or tunnel event.
 type Exchange struct {
 	V       int    `json:"v"`
 	Session string `json:"session,omitempty"`
 	ID      int    `json:"id"`
 	Time    string `json:"time"`
-	Kind    string `json:"kind"` // "http" or "websocket"
+	Kind    string `json:"kind"` // "http", "websocket", "connect", or "tunnel"
 
 	Method string `json:"method"`
 	URL    string `json:"url"`
@@ -34,13 +38,22 @@ type Exchange struct {
 	StatusText string  `json:"status_text,omitempty"`
 	DurationMs float64 `json:"duration_ms"`
 
+	Timings *Timings  `json:"timings,omitempty"`
+	Conn    *ConnInfo `json:"conn,omitempty"`
+
 	Request  Message  `json:"request"`
 	Response *Message `json:"response,omitempty"`
 	// Error is set, and Response is nil, when no response came.
 	Error *Error `json:"error,omitempty"`
+	// AppError is set when an HTTP 2xx response carries a protocol-level
+	// failure (an SSE error event, GraphQL errors[], or JSON-RPC error).
+	AppError *Error `json:"app_error,omitempty"`
 
-	GRPC      *GRPCStatus `json:"grpc,omitempty"`
-	WebSocket *WebSocket  `json:"websocket,omitempty"`
+	GRPC      *GRPCStatus   `json:"grpc,omitempty"`
+	WebSocket *WebSocket    `json:"websocket,omitempty"`
+	Tunnel    *TunnelInfo   `json:"tunnel,omitempty"`
+	Meta      *SemanticMeta `json:"meta,omitempty"`
+	Cause     *CausalLink   `json:"cause,omitempty"`
 
 	// Redacted marks a record made with --redact: credentials in headers and
 	// the URL are masked, so requests that carried them cannot be replayed.
@@ -57,6 +70,36 @@ type Exchange struct {
 	// Ref locates the exchange in the session it was read from, for
 	// reading it back in full. It is not part of the record.
 	Ref int `json:"-"`
+}
+
+// Timings breaks down an exchange's duration into phases, in milliseconds.
+type Timings struct {
+	DNSMs  float64 `json:"dns_ms,omitempty"`
+	TCPMs  float64 `json:"tcp_ms,omitempty"`
+	TLSMs  float64 `json:"tls_ms,omitempty"`
+	SendMs float64 `json:"send_ms,omitempty"`
+	WaitMs float64 `json:"wait_ms"`
+	RecvMs float64 `json:"recv_ms,omitempty"`
+}
+
+// ConnInfo describes the upstream network connection and negotiated TLS state.
+type ConnInfo struct {
+	ID           int    `json:"id,omitempty"`
+	Reused       bool   `json:"reused"`
+	RemoteAddr   string `json:"remote_addr,omitempty"`
+	ALPN         string `json:"alpn,omitempty"`
+	TLSVersion   string `json:"tls_version,omitempty"`
+	CipherSuite  string `json:"cipher_suite,omitempty"`
+	CertSubject  string `json:"cert_subject,omitempty"`
+	CertIssuer   string `json:"cert_issuer,omitempty"`
+	CertDaysLeft *int   `json:"cert_days_left,omitempty"`
+}
+
+// TunnelInfo describes a non-HTTP CONNECT tunnel relayed without inspection.
+type TunnelInfo struct {
+	Target    string `json:"target"`
+	BytesUp   int64  `json:"bytes_up"`
+	BytesDown int64  `json:"bytes_down"`
 }
 
 // Message is one side of an exchange.
@@ -146,6 +189,8 @@ func (e *Exchange) SummaryLine() string {
 	fmt.Fprintf(&b, "#%d %s %s → ", e.ID, e.Method, ShortURL(e.URL))
 	dur := formatMs(e.DurationMs)
 	switch {
+	case e.Kind == "tunnel" && e.Tunnel != nil:
+		fmt.Fprintf(&b, "tunnel (%s↑ %s↓, %s)", formatSize(e.Tunnel.BytesUp), formatSize(e.Tunnel.BytesDown), dur)
 	case e.Error != nil:
 		fmt.Fprintf(&b, "ERR %s (%s)", e.Error.Kind, dur)
 		if e.Error.Kind == "other" {
@@ -154,19 +199,56 @@ func (e *Exchange) SummaryLine() string {
 	case e.WebSocket != nil:
 		n := len(e.WebSocket.Messages) + e.WebSocket.Dropped
 		fmt.Fprintf(&b, "%d websocket, %d messages (%s)", e.Status, n, dur)
+	case e.Response != nil && e.Response.Body != nil && e.Response.Body.Stream != nil:
+		st := e.Response.Body.Stream
+		noun := "events"
+		if st.Events == 1 {
+			noun = "event"
+		}
+		fmt.Fprintf(&b, "%d %s %d %s", e.Status, st.Format, st.Events, noun)
+		if e.AppError != nil {
+			fmt.Fprintf(&b, ", ERR %s", e.AppError.Message)
+		}
+		if st.TTFTMs > 0 {
+			fmt.Fprintf(&b, " (ttft %s, %s, %s)", formatMs(st.TTFTMs), dur, formatSize(e.Response.Body.Size))
+		} else {
+			fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(e.Response.Body.Size))
+		}
 	default:
 		fmt.Fprintf(&b, "%d", e.Status)
-		if e.GRPC != nil && e.GRPC.Code != 0 {
+		switch {
+		case e.GRPC != nil && e.GRPC.Code != 0:
 			fmt.Fprintf(&b, " grpc %s", e.GRPC.Name)
-		}
-		if e.Hint != "" {
+		case e.AppError != nil:
+			fmt.Fprintf(&b, " %s ERR %s", e.AppError.Kind, e.AppError.Message)
+		case e.Hint != "":
 			fmt.Fprintf(&b, " %s", e.Hint)
+		case (e.Status == 401 || e.Status == 403) && e.Meta != nil && e.Meta.Auth != nil && e.Meta.Auth.Expired:
+			b.WriteString(" jwt_expired")
+		case e.Status == 429 && e.Meta != nil && e.Meta.RateLimit != nil && e.Meta.RateLimit.RetryAfter != "":
+			fmt.Fprintf(&b, " retry-after %s", e.Meta.RateLimit.RetryAfter)
 		}
 		size := int64(0)
 		if e.Response != nil && e.Response.Body != nil {
 			size = e.Response.Body.Size
 		}
-		fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(size))
+		phase := slowBottleneck(e)
+		if phase != "" {
+			fmt.Fprintf(&b, " (%s: %s, %s)", dur, phase, formatSize(size))
+		} else {
+			fmt.Fprintf(&b, " (%s, %s)", dur, formatSize(size))
+		}
+	}
+	if e.Conn != nil && e.Conn.CertDaysLeft != nil && *e.Conn.CertDaysLeft <= 7 {
+		fmt.Fprintf(&b, " [cert %dd]", *e.Conn.CertDaysLeft)
+	}
+	if e.Cause != nil {
+		if e.Cause.AuthStripped {
+			fmt.Fprintf(&b, " [redirect #%d dropped Authorization]", e.Cause.RedirectFrom)
+		}
+		if e.Cause.Attempt >= 2 {
+			fmt.Fprintf(&b, " [retry #%d of #%d]", e.Cause.Attempt, e.Cause.RetryOf)
+		}
 	}
 	// One tag per rule: "[header] [mock]".
 	if e.Rule != "" {
@@ -176,6 +258,19 @@ func (e *Exchange) SummaryLine() string {
 		}
 	}
 	return b.String()
+}
+
+func slowBottleneck(e *Exchange) string {
+	if e.DurationMs < 500 || e.Timings == nil {
+		return ""
+	}
+	if e.Timings.DNSMs >= 0.5*e.DurationMs {
+		return "dns " + formatMs(e.Timings.DNSMs)
+	}
+	if e.Timings.TLSMs >= 0.5*e.DurationMs {
+		return "tls " + formatMs(e.Timings.TLSMs)
+	}
+	return ""
 }
 
 // maxSummaryQuery bounds the query string shown in a summary line. A
@@ -273,10 +368,13 @@ type Digest struct {
 	Total      int            `json:"exchanges"`
 	ByClass    map[string]int `json:"by_status"`
 	Failed     int            `json:"failed"`
+	AppErrors  int            `json:"app_errors,omitempty"`
+	Tunnels    int            `json:"tunnels,omitempty"`
 	Incomplete int            `json:"incomplete,omitempty"`
 	SlowestID  int            `json:"slowest_id,omitempty"`
 	SlowestMs  float64        `json:"slowest_ms,omitempty"`
 	Matched    []int          `json:"fail_on_matched,omitempty"`
+	Insights   []string       `json:"insights,omitempty"`
 }
 
 // Add counts e.
@@ -285,10 +383,17 @@ func (d *Digest) Add(e *Exchange) {
 		d.ByClass = map[string]int{}
 	}
 	d.Total++
-	if e.Error != nil {
+	switch {
+	case e.Kind == "tunnel":
+		d.Tunnels++
+		return
+	case e.Error != nil:
 		d.Failed++
-	} else if e.Status > 0 {
+	case e.Status > 0:
 		d.ByClass[fmt.Sprintf("%dxx", e.Status/100)]++
+		if e.AppError != nil || (e.GRPC != nil && e.GRPC.Code != 0) {
+			d.AppErrors++
+		}
 	}
 	// A WebSocket's duration is how long it stayed open, and a failure's how
 	// long it took to fail: neither is a slow response.
@@ -297,7 +402,7 @@ func (d *Digest) Add(e *Exchange) {
 	}
 }
 
-// String renders the digest on one line:
+// String renders the digest on one line (plus any causal insight lines):
 //
 //	── 11 exchanges: 9×2xx, 1×5xx, 1 failed · slowest #5 45ms
 func (d *Digest) String() string {
@@ -310,8 +415,14 @@ func (d *Digest) String() string {
 	for _, c := range classes {
 		parts = append(parts, fmt.Sprintf("%d×%s", d.ByClass[c], c))
 	}
+	if d.AppErrors > 0 {
+		parts = append(parts, fmt.Sprintf("%d app_err", d.AppErrors))
+	}
 	if d.Failed > 0 {
 		parts = append(parts, fmt.Sprintf("%d failed", d.Failed))
+	}
+	if d.Tunnels > 0 {
+		parts = append(parts, fmt.Sprintf("%d tunnel", d.Tunnels))
 	}
 	if d.Incomplete > 0 {
 		parts = append(parts, fmt.Sprintf("%d incomplete", d.Incomplete))
@@ -333,6 +444,9 @@ func (d *Digest) String() string {
 			ids[i] = fmt.Sprintf("#%d", id)
 		}
 		s += " · --fail-on matched " + strings.Join(ids, ", ")
+	}
+	for _, ins := range d.Insights {
+		s += "\n! " + ins
 	}
 	return s
 }
@@ -365,8 +479,8 @@ func (r *Reader) Next() (*Exchange, error) {
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			return nil, fmt.Errorf("line %d: %w", r.line, err)
 		}
-		if e.V != Version {
-			return nil, fmt.Errorf("line %d: record version %d; this httpmon reads only version %d records", r.line, e.V, Version)
+		if !SupportedVersion(e.V) {
+			return nil, fmt.Errorf("line %d: record version %d; this httpmon reads version 3 and %d records", r.line, e.V, Version)
 		}
 		return &e, nil
 	}

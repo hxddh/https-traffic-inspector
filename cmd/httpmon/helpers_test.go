@@ -8,8 +8,8 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
 )
 
 // memRecorder keeps a test's session records in memory.

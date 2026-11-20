@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/rules"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ruleLabels maps an exchange ID to the rules that touched it, for its record.
@@ -65,7 +65,11 @@ func applyRules(w http.ResponseWriter, req *http.Request, host string, reqID int
 	if activeRules.Empty() && recordedMocks == nil {
 		return out
 	}
-	d := activeRules.Decide(req.Method, host, req.URL.Path, req.Header)
+	targetPath := req.URL.Path
+	if req.URL.RawQuery != "" {
+		targetPath += "?" + req.URL.RawQuery
+	}
+	d := activeRules.Decide(req.Method, host, targetPath, req.Header)
 	label := func(s string) {
 		if facts != nil {
 			setRuleLabel(reqID, s)

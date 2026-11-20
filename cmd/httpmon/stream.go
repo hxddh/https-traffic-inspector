@@ -6,9 +6,10 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
 )
 
 // bodySampler wraps a body so its content can be logged without holding up
@@ -27,16 +28,17 @@ type bodySampler struct {
 	rc     io.ReadCloser
 	limit  int
 	expect int64 // declared length, or -1 when unknown
-	onDone func(raw []byte, incomplete bool, total int64)
+	onDone func(raw []byte, incomplete bool, total int64, firstByte time.Time)
 
-	mu       sync.Mutex
-	buf      bytes.Buffer
-	total    int64
-	overflow bool
-	fired    bool
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	total     int64
+	firstByte time.Time
+	overflow  bool
+	fired     bool
 }
 
-func newBodySampler(rc io.ReadCloser, limit int, expect int64, onDone func(raw []byte, incomplete bool, total int64)) *bodySampler {
+func newBodySampler(rc io.ReadCloser, limit int, expect int64, onDone func(raw []byte, incomplete bool, total int64, firstByte time.Time)) *bodySampler {
 	return &bodySampler{rc: rc, limit: limit, expect: expect, onDone: onDone}
 }
 
@@ -44,6 +46,9 @@ func (s *bodySampler) Read(p []byte) (int, error) {
 	n, err := s.rc.Read(p)
 	if n > 0 {
 		s.mu.Lock()
+		if s.total == 0 {
+			s.firstByte = time.Now()
+		}
 		s.total += int64(n)
 		if room := s.limit - s.buf.Len(); room > 0 {
 			if n <= room {
@@ -84,11 +89,12 @@ func (s *bodySampler) fire(reachedEOF bool) {
 	whole := reachedEOF || (s.expect >= 0 && s.total == s.expect)
 	incomplete := s.overflow || !whole
 	total := s.total
+	first := s.firstByte
 	cb := s.onDone
 	s.mu.Unlock()
 
 	if cb != nil {
-		cb(raw, incomplete, total)
+		cb(raw, incomplete, total, first)
 	}
 }
 
@@ -117,9 +123,9 @@ func sampleBodyFor(bodyp *io.ReadCloser, h http.Header, length int64, limit int,
 		onDone(bodyView{})
 		return
 	}
-	*bodyp = newBodySampler(*bodyp, limit, length, func(raw []byte, incomplete bool, total int64) {
+	*bodyp = newBodySampler(*bodyp, limit, length, func(raw []byte, incomplete bool, total int64, firstByte time.Time) {
 		v := decodeBody(h, raw, incomplete)
-		v.Raw, v.RawTruncated, v.Size = raw, incomplete, total
+		v.Raw, v.RawTruncated, v.Size, v.FirstByteAt = raw, incomplete, total, firstByte
 		onDone(v)
 	})
 }
@@ -142,15 +148,22 @@ func captureLimitFor(h http.Header, status int, isRequest bool) int {
 	}
 	ct := h.Get("Content-Type")
 	encoded := len(body.SplitEncodings(h.Get("Content-Encoding"))) > 0
+	_, isMulti := body.MultipartBoundary(ct)
 	switch {
 	case summaryMode && !tuiMode:
+		if !isRequest && body.IsSSE(ct) {
+			return min(captureMaxBody, 64<<10)
+		}
+		if !isRequest && runStats != nil && runStats.failOn.MatchAppError() && (ct == "" || body.LooksLikeJSONType(ct) || body.IsNDJSON(ct)) {
+			return captureMaxBody
+		}
 		if !isRequest && status >= 400 && (ct == "" || body.LooksLikeJSONType(ct)) {
 			return captureMaxBody
 		}
 		return 0
 	case jsonMode && !tuiMode:
 		switch {
-		case ct == "" || body.LooksLikeJSONType(ct) || body.IsGRPC(ct):
+		case ct == "" || body.LooksLikeJSONType(ct) || body.IsGRPC(ct) || body.IsSSE(ct) || body.IsNDJSON(ct) || isMulti:
 			return captureMaxBody
 		case body.PrintableType(ct):
 			if encoded {
@@ -160,7 +173,7 @@ func captureLimitFor(h http.Header, status int, isRequest bool) int {
 		}
 		return 0
 	}
-	if encoded {
+	if encoded || body.IsSSE(ct) || isMulti {
 		return captureMaxBody
 	}
 	return displayMaxBody
@@ -174,7 +187,8 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 		return bodyView{}
 	}
 
-	if body.IsGRPC(h.Get("Content-Type")) {
+	ct := h.Get("Content-Type")
+	if body.IsGRPC(ct) {
 		return bodyView{Text: body.GRPCSummary(raw, incomplete), Truncated: incomplete}
 	}
 
@@ -182,16 +196,32 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 	compressed := len(body.SplitEncodings(enc)) > 0
 
 	if !compressed {
-		if looksLikeText(h.Get("Content-Type"), raw, incomplete) {
+		if body.IsSSE(ct) {
+			st := body.DecodeSSE(raw, displayMaxBody)
+			return bodyView{Text: body.FormatStreamText(st), Truncated: incomplete || st.Omitted > 0}
+		}
+		if boundary, ok := body.MultipartBoundary(ct); ok {
+			if parts, trunc := body.DecodeMultipart(raw, boundary, displayMaxBody); len(parts) > 0 {
+				return bodyView{Text: body.FormatPartsText(parts), Truncated: incomplete || trunc}
+			}
+		}
+		if looksLikeText(ct, raw, incomplete) {
 			return bodyView{Text: string(raw), Truncated: incomplete}
 		}
 		return bodyView{Text: binaryPlaceholder(raw)}
 	}
 
+	if body.IsSSE(ct) {
+		if res, err := body.Decompress(enc, raw); err == nil {
+			st := body.DecodeSSE(res.Data, displayMaxBody)
+			return bodyView{Text: body.FormatStreamText(st), Truncated: res.Truncated || incomplete || st.Omitted > 0}
+		}
+	}
+
 	// This view is only shown, never stored, so decoding stops just past what
 	// can be shown: the rest would be thrown away.
 	res, err := body.DecompressLimit(enc, raw, displayMaxBody+utf8.UTFMax)
-	if err == nil && isPrintableContentType(h.Get("Content-Type")) {
+	if err == nil && isPrintableContentType(ct) {
 		return bodyView{Text: string(res.Data), Truncated: res.Truncated || incomplete}
 	}
 	return bodyView{Text: encodedPlaceholder(enc, raw)}

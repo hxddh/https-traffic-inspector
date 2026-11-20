@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v4.0.0)"
+        description: "Release tag (e.g. v5.0.0)"
         required: true
-        default: "v4.0.0"
+        default: "v5.0.0"
 
 jobs:
   build:
@@ -103,6 +103,14 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
 
+      - name: Prefer the release tag when it already exists
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          tag="${{ inputs.tag_name }}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            git checkout --detach "refs/tags/$tag"
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -178,6 +186,16 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - name: Prefer the release tag when it already exists
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          tag="${{ inputs.tag_name }}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            git checkout --detach "refs/tags/$tag"
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: dist

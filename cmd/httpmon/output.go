@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ---- output channel ----
@@ -283,7 +283,15 @@ func (textSink) start(info runInfo) {
 }
 
 func (textSink) end(d *exchange.Digest) {
-	emitText("\n" + textsafe.Line(d.String()) + "\n")
+	emitText("\n" + sanitizeLines(d.String()) + "\n")
+}
+
+func sanitizeLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = textsafe.Line(l)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // printBanner writes the startup lines to stderr: they are diagnostics, not
@@ -362,7 +370,7 @@ func (summarySink) start(info runInfo) {
 }
 
 func (summarySink) end(d *exchange.Digest) {
-	emitText(textsafe.Line(d.String()) + "\n")
+	emitText(sanitizeLines(d.String()) + "\n")
 }
 
 // ---- JSON ----

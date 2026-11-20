@@ -508,15 +508,55 @@ func TestVersion_DefaultAndHARCreator(t *testing.T) {
 
 // ---- CONNECT tunnel framing ----
 
+type trackingListener struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (l *trackingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.mu.Lock()
+		l.conns = append(l.conns, c)
+		l.mu.Unlock()
+	}
+	return c, err
+}
+
+func (l *trackingListener) closeAccepted() {
+	l.mu.Lock()
+	conns := l.conns
+	l.conns = nil
+	l.mu.Unlock()
+	for _, c := range conns {
+		c.Close() //nolint:errcheck
+	}
+}
+
 // startTestProxy runs the real proxy handler on a loopback listener.
 func startTestProxy(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	ln := &trackingListener{Listener: rawLn}
+	var (
+		mu     sync.Mutex
+		closed bool
+		wg     sync.WaitGroup
+	)
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			if closed {
+				mu.Unlock()
+				return
+			}
+			wg.Add(1)
+			mu.Unlock()
+			defer wg.Done()
 			if r.Method == http.MethodConnect {
 				handleConnect(w, r)
 			} else {
@@ -525,8 +565,15 @@ func startTestProxy(t *testing.T) string {
 		}),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	go srv.Serve(ln)                  //nolint:errcheck
-	t.Cleanup(func() { srv.Close() }) //nolint:errcheck
+	go srv.Serve(ln) //nolint:errcheck
+	t.Cleanup(func() {
+		srv.Close() //nolint:errcheck
+		ln.closeAccepted()
+		mu.Lock()
+		closed = true
+		mu.Unlock()
+		wg.Wait()
+	})
 	return ln.Addr().String()
 }
 

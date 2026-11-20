@@ -68,6 +68,11 @@ func TestLoad_ProjectCannotRedirectTraffic(t *testing.T) {
 		`map = ["api.stripe.com => https://10.0.0.5:443"]`,
 		`header = ["*/* => request set Authorization: Bearer x"]`,
 		`header = ["*/* => request set Cookie: a=b"]`,
+		`header = ["*/* => request set X-Api-Key: secret"]`,
+		`header = ["*/* => request set X-Amz-Security-Token: tok"]`,
+		`mock_from = "other-session"`,
+		`mock = ["* => 200 @/etc/hosts"]`,
+		`mock = ["* => 200 @../outside.json"]`,
 		// userinfo: url.Parse routes to attacker.example, not localhost
 		`map = ["api.example.com => http://localhost:80@attacker.example"]`,
 		`map = ["api.example.com => localhost:80@attacker.example"]`,
@@ -76,6 +81,25 @@ func TestLoad_ProjectCannotRedirectTraffic(t *testing.T) {
 		if _, err := Load(); err == nil {
 			t.Errorf("project file accepted %s", bad)
 		}
+	}
+	proj := setup(t, "", `mock = ["*/ok => 200 @fixtures/ok.json"]`)
+	os.MkdirAll(filepath.Join(proj, "fixtures"), 0o700)                           //nolint:errcheck
+	os.WriteFile(filepath.Join(proj, "fixtures", "ok.json"), []byte("{}"), 0o600) //nolint:errcheck
+	if _, err := Load(); err != nil {
+		t.Errorf("project file rejected confined @FILE: %v", err)
+	}
+	// A symlink inside the project pointing outside must also be rejected.
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	os.WriteFile(outside, []byte("secret"), 0o600) //nolint:errcheck
+	if os.Symlink(outside, filepath.Join(proj, "fixtures", "escape.json")) == nil {
+		os.WriteFile(filepath.Join(proj, ProjectFile), []byte(`mock = ["*/x => 200 @fixtures/escape.json"]`), 0o600) //nolint:errcheck
+		if _, err := Load(); err == nil {
+			t.Error("project file accepted symlink escaping repository")
+		}
+	}
+	// LoadUser ignores project .httpmon.toml.
+	if c, err := LoadUser(); err != nil || len(c.Mock) != 0 {
+		t.Errorf("LoadUser = %+v, %v", c, err)
 	}
 	for _, ok := range []string{`header = ["*/* => response remove Cache-Control"]`, `header = ["*/* => request remove Authorization"]`, `map = ["api.example.com => localhost:3000"]`, `map = ["a => http://127.0.0.1:8080"]`, `map = ["a => [::1]:80"]`} {
 		setup(t, "", ok)

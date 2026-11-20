@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
 )
 
 // Recorded answers requests from a record: a request gets the response

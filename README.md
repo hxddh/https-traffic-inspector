@@ -45,9 +45,10 @@ Anywhere else — a pipe, a file, a CI log, an agent's shell — you get one lin
 httpmon writes to **stderr**; the command's own stdout is left exactly as the
 command wrote it, so `httpmon curl -s … | jq .` still pipes curl's output to jq.
 
-> **Upgrading from 3.x?** See [Migrating from 3.x](#migrating-from-3x). 4.0
-> replaces `--record` and `--har` with sessions and `query --format har`, moves
-> the module to `…/v4/cmd/httpmon`, and keeps the persistent CA in a new place.
+> **Upgrading from 4.x?** Module path is now `…/v5/cmd/httpmon`. Existing 4.x
+> sessions (`v: 3`) remain readable by `query`, `diff`, `replay` and `mcp`; new
+> captures write `v: 4` with phase timings, connection/TLS state, SSE/LLM
+> stream assembly, HTTP-200 soft errors, tunnel events and causal links.
 
 ---
 
@@ -56,15 +57,12 @@ command wrote it, so `httpmon curl -s … | jq .` still pipes curl's output to j
 httpmon starts a local MITM proxy, generates a CA on the fly, and injects the proxy address and CA certificate into the wrapped command's environment.  
 No system configuration is changed, and the temporary CA bundle is removed when the command exits.
 
-- **HTTP and HTTPS** — forwarded and logged; HTTPS is intercepted with a per-host certificate signed by the CA
-- **HTTP/2 and gRPC** — negotiated with each side independently; trailers are carried through; gRPC messages are decoded without a schema and the call's status is shown
-- **WebSocket** — every message is decoded and shown as it passes, `permessage-deflate` included
-- **Faithful forwarding** — the upstream sees the request the client sent: its own `Host`, its own `Accept-Encoding`, its own body framing
+- **HTTP, HTTPS, SSE/LLM streams, HTTP/2, gRPC and WebSocket** — HTTPS is intercepted with a per-host certificate; SSE (`text/event-stream`) and NDJSON streams keep head+tail+error frames and assemble LLM token output, tool calls and usage; gRPC and WebSocket messages (including `permessage-deflate`) are decoded
+- **Deep network & semantic X-ray** — automatic `httptrace` timings (`dns`, `tcp`, `tls`, `send`, `ttfb`, `recv`), socket reuse and upstream TLS/certificate state, multipart part dissection, and zero-leak metadata for JWT expiry, AWS SigV4, rate limits, cache and CORS mismatches
+- **No silent blind spots** — HTTP-200 protocol soft errors (SSE mid-stream errors, GraphQL `errors[]`, JSON-RPC errors), client-side CA rejections (`client_tls_untrusted`), and non-HTTP TCP tunnels are all recorded and surfaced
+- **Causal diagnosis** — links redirect chains (flagging cross-host `Authorization` header drops), retries, unpooled TLS connections and sequential N+1 bursts; `query --diagnose` and MCP `diagnose_session` summarise a session in one call
 - **Safe display** — escape sequences are shown, not executed; a body cannot imitate httpmon's own headings; credentials are masked
-- **Sessions you can query** — `--session NAME` keeps every exchange with its raw bytes; `httpmon query` lists, searches and expands them, exports curl commands and HAR; `httpmon diff` compares runs; `httpmon replay` re-sends them
-- **Mocks and faults** — `--mock`, `--fault` and `--map` answer, delay, break or redirect matching requests; `httpmon mock` serves a session as an offline mock server
-- **A standing proxy** — `httpmon proxy` captures browsers, phones, containers and running services; `httpmon env` points any shell at it
-- **MCP** — `httpmon mcp` lets an agent's MCP client read sessions and add rules
+- **Sessions, mocks, standing proxy & MCP** — `--session NAME` indexes every exchange; `query`, `diff`, `replay`, `--mock`/`--fault`/`--map`/`--header`, `httpmon proxy`, `httpmon ui` and `httpmon mcp` work over the same sessions
 
 ---
 
@@ -78,7 +76,7 @@ curl -fsSL https://github.com/hxddh/https-traffic-inspector/releases/latest/down
 
 Downloads the binary for your platform, checks it against the release's
 `SHA256SUMS`, and installs it as `~/.local/bin/httpmon` (`HTTPMON_INSTALL_DIR`
-changes the directory, `HTTPMON_VERSION=v4.0.0` pins a version).
+changes the directory, `HTTPMON_VERSION=v5.0.0` pins a version).
 
 ### Install script (Windows PowerShell)
 
@@ -91,7 +89,7 @@ Installs `httpmon.exe` to `%LOCALAPPDATA%\Programs\httpmon` and adds it to your 
 ### go install (requires Go 1.26+)
 
 ```bash
-go install github.com/hxddh/https-traffic-inspector/v4/cmd/httpmon@latest
+go install github.com/hxddh/https-traffic-inspector/v5/cmd/httpmon@latest
 ```
 
 ### Container
@@ -173,7 +171,7 @@ with one of those names, write `httpmon -- query …`.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--format` | _(auto)_ | `text`, `summary` or `json`. Default: `text` when output is a terminal, `summary` otherwise. `$HTTPMON_FORMAT` sets it for every run. |
-| `--fail-on` | _(none)_ | Exit `3` if any exchange matches: status classes (`5xx`), codes (`404`), `error` (no response) or `incomplete` (still unanswered at the end), comma-separated. `$HTTPMON_FAIL_ON`. |
+| `--fail-on` | _(none)_ | Exit `3` if any exchange matches: status classes (`5xx`), codes (`404`), `error` (no response), `app_error` (HTTP-200 SSE/GraphQL/JSON-RPC/gRPC error) or `incomplete`, comma-separated. `$HTTPMON_FAIL_ON`. |
 | `-o`, `--output` | _(stderr)_ | Write httpmon's output to a file; `-` for stdout. |
 | `--session` | _(none)_ | Keep every exchange, with its raw bytes, in this named session (see [Sessions](#sessions)). |
 | `--session-dir` | _(none)_ | Keep the session in this directory instead. |
@@ -220,10 +218,12 @@ just by people. The defaults are chosen for them: no flags are needed to get
 compact output in a non-interactive shell.
 
 ```bash
-httpmon --session run1 --fail-on 5xx,error npm test
-httpmon query run1 --status 5xx,error       # what failed
-httpmon query run1 --id 10                  # one exchange in full
-httpmon query run1 --id 10 --body response  # its decoded body
+httpmon --session run1 --fail-on 5xx,error,app_error npm test
+httpmon query run1 --diagnose                       # one-call causal & error report
+httpmon query run1 --status 5xx,error,app_error     # what failed (200 soft errors included)
+httpmon query run1 --id 10                          # full X-ray: timings, TLS, JWT/CORS, body
+httpmon query run1 --id 10 --body response          # its decoded body
+```
 
 # does the code handle the API being down?
 httpmon --mock 'POST api.example.com/v1/orders => 503' npm test
@@ -375,12 +375,13 @@ an exchanges file (`-` for stdin).
 
 ```bash
 httpmon query api-test                          # one line per exchange, and a digest
-httpmon query api-test --status 5xx,error       # filter: also --method, --url, --error, --rule
-httpmon query api-test --grep '(?i)order_id'    # search URLs, headers and decoded bodies
-httpmon query api-test --id 10                  # one exchange (--format text|json)
+httpmon query api-test --diagnose               # failures, 200 soft errors, bottlenecks, causal insights
+httpmon query api-test --status 5xx,error,app_error # filter: also --method, --url, --error, --rule
+httpmon query api-test --grep '(?i)order_id'    # search URLs, headers, streams, parts and bodies
+httpmon query api-test --id 10                  # full X-ray (--format text|json)
 httpmon query api-test --id 10 --body response  # its decoded body, untruncated
 httpmon query api-test --id 10 --format curl    # a curl command that sends it again
-httpmon query api-test --format har > api.har   # HAR 1.2 for browser dev tools, Charles, Postman
+httpmon query api-test --format har > api.har   # HAR 1.2 with DNS/TCP/TLS/TTFB/receive timings
 httpmon query proxy --follow                    # keep reading while the session grows
 httpmon query proxy --live                      # and list what is still in flight
 httpmon query proxy --wait --status 5xx         # block until the next 5xx, print it
@@ -524,14 +525,12 @@ outcome; `--read-only` turns that off.
 {"mcpServers": {"httpmon": {"command": "httpmon", "args": ["mcp"]}}}
 ```
 
-Tools: `list_sessions`, `query_exchanges` (status, method, URL, grep filters),
-`get_exchange`, `get_body`, `wait_for_exchange` (blocks until a matching
-exchange happens, up to 60 s), `export_curl`, `in_flight`, `diff_sessions`. With
-`--allow-mutations`, also `add_rule` and `clear_rules`, which change the rules
-of a running session within a second, and `replay_exchange`, which sends a
-recorded request again. Results are masked unless
-`--show-secrets`, and content from the network is returned as data inside the
-tool result.
+Tools: `list_sessions`, `diagnose_session`, `query_exchanges` (status, method,
+URL, grep, rule filters), `get_exchange`, `get_body`, `wait_for_exchange`
+(blocks up to 60 s without stalling concurrent MCP requests, and honours
+`notifications/cancelled`), `export_curl`, `in_flight`, `diff_sessions`
+(`ignore` paths supported). With `--allow-mutations`, also `add_rule`,
+`clear_rules` and `replay_exchange`. Results are masked unless `--show-secrets`.
 
 ### Settings files
 
@@ -549,23 +548,26 @@ ignore = [".updated_at", ".request_id"]   # httpmon diff
 
 Command-line flags override a project's `.httpmon.toml` (found in the working
 directory or a parent), which overrides the user's `config.toml`, which
-overrides `HTTPMON_FORMAT` / `HTTPMON_FAIL_ON` / `HTTPMON_CA_DIR`. Rule lists
-add up. Unknown keys are an error. A project file comes with whatever is
-checked out, so it cannot set `upstream_proxy`, `insecure_upstream`, `ca_dir`
-or `show_secrets`, may only `map` to this machine, and its `header` rules may
-not set `Authorization`, `Cookie` or `Proxy-Authorization`.
+overrides `HTTPMON_FORMAT` / `HTTPMON_FAIL_ON` / `HTTPMON_CA_DIR`. `httpmon proxy`
+loads only the user's `config.toml`. Rule lists add up, and unknown keys are an
+error. A project file comes with whatever is checked out, so it cannot set
+`upstream_proxy`, `insecure_upstream`, `ca_dir`, `show_secrets` or `mock_from`,
+may only reference `@FILE` mocks inside the project directory, may only `map`
+to this machine, and its `header` rules may not set any credential header.
 
 ### Exchange records
 
 `--format json` and sessions hold the same object (`httpmon schema` prints
-its JSON Schema):
+its JSON Schema; v5 writes `"v": 4` and still reads `"v": 3` records):
 
 ```json
 {
-  "v": 3, "session": "20261114T143201Z-4f2a9c1e", "id": 10,
+  "v": 4, "session": "20261114T143201Z-4f2a9c1e", "id": 10,
   "time": "2026-11-14T14:32:01.123Z", "kind": "http",
   "method": "GET", "url": "https://api.example.com/v1/orders",
   "status": 500, "status_text": "Internal Server Error", "duration_ms": 44.2,
+  "trace": {"dns_ms": 2.1, "tcp_ms": 8.4, "tls_ms": 14.0, "send_ms": 0.2, "wait_ms": 18.9, "recv_ms": 0.6},
+  "conn": {"id": 1, "reused": false, "tls_version": "TLS 1.3", "alpn": "h2", "cert_days_left": 82},
   "request": {"proto": "HTTP/2.0", "headers": {"Accept": ["*/*"]}},
   "response": {
     "proto": "HTTP/2.0",
@@ -578,17 +580,28 @@ its JSON Schema):
 
 - `headers` map each name to its values; repeated headers such as `Set-Cookie` stay separate.
 - A body is decoded from its `Content-Encoding` and given as `json` (a JSON
-  value), `text`, `grpc` (messages decoded without a schema: keys are field
-  numbers) or `binary`. `size` is the bytes on the wire. When the rendering is
-  shortened `truncated` is `true`; JSON is shortened by structure —
-  `"…(+37 more items)"` — and stays valid.
+  value), `sse` (Server-Sent Events / NDJSON event stream with `llm` delta
+  assembly), `multipart` (form-data parts), `text`, `grpc` (messages decoded
+  without a schema: keys are field numbers) or `binary`. `size` is the bytes on
+  the wire. When the rendering is shortened `truncated` is `true`; JSON is
+  shortened by structure — `"…(+37 more items)"` — and stays valid.
 - In a session, each body also has `raw`: the wire bytes, UTF-8 or base64.
+- `trace` records 6-phase latency (`dns_ms`, `tcp_ms`, `tls_ms`, `send_ms`,
+  `wait_ms`, `recv_ms`); `ttft_ms` records time to first body chunk; `conn`
+  records connection reuse, TLS version/cipher/ALPN, and leaf certificate health.
+- `app_error` surfaces application-layer errors hidden inside HTTP 200 responses
+  (GraphQL `errors[]`, JSON-RPC `error`, mid-stream SSE/LLM error frames).
+- `meta` extracts zero-leak semantic metadata (`auth` scheme + safe JWT claims,
+  `rate_limit`, `cache`, `cors` mismatch diagnostics, `graphql_op`); `cause`
+  links redirects (`redirect_from`, `auth_stripped`) and retries (`retry_of`,
+  `attempt`).
 - A failed exchange has `"error": {"kind": …, "message": …}` and no `response`.
-  Kinds: `dns`, `refused`, `timeout`, `tls_verify`, `tls_handshake`, `reset`,
-  `proxy`, `canceled`, `injected`, `other`.
+  Kinds: `dns`, `refused`, `timeout`, `tls_verify`, `tls_handshake`,
+  `client_tls_untrusted`, `reset`, `proxy`, `canceled`, `injected`, `other`.
 - `"rule"` names the mock, fault, map or header rules that touched the exchange.
 - gRPC calls have `"grpc": {"code", "name", "message"}`; WebSocket connections
-  `"kind": "websocket"` and `"websocket": {"messages": […]}`.
+  `"kind": "websocket"` and `"websocket": {"messages": […]}`; opaque non-HTTP
+  `CONNECT` pipes `"kind": "tunnel"` and `"tunnel": {"bytes": …}`.
 
 ---
 
@@ -649,20 +662,26 @@ trusts the CA.
 
 ---
 
-## Migrating from 3.x
+## Migrating
 
-4.0 drops compatibility with 3.x options; the exchange format (v3) is unchanged,
-so 3.x record files can still be queried, diffed and replayed by path.
+5.0 bumps the Go module path to `…/v5/cmd/httpmon@latest` and the exchange
+record version to `v: 4` (`v: 3` session and NDJSON files are still read by
+`query`, `diff`, `replay` and `mock --from`). Project `.httpmon.toml` files can
+no longer set `mock_from`, reference `@FILE` mocks outside the project
+directory, or set any credential header.
 
-| | 3.x | 4.0 |
-|---|---|---|
-| Keep exchanges | `--record trace.ndjson` | `--session NAME` (or `--session-dir DIR`) |
-| HAR | `--har out.har` | `httpmon query NAME --format har > out.har` |
-| Read them | `httpmon query trace.ndjson` | `httpmon query NAME` (a path still works) |
-| `go install` path | `…/v3@latest` (binary `https-traffic-inspector`) | `…/v4/cmd/httpmon@latest` (binary `httpmon`) |
-| Release files | `httpmon-<version>-<os>-<arch>` | `httpmon-<os>-<arch>`, plus `SHA256SUMS`, SBOM, attestations |
-| Persistent CA | `httpmon ca --dir <dir>` (required) | `httpmon ca` uses httpmon's home; `--dir` still works |
-| New reserved first arguments | | `proxy`, `env`, `mock`, `sessions`, `mcp` |
+4.0 drops compatibility with 3.x options; 3.x record files (v3) can still be
+queried, diffed and replayed by path.
+
+| | 3.x | 4.x | 5.0 |
+|---|---|---|---|
+| Keep exchanges | `--record trace.ndjson` | `--session NAME` (or `--session-dir DIR`) | `--session NAME` (or `--session-dir DIR`) |
+| HAR | `--har out.har` | `httpmon query NAME --format har > out.har` | `httpmon query NAME --format har > out.har` (6-phase timings) |
+| Read them | `httpmon query trace.ndjson` | `httpmon query NAME` (a path still works) | `httpmon query NAME` (`--diagnose` for causal insights) |
+| `go install` path | `…/v3@latest` (binary `https-traffic-inspector`) | `…/v4/cmd/httpmon@latest` (binary `httpmon`) | `…/v5/cmd/httpmon@latest` (binary `httpmon`) |
+| Release files | `httpmon-<version>-<os>-<arch>` | `httpmon-<os>-<arch>`, plus `SHA256SUMS`, SBOM, attestations | `httpmon-<os>-<arch>`, plus `SHA256SUMS`, SBOM, attestations |
+| Persistent CA | `httpmon ca --dir <dir>` (required) | `httpmon ca` uses httpmon's home; `--dir` still works | `httpmon ca` uses httpmon's home; `--dir` still works |
+| New reserved first arguments | | `proxy`, `env`, `mock`, `sessions`, `mcp` | (unchanged) |
 
 ---
 
@@ -670,13 +689,13 @@ so 3.x record files can still be queried, diffed and replayed by path.
 
 - **Go programs skip the proxy for loopback targets.** Go's `ProxyFromEnvironment` never proxies `localhost` or `127.0.0.1`, so a Go client calling a local server is not captured.
 - **gRPC messages are decoded without a schema.** Field numbers, not names; a fixed64 may really be a double, and bytes that parse as a message may really be bytes.
-- **Only HTTP is inspected.** Other protocols in a `CONNECT` tunnel are relayed untouched. A server-first protocol waits up to one second before httpmon concludes the client is not going to speak.
+- **Only HTTP is inspected.** Other protocols in a `CONNECT` tunnel are relayed untouched (recorded as `kind: "tunnel"` with byte count and duration). A server-first protocol waits up to one second before httpmon concludes the client is not going to speak.
 - **WebSocket over HTTP/2 (RFC 8441) is not supported**; clients fall back to HTTP/1.1, which works.
 - **Cleartext HTTP/2 cannot be sent through `--upstream-proxy`.**
 - **A JVM that does not see `JAVA_TOOL_OPTIONS`** — for example a Gradle daemon already running before httpmon started — is not configured. Stop it first (`./gradlew --stop`).
 - **On Windows, a session being read is not rotated.** Windows cannot rename a file another process has open, so while `httpmon ui` or `query --follow` reads a session, it grows past `--max-session-size` and is rotated once the reader lets go.
-- **Rules match on host, path and request headers**, not on bodies, and do not apply to WebSocket connections.
-- **Bodies are capped.** Output shows about `--max-body` bytes; sessions and decoding keep `--max-capture` bytes, buffered per request. The summary and JSON outputs keep only what they use: the summary only an error response's JSON, JSON output nothing of a binary body.
+- **Rules match on host, path, query parameters and request headers**, not on bodies, and do not apply to WebSocket connections.
+- **Bodies are capped.** Output shows about `--max-body` bytes; sessions and decoding keep `--max-capture` bytes, buffered per request. The summary and JSON outputs keep only what they use: the summary only JSON, SSE or NDJSON responses needed for error extraction, JSON output nothing of a binary body.
 - **Masking covers headers and URLs, not bodies.**
 
 ---

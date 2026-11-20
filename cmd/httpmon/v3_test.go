@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
 )
 
 // Regression: body text started at the first column like httpmon's own
@@ -155,7 +155,7 @@ func TestJSONStream_EveryLineParses(t *testing.T) {
 		}
 		if ev, ok := m["event"].(string); ok {
 			events[ev]++
-		} else if m["v"] != float64(3) {
+		} else if m["v"] != float64(exchange.Version) {
 			t.Errorf("non-event line is not an exchange: %q", line)
 		}
 	}

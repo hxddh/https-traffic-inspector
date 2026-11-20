@@ -21,6 +21,9 @@ func FuzzRender(f *testing.F) {
 	f.Add([]byte{0, 0, 0, 0, 3, 8, 150, 1}, "application/grpc", "", false)
 	f.Add([]byte("plain\x1b[31m text"), "text/plain", "", false)
 	f.Add([]byte{0xff, 0xfe, 0}, "", "br, gzip", true)
+	f.Add([]byte("event: message_start\ndata: {\"model\":\"claude\"}\n\nevent: error\ndata: {\"error\":\"overloaded\"}\n\n"), "text/event-stream", "", false)
+	f.Add([]byte("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n{\"usage\":{\"total_tokens\":5}}\n"), "application/x-ndjson", "", false)
+	f.Add([]byte("--b\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nval\r\n--b--\r\n"), "multipart/form-data; boundary=b", "", false)
 	f.Fuzz(func(t *testing.T, raw []byte, ct, ce string, truncated bool) {
 		h := http.Header{}
 		h.Set("Content-Type", ct)

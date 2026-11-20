@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ---- httpmon query ----
@@ -94,6 +94,14 @@ func grepExchange(e *exchange.Exchange, re *regexp.Regexp) bool {
 			j, _ := json.Marshal(b.JSON)
 			return re.Match(j)
 		}
+		if b.Stream != nil && re.MatchString(b.Stream.Assembled+" "+b.Stream.Error) {
+			return true
+		}
+		for _, p := range b.Parts {
+			if re.MatchString(p.Name + " " + p.Filename + " " + p.Value) {
+				return true
+			}
+		}
 		return false
 	}
 	if headers(e.Request.Headers) || bodyMatch(e.Request.Headers, e.Request.Body) {
@@ -103,6 +111,9 @@ func grepExchange(e *exchange.Exchange, re *regexp.Regexp) bool {
 		return true
 	}
 	if e.Error != nil && re.MatchString(e.Error.Message) {
+		return true
+	}
+	if e.AppError != nil && re.MatchString(e.AppError.Kind+" "+e.AppError.Message) {
 		return true
 	}
 	if e.WebSocket != nil {
@@ -121,13 +132,14 @@ func cmdQuery(args []string) int {
 	out.register(fs)
 	var q queryFilter
 	fs.IntVar(&q.id, "id", 0, "only the exchange with this id")
-	status := fs.String("status", "", "only exchanges matching these statuses: classes (5xx), codes (404) or error, comma-separated")
+	status := fs.String("status", "", "only exchanges matching these statuses: classes (5xx), codes (404), error or app_error, comma-separated")
 	fs.StringVar(&q.method, "method", "", "only this method")
 	fs.StringVar(&q.url, "url", "", "only URLs containing this text (case-insensitive)")
 	fs.BoolVar(&q.errors, "error", false, "only exchanges that got no response")
-	fs.BoolVar(&q.rule, "rule", false, "only exchanges a --mock, --fault or --map rule touched")
+	fs.BoolVar(&q.rule, "rule", false, "only exchanges a --mock, --fault, --map or --header rule touched")
 	grep := fs.String("grep", "", "only exchanges whose URL, headers or decoded bodies match this regular expression ((?i) for any case)")
 	live := fs.Bool("live", false, "also list the session's exchanges still in flight")
+	diagnose := fs.Bool("diagnose", false, "summarise failures, HTTP-200 soft errors, latency bottlenecks and causal anomalies")
 	bodyFlag := fs.String("body", "", "print one exchange's decoded body in full: request or response (needs --id)")
 	format := fs.String("format", "summary", "output format: summary | json | text | curl | har (default text with --id)")
 	maxBody := fs.Int("max-body", 4000, "approximate max bytes of each body shown")
@@ -203,6 +215,10 @@ Options:
 		fmt.Fprintf(os.Stderr, "httpmon query: --wait reads a session, and cannot be used with --follow or --body\n")
 		return 1
 	}
+	if *diagnose && (*follow || *wait || *bodyFlag != "") {
+		fmt.Fprintf(os.Stderr, "httpmon query: --diagnose cannot be used with --follow, --wait or --body\n")
+		return 1
+	}
 	if *maxBody <= 0 {
 		fmt.Fprintf(os.Stderr, "httpmon query: --max-body must be greater than 0\n")
 		return 1
@@ -221,6 +237,7 @@ Options:
 	defer signal.Stop(stop)
 
 	var digest exchange.Digest
+	var diagList []*exchange.Exchange
 	var harOut *exchange.HARStream
 	if *format == "har" {
 		harOut = exchange.NewHARStream(w, version)
@@ -231,6 +248,11 @@ Options:
 			return true
 		}
 		matched++
+		if *diagnose {
+			prepareForDisplay(e)
+			diagList = append(diagList, e)
+			return true
+		}
 		if *bodyFlag != "" {
 			bad += writeBody(w, e, *bodyFlag)
 			return false
@@ -290,7 +312,7 @@ Options:
 				return 1 // interrupted
 			}
 		default:
-			err = eachMatching(st, &q, *format == "summary" && q.grep == nil && !showSecrets && *bodyFlag == "",
+			err = eachMatching(st, &q, *format == "summary" && !*diagnose && q.grep == nil && !showSecrets && *bodyFlag == "",
 				func(line string, light *exchange.Exchange) {
 					matched++
 					digest.Add(light)
@@ -305,6 +327,15 @@ Options:
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon query: %v\n", err)
 		return 1
+	}
+	if *diagnose {
+		diag := exchange.Diagnose(diagList)
+		if *format == "json" {
+			emitJSON(diag)
+		} else {
+			emitText(sanitizeLines(diag.String()))
+		}
+		return 0
 	}
 	if *bodyFlag != "" {
 		if matched == 0 {
@@ -327,7 +358,7 @@ Options:
 		writeLive(pos[0], *format == "json")
 	}
 	if *format == "summary" && !*follow && !*wait && matched != 1 {
-		emitText(textsafe.Line(digest.String()) + "\n")
+		emitText(sanitizeLines(digest.String()) + "\n")
 	}
 	if matched == 0 && q.id != 0 {
 		fmt.Fprintf(os.Stderr, "httpmon query: no exchange #%d\n", q.id)
@@ -374,8 +405,8 @@ func readRecords(r io.Reader, follow bool, stop <-chan os.Signal, fn func(*excha
 			fmt.Fprintf(os.Stderr, "httpmon query: line %d: not an exchange record: %v\n", lineNo, err)
 			continue
 		}
-		if e.V != exchange.Version {
-			return fmt.Errorf("line %d: record version %d; this httpmon reads only version %d records", lineNo, e.V, exchange.Version)
+		if !exchange.SupportedVersion(e.V) {
+			return fmt.Errorf("line %d: record version %d; this httpmon reads version 3 and %d records", lineNo, e.V, exchange.Version)
 		}
 		if !fn(&e) {
 			return nil
@@ -428,7 +459,7 @@ func writeLive(arg string, asJSON bool) {
 	var m session.Meta
 	_ = session.ReadJSON(dir, session.MetaFile, &m)
 	var l session.Live
-	if !m.Running() || session.ReadJSON(dir, session.LiveFile, &l) != nil {
+	if !m.RunningIn(dir) || session.ReadJSON(dir, session.LiveFile, &l) != nil {
 		if !asJSON {
 			emitText("── session not running; nothing in flight\n")
 		}
@@ -454,32 +485,66 @@ func writeLive(arg string, asJSON bool) {
 // prepareForDisplay masks credentials, re-renders bodies from their raw bytes
 // within the display budget, and drops the raw bytes, which are for replay.
 func prepareForDisplay(e *exchange.Exchange) {
-	e.URL = displayURL(e.URL)
-	e.Request.Headers = exchange.FromHTTP(displayHeaders(e.Request.Headers.HTTP()))
-	e.Request.Body, _ = rerender(e.Request.Headers, e.Request.Body)
+	prepareForDisplayWith(e, displayMaxBody, showSecrets)
+}
+
+func prepareForDisplayWith(e *exchange.Exchange, budget int, unmasked bool) {
+	rawReqH := e.Request.Headers.HTTP()
+	var rawRespH map[string][]string
 	if e.Response != nil {
-		e.Response.Headers = exchange.FromHTTP(displayHeaders(e.Response.Headers.HTTP()))
+		rawRespH = e.Response.Headers
+	}
+	e.Request.Body, _ = rerenderWith(e.Request.Headers, e.Request.Body, budget)
+	gqlOp := ""
+	if e.Request.Body != nil {
+		gqlOp = e.Request.Body.GraphQLOp
+	}
+	if e.Meta == nil && !e.Redacted {
+		t, _ := time.Parse(time.RFC3339Nano, e.Time)
+		e.Meta = exchange.ExtractMeta(e.Method, rawReqH, exchange.Headers(rawRespH).HTTP(), e.Status, t, gqlOp)
+	}
+	maskHdr := func(h exchange.Headers) exchange.Headers {
+		if unmasked {
+			return h
+		}
+		return exchange.FromHTTP(textsafe.MaskHeaders(h.HTTP()))
+	}
+	if !unmasked {
+		e.URL = textsafe.MaskURL(e.URL)
+	}
+	e.Request.Headers = maskHdr(e.Request.Headers)
+	if e.Response != nil {
+		var savedStream *body.StreamInfo
+		if e.Response.Body != nil {
+			savedStream = e.Response.Body.Stream
+		}
+		e.Response.Headers = maskHdr(e.Response.Headers)
 		if len(e.Response.Trailers) > 0 {
-			e.Response.Trailers = exchange.FromHTTP(displayHeaders(e.Response.Trailers.HTTP()))
+			e.Response.Trailers = maskHdr(e.Response.Trailers)
 		}
 		var hint string
-		e.Response.Body, hint = rerender(e.Response.Headers, e.Response.Body)
+		e.Response.Body, hint = rerenderWith(e.Response.Headers, e.Response.Body, budget)
+		if savedStream != nil && e.Response.Body != nil && e.Response.Body.Stream != nil && e.Response.Body.Stream.TTFTMs == 0 {
+			e.Response.Body.Stream.TTFTMs = savedStream.TTFTMs
+		}
 		if e.Status >= 400 {
 			e.Hint = hint
+		} else if e.Status >= 200 && e.Status < 300 && e.AppError == nil && e.Response.Body != nil && e.Response.Body.SoftErrorKind != "" {
+			e.AppError = &exchange.Error{Kind: e.Response.Body.SoftErrorKind, Message: e.Response.Body.SoftErrorHint}
 		}
 	}
 	if e.WebSocket != nil {
 		for i := range e.WebSocket.Messages {
 			m := &e.WebSocket.Messages[i]
-			if m.Text != nil && len(*m.Text) > displayMaxBody {
-				s := (*m.Text)[:displayMaxBody]
-				m.Text, m.Truncated = &s, true
+			if m.Text != nil && len(*m.Text) > budget {
+				s, cut := textsafe.ClipUTF8(*m.Text, budget)
+				m.Text, m.Truncated = &s, cut
 			}
 		}
 	}
 }
 
-func rerender(h exchange.Headers, b *body.Rendered) (*body.Rendered, string) {
+func rerenderWith(h exchange.Headers, b *body.Rendered, budget int) (*body.Rendered, string) {
 	if b == nil {
 		return nil, ""
 	}
@@ -495,7 +560,7 @@ func rerender(h exchange.Headers, b *body.Rendered) (*body.Rendered, string) {
 		b.Raw = nil
 		return b, ""
 	}
-	r, hint := body.Render(h.HTTP(), raw, b.Raw.Truncated, b.Size, displayMaxBody)
+	r, hint := body.Render(h.HTTP(), raw, b.Raw.Truncated, b.Size, budget)
 	return r, hint
 }
 
@@ -546,17 +611,31 @@ func writeBody(w io.Writer, e *exchange.Exchange, which string) int {
 // renderExchangeText renders one exchange in the text style, for reading.
 func renderExchangeText(e *exchange.Exchange) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n%s\n", paint(colCyan, fmt.Sprintf("=== #%d %s %s ===", e.ID, textsafe.Line(e.Method), textsafe.Line(e.URL))))
-	fmt.Fprintf(&b, "Time: %s  Duration: %.0fms\n", e.Time, e.DurationMs)
-	b.WriteString("\nRequest headers:\n")
-	writeHeaderBlock(&b, e.Request.Headers)
+	proto := ""
+	if e.Request.Proto != "" {
+		proto = " " + textsafe.Line(e.Request.Proto)
+	}
+	fmt.Fprintf(&b, "\n%s\n", paint(colCyan, fmt.Sprintf("=== #%d %s %s%s ===", e.ID, textsafe.Line(e.Method), textsafe.Line(e.URL), proto)))
+	fmt.Fprintf(&b, "Time: %s  Duration: %.1fms\n", e.Time, e.DurationMs)
+	if xray := formatExchangeXRay(e); xray != "" {
+		b.WriteString(xray)
+	}
+	if e.Kind != "tunnel" && e.Kind != "connect" || len(e.Request.Headers) > 0 {
+		b.WriteString("\nRequest headers:\n")
+		writeHeaderBlock(&b, e.Request.Headers)
+	}
 	writeRenderedBody(&b, "Request body", e.Request.Body)
 	switch {
+	case e.Kind == "tunnel" && e.Tunnel != nil:
+		fmt.Fprintf(&b, "\n%s\n", paint(colYellow, fmt.Sprintf("Tunnel relayed: %d B↑  %d B↓", e.Tunnel.BytesUp, e.Tunnel.BytesDown)))
 	case e.Error != nil:
 		fmt.Fprintf(&b, "\n%s\n", paint(colRed, fmt.Sprintf("FAILED: %s", e.Error.Kind)))
 		b.WriteString(textsafe.Terminal(e.Error.Message) + "\n")
 	case e.Response != nil:
 		fmt.Fprintf(&b, "\n%s\n", paint(colGreen, fmt.Sprintf("Response: %d %s %s", e.Status, textsafe.Line(e.StatusText), e.Response.Proto)))
+		if e.AppError != nil {
+			fmt.Fprintf(&b, "%s\n", paint(colRed, fmt.Sprintf("Protocol error (%s): %s", textsafe.Line(e.AppError.Kind), textsafe.Line(e.AppError.Message))))
+		}
 		writeHeaderBlock(&b, e.Response.Headers)
 		writeRenderedBody(&b, "Response body", e.Response.Body)
 		if len(e.Response.Trailers) > 0 {
@@ -582,12 +661,148 @@ func renderExchangeText(e *exchange.Exchange) string {
 	return b.String()
 }
 
+// formatExchangeXRay formats timing, connection/TLS, semantic and causal facts.
+func formatExchangeXRay(e *exchange.Exchange) string {
+	var b strings.Builder
+	if t := e.Timings; t != nil {
+		var parts []string
+		if t.DNSMs > 0 {
+			parts = append(parts, fmt.Sprintf("dns %.1fms", t.DNSMs))
+		}
+		if t.TCPMs > 0 {
+			parts = append(parts, fmt.Sprintf("tcp %.1fms", t.TCPMs))
+		}
+		if t.TLSMs > 0 {
+			parts = append(parts, fmt.Sprintf("tls %.1fms", t.TLSMs))
+		}
+		if t.SendMs > 0 {
+			parts = append(parts, fmt.Sprintf("send %.1fms", t.SendMs))
+		}
+		parts = append(parts, fmt.Sprintf("ttfb %.1fms", t.WaitMs))
+		if t.RecvMs > 0 {
+			parts = append(parts, fmt.Sprintf("recv %.1fms", t.RecvMs))
+		}
+		fmt.Fprintf(&b, "Timing: %s\n", strings.Join(parts, " · "))
+	}
+	if c := e.Conn; c != nil {
+		reuse := "new"
+		if c.Reused {
+			reuse = "reused"
+		}
+		head := reuse
+		if c.ID > 0 {
+			head = fmt.Sprintf("#%d (%s)", c.ID, reuse)
+		}
+		if c.RemoteAddr != "" {
+			head += " → " + textsafe.Line(c.RemoteAddr)
+		}
+		parts := []string{head}
+		if c.TLSVersion != "" {
+			tlsDesc := textsafe.Line(c.TLSVersion)
+			if c.ALPN != "" {
+				tlsDesc += " (" + textsafe.Line(c.ALPN) + ")"
+			}
+			parts = append(parts, tlsDesc)
+		}
+		if c.CertSubject != "" || c.CertIssuer != "" {
+			certDesc := "cert " + textsafe.Line(c.CertSubject)
+			if c.CertIssuer != "" {
+				certDesc += " by " + textsafe.Line(c.CertIssuer)
+			}
+			if c.CertDaysLeft != nil {
+				certDesc += fmt.Sprintf(" (%dd left)", *c.CertDaysLeft)
+			}
+			parts = append(parts, certDesc)
+		}
+		fmt.Fprintf(&b, "Connection: %s\n", strings.Join(parts, " · "))
+	}
+	if cs := e.Cause; cs != nil {
+		var parts []string
+		if cs.RedirectFrom > 0 {
+			s := fmt.Sprintf("followed redirect from #%d", cs.RedirectFrom)
+			if cs.AuthStripped {
+				s += " (Authorization header dropped)"
+			}
+			parts = append(parts, s)
+		}
+		if cs.Attempt >= 2 {
+			parts = append(parts, fmt.Sprintf("retry #%d of #%d", cs.Attempt, cs.RetryOf))
+		}
+		if len(parts) > 0 {
+			fmt.Fprintf(&b, "Cause: %s\n", strings.Join(parts, "; "))
+		}
+	}
+	if m := e.Meta; m != nil {
+		if m.GraphQLOp != "" {
+			fmt.Fprintf(&b, "GraphQL: %s\n", textsafe.Line(m.GraphQLOp))
+		}
+		if a := m.Auth; a != nil {
+			var parts []string
+			parts = append(parts, textsafe.Line(a.Scheme))
+			if a.Alg != "" {
+				parts = append(parts, "alg="+textsafe.Line(a.Alg))
+			}
+			if a.Subject != "" {
+				parts = append(parts, "sub="+textsafe.Line(a.Subject))
+			}
+			if a.Issuer != "" {
+				parts = append(parts, "iss="+textsafe.Line(a.Issuer))
+			}
+			if a.ExpiresAt != "" {
+				exp := "exp=" + a.ExpiresAt
+				if a.Expired {
+					exp += " [EXPIRED]"
+				}
+				parts = append(parts, exp)
+			}
+			if a.Region != "" {
+				parts = append(parts, "region="+textsafe.Line(a.Region))
+			}
+			if a.Service != "" {
+				parts = append(parts, "service="+textsafe.Line(a.Service))
+			}
+			fmt.Fprintf(&b, "Auth: %s\n", strings.Join(parts, " "))
+		}
+		if rl := m.RateLimit; rl != nil {
+			var parts []string
+			if rl.Remaining != "" || rl.Limit != "" {
+				parts = append(parts, fmt.Sprintf("remaining=%s/%s", textsafe.Line(rl.Remaining), textsafe.Line(rl.Limit)))
+			}
+			if rl.RetryAfter != "" {
+				parts = append(parts, "retry-after="+textsafe.Line(rl.RetryAfter))
+			}
+			if rl.Reset != "" {
+				parts = append(parts, "reset="+textsafe.Line(rl.Reset))
+			}
+			fmt.Fprintf(&b, "Rate-Limit: %s\n", strings.Join(parts, " "))
+		}
+		if m.Cache != "" {
+			fmt.Fprintf(&b, "Cache: %s\n", textsafe.Line(m.Cache))
+		}
+		if c := m.CORS; c != nil {
+			line := "origin=" + textsafe.Line(c.Origin)
+			if c.AllowOrigin != "" {
+				line += " allow=" + textsafe.Line(c.AllowOrigin)
+			}
+			if c.Problem != "" {
+				line += " [PROBLEM: " + textsafe.Line(c.Problem) + "]"
+			}
+			fmt.Fprintf(&b, "CORS: %s\n", line)
+		}
+	}
+	return b.String()
+}
+
 func writeRenderedBody(b *strings.Builder, title string, r *body.Rendered) {
 	if r == nil {
 		return
 	}
 	var s string
 	switch {
+	case r.Stream != nil:
+		s = body.FormatStreamText(r.Stream)
+	case len(r.Parts) > 0:
+		s = body.FormatPartsText(r.Parts)
 	case r.JSON != nil:
 		j, _ := json.MarshalIndent(r.JSON, "", "  ")
 		s = string(j)
@@ -599,7 +814,7 @@ func writeRenderedBody(b *strings.Builder, title string, r *body.Rendered) {
 	default:
 		s = fmt.Sprintf("[binary, %d bytes]", r.Size)
 	}
-	if r.Truncated {
+	if r.Truncated && r.Stream == nil {
 		s += truncationMarker
 	}
 	fmt.Fprintf(b, "\n%s:\n%s\n", title, quoteBody(s))
@@ -622,7 +837,8 @@ func openStoreOnly(arg string, want func(int) bool) (*store.Store, error) {
 	persist := false
 	if filepath.Base(path) == session.ExchangesFile {
 		var m session.Meta
-		persist = session.ReadJSON(filepath.Dir(path), session.MetaFile, &m) != nil || !m.Running()
+		dir := filepath.Dir(path)
+		persist = session.ReadJSON(dir, session.MetaFile, &m) != nil || !m.RunningIn(dir)
 	}
 	return store.OpenOnly(path, persist, want)
 }
@@ -741,7 +957,7 @@ func followFrom(dir, path string, offset int64, stop <-chan os.Signal, deadline 
 			continue
 		}
 		var e exchange.Exchange
-		if json.Unmarshal(line, &e) != nil || e.V != exchange.Version {
+		if json.Unmarshal(line, &e) != nil || !exchange.SupportedVersion(e.V) {
 			continue
 		}
 		if !fn(&e) {

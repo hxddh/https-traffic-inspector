@@ -13,10 +13,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ---- exchange records ----
@@ -65,14 +66,22 @@ func buildExchange(id int, r capturedRequest, rs capturedResponse, forRecord boo
 		Rule:     ruleLabel(id),
 	}
 	e.Request.Body, _ = renderBody(r.facts.headers, r.body, forRecord)
+	gqlOp := ""
+	if e.Request.Body != nil {
+		gqlOp = e.Request.Body.GraphQLOp
+	}
 	if rs.err != nil {
 		e.Error = rs.err
+		e.Meta = exchange.ExtractMeta(r.facts.method, r.facts.headers, nil, 0, r.facts.startTime, gqlOp)
 		return e
 	}
 
 	f := rs.facts
 	e.Status = f.status
 	e.StatusText = statusText(f.statusText)
+	if !f.upgraded {
+		e.Timings, e.Conn = f.trace.finish(r.facts.startTime, f.duration, f.totalDuration(), f.tlsState)
+	}
 	resp := &exchange.Message{
 		Proto:   f.proto,
 		Headers: exchange.FromHTTP(headers(f.headers)),
@@ -82,9 +91,18 @@ func buildExchange(id int, r capturedRequest, rs capturedResponse, forRecord boo
 	}
 	var hint string
 	resp.Body, hint = renderBody(f.headers, rs.body, forRecord)
+	if resp.Body != nil && resp.Body.Stream != nil && !rs.body.FirstByteAt.IsZero() && !r.facts.startTime.IsZero() {
+		ttft := millis(rs.body.FirstByteAt.Sub(r.facts.startTime))
+		if ttft >= 0 {
+			resp.Body.Stream.TTFTMs = ttft
+		}
+	}
 	if f.status >= 400 {
 		e.Hint = hint
+	} else if f.status >= 200 && f.status < 300 && resp.Body != nil && resp.Body.SoftErrorKind != "" {
+		e.AppError = &exchange.Error{Kind: resp.Body.SoftErrorKind, Message: resp.Body.SoftErrorHint}
 	}
+	e.Meta = exchange.ExtractMeta(r.facts.method, r.facts.headers, f.headers, f.status, r.facts.startTime, gqlOp)
 	e.Response = resp
 
 	if body.IsGRPC(f.headers.Get("Content-Type")) {
@@ -136,7 +154,12 @@ func wsRecord(m wsMessage, forRecord bool) exchange.WSMessage {
 	}
 	data := m.data
 	if !forRecord && len(data) > displayMaxBody {
-		data, rm.Truncated = data[:displayMaxBody], true
+		if utf8.Valid(data) {
+			clipped, cut := textsafe.ClipUTF8(string(data), displayMaxBody)
+			data, rm.Truncated = []byte(clipped), cut
+		} else {
+			data, rm.Truncated = data[:displayMaxBody], true
+		}
 	}
 	if utf8.Valid(data) {
 		s := string(data)
@@ -195,18 +218,27 @@ func writeRecord(e *exchange.Exchange) {
 
 // ---- run statistics ----
 
-// stats feeds the end-of-run digest and --fail-on.
+// stats feeds the end-of-run digest, causal insights and --fail-on.
 type stats struct {
 	mu     sync.Mutex
 	digest exchange.Digest
 	failOn *exchange.FailOn
+	causal *exchange.CausalTracker
 }
 
-var runStats = &stats{}
+var runStats = &stats{causal: exchange.NewCausalTracker()}
 
 func (s *stats) add(e *exchange.Exchange) {
+	s.observeAndAdd(e, false, "")
+}
+
+func (s *stats) observeAndAdd(e *exchange.Exchange, hasAuth bool, location string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.causal == nil {
+		s.causal = exchange.NewCausalTracker()
+	}
+	s.causal.Observe(e, hasAuth, location)
 	s.digest.Add(e)
 	if s.failOn.Match(e) {
 		s.digest.Matched = append(s.digest.Matched, e.ID)
@@ -225,6 +257,9 @@ func (s *stats) final(pending []exchange.Pending) *exchange.Digest {
 		for _, p := range pending {
 			d.Matched = append(d.Matched, p.ID)
 		}
+	}
+	if s.causal != nil {
+		d.Insights = s.causal.Insights()
 	}
 	if d.ByClass == nil {
 		d.ByClass = map[string]int{}

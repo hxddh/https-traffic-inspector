@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
 )
 
 // ---- diff ----
@@ -204,13 +204,15 @@ func side(e *Exchange) *Side {
 }
 
 // Outcome renders how an exchange ended: "200", "500 db_timeout",
-// "200 grpc NOT_FOUND", "ERR refused".
+// "200 grpc NOT_FOUND", "200 graphql ERR UNAUTHENTICATED", "ERR refused".
 func Outcome(e *Exchange) string {
 	switch {
 	case e.Error != nil:
 		return "ERR " + e.Error.Kind
 	case e.GRPC != nil && e.GRPC.Code != 0:
 		return fmt.Sprintf("%d grpc %s", e.Status, e.GRPC.Name)
+	case e.AppError != nil:
+		return fmt.Sprintf("%d %s ERR %s", e.Status, e.AppError.Kind, e.AppError.Message)
 	case e.Hint != "":
 		return fmt.Sprintf("%d %s", e.Status, e.Hint)
 	}

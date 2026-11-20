@@ -11,11 +11,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/rules"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ProjectFile is the name of a project's settings file.
@@ -46,14 +48,25 @@ type Config struct {
 
 // Load reads the user and project files that exist.
 func Load() (Config, error) {
-	var c Config
-	if h, err := session.Home(); err == nil {
-		if err := c.merge(filepath.Join(h, "config.toml"), false); err != nil {
-			return c, err
-		}
+	c, err := LoadUser()
+	if err != nil {
+		return c, err
 	}
 	if p := findProject(); p != "" {
 		if err := c.merge(p, true); err != nil {
+			return c, err
+		}
+	}
+	return c, nil
+}
+
+// LoadUser reads only the user's config.toml in httpmon's home, for standing
+// commands such as "httpmon proxy" that must not be altered by whatever
+// directory they happen to be started in.
+func LoadUser() (Config, error) {
+	var c Config
+	if h, err := session.Home(); err == nil {
+		if err := c.merge(filepath.Join(h, "config.toml"), false); err != nil {
 			return c, err
 		}
 	}
@@ -81,10 +94,11 @@ func findProject() string {
 }
 
 // A project file comes with whatever repository is checked out, so it may not
-// change where traffic goes or how it is verified: no upstream proxy, no
-// skipped verification, no other CA, no unmasked credentials, and map rules
-// only to this machine.
-func checkProject(f *Config) error {
+// change where traffic goes, how it is verified, or read files outside the
+// repository: no upstream proxy, no skipped verification, no other CA, no
+// unmasked credentials, no mock_from, @FILE mocks confined to the project, no
+// setting of credential headers, and map rules only to this machine.
+func checkProject(f *Config, projDir string) error {
 	switch {
 	case f.UpstreamProxy != "":
 		return errors.New("upstream_proxy may only be set in the user config")
@@ -94,17 +108,27 @@ func checkProject(f *Config) error {
 		return errors.New("ca_dir may only be set in the user config")
 	case f.ShowSecrets != nil:
 		return errors.New("show_secrets may only be set in the user config")
+	case f.MockFrom != "":
+		return errors.New("mock_from may only be set in the user config")
+	}
+	for i, m := range f.Mock {
+		r, err := rules.ParseInDir(rules.KindMock, m, projDir)
+		if err != nil {
+			return err
+		}
+		if r.BodyFile != "" {
+			lhs, rhs, _ := strings.Cut(m, "=>")
+			code, _, _ := strings.Cut(strings.TrimSpace(rhs), " ")
+			f.Mock[i] = strings.TrimSpace(lhs) + " => " + code + " @" + r.BodyFile
+		}
 	}
 	for _, h := range f.Header {
 		r, err := rules.Parse(rules.KindHeader, h)
 		if err != nil {
 			return err
 		}
-		switch r.Name {
-		case "Authorization", "Cookie", "Proxy-Authorization":
-			if r.Op == "set" {
-				return fmt.Errorf("header %q: a project file may not set %s", h, r.Name)
-			}
+		if r.Op == "set" && textsafe.IsSensitiveHeader(r.Name) {
+			return fmt.Errorf("header %q: a project file may not set %s", h, r.Name)
 		}
 	}
 	for _, m := range f.Map {
@@ -135,7 +159,7 @@ func (c *Config) merge(path string, project bool) error {
 		return fmt.Errorf("%s: unknown setting %q", path, und[0].String())
 	}
 	if project {
-		if err := checkProject(&f); err != nil {
+		if err := checkProject(&f, filepath.Dir(path)); err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
 	}
