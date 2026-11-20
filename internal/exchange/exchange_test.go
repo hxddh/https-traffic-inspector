@@ -13,8 +13,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
 )
 
 func TestSummaryLine(t *testing.T) {
@@ -126,14 +127,96 @@ func TestDescribe_UsesDisplayURL(t *testing.T) {
 }
 
 func TestReader_RejectsOtherVersions(t *testing.T) {
-	r := NewReader(strings.NewReader(`{"v":3,"id":1,"method":"GET","url":"u","time":"t","kind":"http","request":{"headers":{}}}` + "\n\n" + `{"v":2,"seq":1}` + "\n"))
+	r := NewReader(strings.NewReader(`{"v":3,"id":1,"method":"GET","url":"u","time":"t","kind":"http","request":{"headers":{}}}` + "\n" +
+		`{"v":4,"id":2,"method":"GET","url":"u","time":"t","kind":"http","request":{"headers":{}}}` + "\n\n" + `{"v":2,"seq":1}` + "\n"))
 	if e, err := r.Next(); err != nil || e.ID != 1 {
-		t.Fatalf("first = %+v, %v", e, err)
+		t.Fatalf("first (v3) = %+v, %v", e, err)
+	}
+	if e, err := r.Next(); err != nil || e.ID != 2 {
+		t.Fatalf("second (v4) = %+v, %v", e, err)
 	}
 	if _, err := r.Next(); err == nil || !strings.Contains(err.Error(), "version 2") {
-		t.Errorf("second err = %v, want a version error", err)
+		t.Errorf("third err = %v, want a version error", err)
 	}
 	if _, err := r.Next(); !errors.Is(err, io.EOF) {
-		t.Errorf("third err = %v, want EOF", err)
+		t.Errorf("fourth err = %v, want EOF", err)
+	}
+}
+
+func TestMetaAndCausalTracker(t *testing.T) {
+	// JWT header {"alg":"HS256"} = eyJhbGciOiJIUzI1NiJ9
+	// JWT payload {"sub":"usr_42","iss":"auth.local","exp":1700000000} = eyJzdWIiOiJ1c3JfNDIiLCJpc3MiOiJhdXRoLmxvY2FsIiwiZXhwIjoxNzAwMDAwMDAwfQ
+	jwt := "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c3JfNDIiLCJpc3MiOiJhdXRoLmxvY2FsIiwiZXhwIjoxNzAwMDAwMDAwfQ.supersecretsignature"
+	reqH := Headers{"Authorization": {jwt}, "Origin": {"https://app.example.com"}}.HTTP()
+	respH := Headers{"Access-Control-Allow-Origin": {"*"}, "Access-Control-Allow-Credentials": {"true"}, "Retry-After": {"15"}, "CF-Cache-Status": {"HIT"}}.HTTP()
+	now := mustTime("2026-11-20T00:00:00Z")
+	m := ExtractMeta("GET", reqH, respH, 401, now, "query GetViewer")
+	if m == nil || m.Auth == nil || !m.Auth.Expired || m.Auth.Subject != "usr_42" || m.Auth.Alg != "HS256" {
+		t.Fatalf("auth meta = %+v", m)
+	}
+	if m.CORS == nil || !strings.Contains(m.CORS.Problem, "wildcard") || m.Cache != "HIT" || m.RateLimit.RetryAfter != "15" {
+		t.Errorf("cors/cache/rl = %+v", m)
+	}
+
+	ct := NewCausalTracker()
+	e1 := &Exchange{ID: 1, Kind: "http", Method: "GET", URL: "https://a.example.com/start", Status: 302, Time: "2026-11-20T00:00:00.000Z"}
+	ct.Observe(e1, true, "https://b.example.com/dest")
+	e2 := &Exchange{ID: 2, Kind: "http", Method: "GET", URL: "https://b.example.com/dest", Status: 401, Time: "2026-11-20T00:00:00.010Z", Meta: m}
+	ct.Observe(e2, false, "")
+	if e2.Cause == nil || e2.Cause.RedirectFrom != 1 || !e2.Cause.AuthStripped {
+		t.Errorf("redirect cause = %+v", e2.Cause)
+	}
+	if !strings.Contains(e2.SummaryLine(), "jwt_expired") || !strings.Contains(e2.SummaryLine(), "[redirect #1 dropped Authorization]") {
+		t.Errorf("summary = %q", e2.SummaryLine())
+	}
+
+	// Retry + unpooled TLS + N+1 sequential burst
+	for i := 1; i <= 9; i++ {
+		u := fmt.Sprintf("https://api.example.com/v1/users/%d", i)
+		e := &Exchange{ID: 10 + i, Kind: "http", Method: "GET", URL: u, Status: 200, DurationMs: 20,
+			Time: "2026-11-20T00:00:01.000Z", Conn: &ConnInfo{ID: i, Reused: false}}
+		ct.Observe(e, false, "")
+	}
+	f1 := &Exchange{ID: 30, Kind: "http", Method: "POST", URL: "https://api.example.com/pay", Status: 503, DurationMs: 50, Time: "2026-11-20T00:00:02.000Z"}
+	f2 := &Exchange{ID: 31, Kind: "http", Method: "POST", URL: "https://api.example.com/pay", Status: 200, DurationMs: 40, Time: "2026-11-20T00:00:03.000Z"}
+	ct.Observe(f1, false, "")
+	ct.Observe(f2, false, "")
+	if f2.Cause == nil || f2.Cause.Attempt != 2 || f2.Cause.RetryOf != 30 {
+		t.Errorf("retry cause = %+v", f2.Cause)
+	}
+	ins := strings.Join(ct.Insights(), " | ")
+	for _, want := range []string{"dropped Authorization", "expired JWT", "CORS", "1 retry", "0 reused", "N+1 pattern"} {
+		if !strings.Contains(ins, want) {
+			t.Errorf("insights %q lacks %q", ins, want)
+		}
+	}
+}
+
+func mustTime(s string) time.Time {
+	tm, _ := parseTime(s)
+	return tm
+}
+
+func TestToHAR_ServerIPAddressIPv6(t *testing.T) {
+	for _, tc := range []struct {
+		remote string
+		want   string
+	}{
+		{"127.0.0.1:443", "127.0.0.1"},
+		{"[::1]:443", "::1"},
+		{"[2001:db8::1]:8443", "2001:db8::1"},
+		{"2001:db8::2", "2001:db8::2"},
+	} {
+		h := ToHAR(&Exchange{
+			Kind:       "http",
+			Method:     "GET",
+			URL:        "https://api.example.com/",
+			Status:     200,
+			DurationMs: 10,
+			Conn:       &ConnInfo{ID: 7, RemoteAddr: tc.remote},
+		})
+		if h.ServerIPAddress != tc.want {
+			t.Errorf("RemoteAddr %q -> ServerIPAddress = %q, want %q", tc.remote, h.ServerIPAddress, tc.want)
+		}
 	}
 }

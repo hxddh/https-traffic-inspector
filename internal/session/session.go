@@ -15,8 +15,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/store"
 )
 
 // File names inside a session directory.
@@ -154,7 +154,38 @@ type Meta struct {
 
 // Running reports whether the session's process is still running.
 func (m Meta) Running() bool {
-	return m.Ended.IsZero() && m.PID > 0 && processAlive(m.PID)
+	return m.RunningIn("")
+}
+
+// staleHeartbeat bounds how old live.json may get before a session whose PID
+// still exists (e.g. PID 1 in a restarted container, or a reused PID) is
+// treated as dead. A running session rewrites live.json every 3 seconds.
+const staleHeartbeat = 30 * time.Second
+
+// RunningIn reports whether the session in dir is still running, checking its
+// live.json heartbeat when present so PID reuse (such as PID 1 in containers)
+// never locks a dead session forever.
+func (m Meta) RunningIn(dir string) bool {
+	if !m.Ended.IsZero() || m.PID <= 0 || !processAlive(m.PID) {
+		return false
+	}
+	if dir == "" {
+		return true
+	}
+	var l Live
+	if ReadJSON(dir, LiveFile, &l) == nil {
+		if l.PID == 0 || l.PID != m.PID {
+			return false
+		}
+		if !l.Updated.IsZero() && time.Since(l.Updated) > staleHeartbeat {
+			return false
+		}
+		return true
+	}
+	if !m.Started.IsZero() && time.Since(m.Started) > staleHeartbeat {
+		return false
+	}
+	return true
 }
 
 // WriteJSON writes v to dir/name atomically, so a reader never sees half a file.
@@ -241,7 +272,7 @@ func List() ([]Info, error) {
 		dir := filepath.Join(h, "sessions", e.Name())
 		info := Info{Name: e.Name(), Dir: dir}
 		_ = ReadJSON(dir, MetaFile, &info.Meta) // a session without meta is still listed
-		info.Running = info.Meta.Running()
+		info.Running = info.Meta.RunningIn(dir)
 		info.Truncated = info.Meta.Dropped > 0
 		if fi, err := os.Stat(filepath.Join(dir, ExchangesFile)); err == nil {
 			info.Modified = fi.ModTime()
@@ -264,7 +295,7 @@ func Remove(name string) error {
 		return err
 	}
 	var m Meta
-	if ReadJSON(dir, MetaFile, &m) == nil && m.Running() {
+	if ReadJSON(dir, MetaFile, &m) == nil && m.RunningIn(dir) {
 		return fmt.Errorf("session %q is running (process %d); stop it first", name, m.PID)
 	}
 	if _, err := os.Stat(dir); err != nil {

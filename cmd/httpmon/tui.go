@@ -16,9 +16,9 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // tuiEntry holds one HTTP transaction displayed in the TUI. Every string in
@@ -47,8 +47,9 @@ type tuiEntry struct {
 	reqBodyRaw    []byte
 	reqBodyWhole  bool
 
-	failed   string // the error, when the exchange got no response
-	grpcLine string
+	failed    string // the error, when the exchange got no response
+	grpcLine  string
+	extraMeta string // timing waterfall, connection/TLS, auth/CORS/causal lines
 
 	rule string // the rules that touched it: "mock: …; fault: …"
 
@@ -733,6 +734,9 @@ func renderEntryDetail(e *tuiEntry, color bool) string {
 	}
 	if e.rule != "" {
 		fmt.Fprintf(&b, "Rule: %s\n", textsafe.Line(e.rule))
+	}
+	if e.extraMeta != "" {
+		b.WriteString(textsafe.Terminal(e.extraMeta) + "\n")
 	}
 	writeMap("Request Headers", e.reqHeaders)
 	if e.reqBody != "" {

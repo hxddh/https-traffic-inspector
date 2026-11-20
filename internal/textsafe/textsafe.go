@@ -248,3 +248,19 @@ func MaskURL(raw string) string {
 
 // IsSensitiveParam reports whether a URL query parameter carries credentials.
 func IsSensitiveParam(name string) bool { return sensitiveQueryParams[strings.ToLower(name)] }
+
+// ClipUTF8 shortens s to at most maxBytes bytes, backing off to a UTF-8 rune
+// boundary so a multi-byte character is never split in half.
+func ClipUTF8(s string, maxBytes int) (string, bool) {
+	if maxBytes <= 0 {
+		return "", len(s) > 0
+	}
+	if len(s) <= maxBytes {
+		return s, false
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
+}

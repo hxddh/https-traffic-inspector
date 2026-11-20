@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -277,4 +279,118 @@ func clip(s string) string {
 		return string(r[:max]) + "…"
 	}
 	return s
+}
+
+// SoftErrorHint inspects a parsed JSON body for protocol-level errors commonly
+// returned inside an HTTP 200 OK response: GraphQL "errors" arrays and
+// JSON-RPC 2.0 "error" objects. It returns ("", "") for normal payloads.
+func SoftErrorHint(v any) (kind, hint string) {
+	obj, ok := v.(Object)
+	if !ok {
+		return "", ""
+	}
+	if _, isRPC := obj.Get("jsonrpc"); isRPC {
+		if e, hasErr := obj.Get("error"); hasErr && e != nil {
+			h := ErrorHint(obj)
+			if h == "" {
+				h = "jsonrpc_error"
+			}
+			return "jsonrpc", h
+		}
+	}
+	errsVal, hasErrs := obj.Get("errors")
+	errs, ok := errsVal.([]any)
+	if !hasErrs || !ok || len(errs) == 0 {
+		return "", ""
+	}
+	_, hasData := obj.Get("data")
+	e0, e0Obj := errs[0].(Object)
+	isGQL := hasData
+	if e0Obj && !isGQL {
+		_, hasMsg := e0.Get("message")
+		_, hasLoc := e0.Get("locations")
+		_, hasPath := e0.Get("path")
+		_, hasExt := e0.Get("extensions")
+		isGQL = hasMsg && (hasLoc || hasPath || hasExt)
+	}
+	if !isGQL {
+		return "", ""
+	}
+	if e0Obj {
+		if ext, ok := objObj(e0, "extensions"); ok {
+			if code := objStr(ext, "code"); code != "" {
+				return "graphql", clip(code)
+			}
+		}
+		if code := objStr(e0, "code"); code != "" {
+			return "graphql", clip(code)
+		}
+		if msg := objStr(e0, "message"); msg != "" {
+			return "graphql", clip(msg)
+		}
+	}
+	return "graphql", "graphql_error"
+}
+
+var gqlOpRE = regexp.MustCompile(`^(query|mutation|subscription)\b(?:\s+([A-Za-z_][A-Za-z0-9_]*))?`)
+
+// GraphQLOperation extracts the operation kind and name (e.g. "mutation CreateOrder")
+// from a GraphQL JSON request body, or "" when v is not one.
+func GraphQLOperation(v any) string {
+	obj, ok := v.(Object)
+	if !ok {
+		return ""
+	}
+	q := objStr(obj, "query")
+	if q == "" {
+		return ""
+	}
+	opName := objStr(obj, "operationName")
+	// Strip leading whitespace and # comment lines.
+	lines := strings.Split(q, "\n")
+	var trimmed strings.Builder
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		trimmed.WriteString(t)
+		trimmed.WriteByte(' ')
+		if trimmed.Len() > 128 {
+			break
+		}
+	}
+	head := strings.TrimSpace(trimmed.String())
+	if m := gqlOpRE.FindStringSubmatch(head); m != nil {
+		kind := m[1]
+		name := opName
+		if name == "" {
+			name = m[2]
+		}
+		if name != "" {
+			return kind + " " + name
+		}
+		return kind
+	}
+	if strings.HasPrefix(head, "{") {
+		if opName != "" {
+			return "query " + opName
+		}
+		return "query"
+	}
+	return ""
+}
+
+var tolerantErrRE = regexp.MustCompile(`"(?:code|error_code|type|error|message|detail|title)"\s*:\s*"([^"\\]{1,80})"`)
+
+// TolerantErrorHint extracts an error code or message from the captured prefix
+// of a truncated JSON body that cannot be parsed as a whole.
+func TolerantErrorHint(data []byte) string {
+	if len(data) > 8192 {
+		data = data[:8192]
+	}
+	if m := tolerantErrRE.FindSubmatch(data); m != nil {
+		return clip(string(m[1]))
+	}
+	return ""
 }

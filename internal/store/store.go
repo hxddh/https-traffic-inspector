@@ -25,11 +25,12 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // File names.
@@ -67,11 +68,17 @@ type Entry struct {
 // Light is the exchange as far as the index knows it: enough to filter,
 // count and summarise.
 func (e Entry) Light() *exchange.Exchange {
-	x := &exchange.Exchange{ID: e.ID, Method: e.Method, URL: e.URL, Status: e.Status, DurationMs: e.DurMs, Rule: e.Rule, Time: e.Time}
-	if e.ErrKind != "" {
+	x := &exchange.Exchange{ID: e.ID, Kind: "http", Method: e.Method, URL: e.URL, Status: e.Status, DurationMs: e.DurMs, Rule: e.Rule, Time: e.Time}
+	switch {
+	case e.ErrKind == "tunnel":
+		x.Kind = "tunnel"
+	case strings.HasPrefix(e.ErrKind, "~"):
+		x.AppError = &exchange.Error{Kind: e.ErrKind[1:]}
+	case e.ErrKind != "":
 		x.Error = &exchange.Error{Kind: e.ErrKind}
 	}
 	if e.WS {
+		x.Kind = "websocket"
 		x.WebSocket = &exchange.WebSocket{}
 	}
 	return x
@@ -111,8 +118,15 @@ func HintOf(m *exchange.Message) string {
 func entryOf(e *exchange.Exchange, off int64, n int) Entry {
 	en := Entry{ID: e.ID, Off: off, Len: n, Method: e.Method, URL: e.URL, Status: e.Status,
 		WS: e.WebSocket != nil, DurMs: e.DurationMs, Rule: e.Rule, Time: e.Time, Summary: SummaryOf(e)}
-	if e.Error != nil {
+	switch {
+	case e.Kind == "tunnel":
+		en.ErrKind = "tunnel"
+	case e.Error != nil:
 		en.ErrKind = e.Error.Kind
+	case e.AppError != nil:
+		en.ErrKind = "~" + e.AppError.Kind
+	case e.GRPC != nil && e.GRPC.Code != 0:
+		en.ErrKind = "~grpc"
 	}
 	return en
 }
@@ -298,7 +312,7 @@ func scan(f *os.File, from, to int64) ([]Entry, error) {
 		if len(line) > 0 && (complete || errors.Is(err, io.EOF)) {
 			if t := bytes.TrimSpace(line); len(t) > 0 {
 				var e exchange.Exchange
-				if json.Unmarshal(t, &e) == nil && e.V == exchange.Version {
+				if json.Unmarshal(t, &e) == nil && exchange.SupportedVersion(e.V) {
 					out = append(out, entryOf(&e, off, len(line)))
 				} else if !complete {
 					return out, nil

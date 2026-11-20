@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
 )
 
 func ex(id int, method, url string, status int, jsonBody string, ms float64) *Exchange {

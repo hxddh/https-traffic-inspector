@@ -12,29 +12,34 @@ reports every exchange. It needs no setup.
 ## Run
 
 ```bash
-httpmon --session run1 --fail-on 5xx,error <command> [args...]
+httpmon --session run1 --fail-on 5xx,error,app_error <command> [args...]
 ```
 
 - httpmon's report goes to **stderr**; the command's stdout is untouched.
-- In a non-interactive shell the report is one line per exchange plus a digest:
+- In a non-interactive shell the report is one line per exchange plus a digest
+  and causal insights (redirect auth-drops, retries, unpooled TLS, N+1 bursts):
   ```
   #10 GET api.example.com/v1/orders → 500 db_timeout (44ms, 105 B)
-  #11 GET api.example.com/v1/users → ERR refused (0ms)
-  ── 11 exchanges: 9×2xx, 1×5xx, 1 failed · slowest #5 45ms
+  #11 POST api.example.com/graphql → 200 graphql ERR UNAUTHENTICATED (18ms, 312 B)
+  #12 POST api.anthropic.com/v1/messages → 200 sse 48 events (ttft 92ms, 2.4s, 6 KB)
+  ── 12 exchanges: 10×2xx, 1×5xx, 1 app_err · slowest #12 2.4s
   ```
 - Exit code: the command's own non-zero code is passed through; otherwise **3**
-  means an exchange matched `--fail-on`. Use it to verify a fix.
-- `--session NAME` keeps every exchange (raw bytes included) for `query`.
+  means an exchange matched `--fail-on` (`app_error` catches HTTP-200 errors in
+  SSE streams, GraphQL, JSON-RPC and gRPC).
+- `--session NAME` keeps every exchange (raw bytes, phase timings, TLS state,
+  stream events and causal links included) for `query`.
 
 ## Drill down — read the session through `query`, not directly
 
 ```bash
-httpmon query run1 --status 5xx,error         # failures only
-httpmon query run1 --grep 'order_id.*42'      # search URLs, headers, bodies
-httpmon query run1 --id 10                    # one exchange, full text
+httpmon query run1 --diagnose                 # one-shot failure, soft-error & causal report
+httpmon query run1 --status 5xx,error,app_error
+httpmon query run1 --grep 'order_id.*42'      # search URLs, headers, streams, parts, bodies
+httpmon query run1 --id 10                    # full X-ray: timings, TLS/conn, JWT/CORS, body
 httpmon query run1 --id 10 --body response    # decoded body, untruncated
 httpmon query run1 --id 10 --format curl      # a curl command that re-sends it
-httpmon query run1 --format har > run1.har    # for browser dev tools
+httpmon query run1 --format har > run1.har    # HAR 1.2 with DNS/TCP/TLS/TTFB/receive timings
 httpmon query run1 --wait --url /orders       # block until the next matching exchange (exit 4 on timeout)
 ```
 

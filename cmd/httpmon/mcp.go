@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,22 +11,25 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/config"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/rules"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // ---- httpmon mcp ----
 //
 // A Model Context Protocol server over stdio: an agent's client starts
-// "httpmon mcp" and gets tools to list sessions, query their exchanges, read
-// one in full, see what is in flight and compare two runs. With
-// --allow-mutations it can also add rules to a running session and replay
-// recorded requests. Credentials are masked unless --show-secrets.
+// "httpmon mcp" and gets tools to list sessions, query or diagnose their
+// exchanges, read one in full, wait without blocking other calls, see what is
+// in flight and compare two runs. With --allow-mutations it can also add rules
+// to a running session and replay recorded requests. Credentials are masked
+// unless --show-secrets.
 
 const mcpProtocolVersion = "2025-06-18"
 
@@ -53,7 +57,9 @@ type mcpTool struct {
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
 	Annotations map[string]any `json:"annotations,omitempty"`
+	blocking    bool
 	call        func(args map[string]any) (string, error)
+	callCtx     func(ctx context.Context, args map[string]any) (string, error)
 }
 
 func cmdMCP(args []string) int {
@@ -65,10 +71,10 @@ func cmdMCP(args []string) int {
 
 Runs a Model Context Protocol server on stdin and stdout, for an agent's
 MCP client. Its tools read httpmon sessions -- list_sessions,
-query_exchanges, get_exchange, get_body, wait_for_exchange, export_curl,
-in_flight, diff_sessions -- and, with --allow-mutations, add_rule and
-clear_rules change the rules of a running session and replay_exchange
-sends a recorded request again.
+query_exchanges, diagnose_session, get_exchange, get_body,
+wait_for_exchange, export_curl, in_flight, diff_sessions -- and, with
+--allow-mutations, add_rule and clear_rules change the rules of a running
+session and replay_exchange sends a recorded request again.
 
 Example client configuration:
   {"mcpServers": {"httpmon": {"command": "httpmon", "args": ["mcp"]}}}
@@ -90,21 +96,49 @@ func serveMCP(in io.Reader, out io.Writer, tools []mcpTool) int {
 	for _, t := range tools {
 		byName[t.Name] = t
 	}
+	var outMu sync.Mutex
 	enc := json.NewEncoder(out)
 	enc.SetEscapeHTML(false)
+	var writeErr atomicBool
+	send := func(resp mcpResponse) {
+		outMu.Lock()
+		defer outMu.Unlock()
+		if err := enc.Encode(resp); err != nil {
+			writeErr.set()
+		}
+	}
+
+	var cancelMu sync.Mutex
+	cancels := map[string]context.CancelFunc{}
+	var wg sync.WaitGroup
+
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 64*1024), 16<<20)
-	for sc.Scan() {
+	for sc.Scan() && !writeErr.get() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
 		var req mcpRequest
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			enc.Encode(mcpResponse{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: &mcpError{-32700, "parse error"}}) //nolint:errcheck
+			send(mcpResponse{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: &mcpError{-32700, "parse error"}})
 			continue
 		}
 		if len(req.ID) == 0 {
+			if req.Method == "notifications/cancelled" {
+				var c struct {
+					RequestID json.RawMessage `json:"requestId"`
+				}
+				if json.Unmarshal(req.Params, &c) == nil && len(c.RequestID) > 0 {
+					key := strings.TrimSpace(string(c.RequestID))
+					cancelMu.Lock()
+					fn := cancels[key]
+					cancelMu.Unlock()
+					if fn != nil {
+						fn()
+					}
+				}
+			}
 			continue // a notification: nothing to answer
 		}
 		resp := mcpResponse{JSONRPC: "2.0", ID: req.ID}
@@ -115,7 +149,7 @@ func serveMCP(in io.Reader, out io.Writer, tools []mcpTool) int {
 				"capabilities":    map[string]any{"tools": map[string]any{}},
 				"serverInfo":      map[string]any{"name": "httpmon", "version": version},
 				"instructions": "httpmon captures HTTP(S) traffic into sessions. Start one with `httpmon --session NAME <command>` " +
-					"or `httpmon proxy`. Use query_exchanges for an overview (one line per exchange), then get_exchange or get_body for detail.",
+					"or `httpmon proxy`. Use diagnose_session or query_exchanges for an overview, then get_exchange or get_body for detail.",
 			}
 		case "ping":
 			resp.Result = map[string]any{}
@@ -135,6 +169,33 @@ func serveMCP(in io.Reader, out io.Writer, tools []mcpTool) int {
 				resp.Error = &mcpError{-32602, "unknown tool " + p.Name}
 				break
 			}
+			if t.blocking {
+				reqID := append(json.RawMessage(nil), req.ID...)
+				key := strings.TrimSpace(string(reqID))
+				ctx, cancel := context.WithCancel(context.Background())
+				cancelMu.Lock()
+				cancels[key] = cancel
+				cancelMu.Unlock()
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer func() {
+						cancel()
+						cancelMu.Lock()
+						delete(cancels, key)
+						cancelMu.Unlock()
+					}()
+					text, err := callToolCtx(ctx, t, p.Arguments)
+					r := mcpResponse{JSONRPC: "2.0", ID: reqID}
+					if err != nil {
+						r.Result = map[string]any{"content": []map[string]any{{"type": "text", "text": err.Error()}}, "isError": true}
+					} else {
+						r.Result = map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}
+					}
+					send(r)
+				}()
+				continue
+			}
 			text, err := callTool(t, p.Arguments)
 			if err != nil {
 				resp.Result = map[string]any{"content": []map[string]any{{"type": "text", "text": err.Error()}}, "isError": true}
@@ -144,21 +205,47 @@ func serveMCP(in io.Reader, out io.Writer, tools []mcpTool) int {
 		default:
 			resp.Error = &mcpError{-32601, "method not found: " + req.Method}
 		}
-		if err := enc.Encode(resp); err != nil {
-			return 1
-		}
+		send(resp)
+	}
+	wg.Wait()
+	if writeErr.get() {
+		return 1
 	}
 	return 0
+}
+
+type atomicBool struct {
+	mu sync.Mutex
+	v  bool
+}
+
+func (a *atomicBool) set() {
+	a.mu.Lock()
+	a.v = true
+	a.mu.Unlock()
+}
+
+func (a *atomicBool) get() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.v
 }
 
 // callTool runs a tool, turning a panic into a tool error: one bad call must
 // not end a server the client keeps running.
 func callTool(t mcpTool, args map[string]any) (text string, err error) {
+	return callToolCtx(context.Background(), t, args)
+}
+
+func callToolCtx(ctx context.Context, t mcpTool, args map[string]any) (text string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("httpmon: %s failed: %v", t.Name, r)
 		}
 	}()
+	if t.callCtx != nil {
+		return t.callCtx(ctx, args)
+	}
 	return t.call(args)
 }
 
@@ -176,6 +263,9 @@ func strProp(desc string) map[string]any {
 func intProp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
 }
+func boolProp(desc string) map[string]any {
+	return map[string]any{"type": "boolean", "description": desc}
+}
 
 func argString(a map[string]any, k string) string {
 	if v, ok := a[k].(string); ok {
@@ -189,6 +279,13 @@ func argInt(a map[string]any, k string, def int) int {
 		return int(v)
 	}
 	return def
+}
+
+func argBool(a map[string]any, k string) bool {
+	if v, ok := a[k].(bool); ok {
+		return v
+	}
+	return false
 }
 
 var sessionProp = strProp("session name (see list_sessions), session directory or exchanges file")
@@ -206,21 +303,34 @@ func mcpTools(allowMutations bool) []mcpTool {
 		{
 			Name: "query_exchanges",
 			Description: "List a session's exchanges, one line each (\"#3 GET host/path → 500 hint (12ms, 105 B)\"), " +
-				"with a digest. Filters combine.",
+				"with a digest and causal insights. Filters combine.",
 			InputSchema: schema(map[string]any{
 				"session": sessionProp,
-				"status":  strProp("statuses: classes (5xx), codes (404), error, comma-separated"),
+				"status":  strProp("statuses: classes (5xx), codes (404), error, app_error, comma-separated"),
 				"method":  strProp("HTTP method"),
 				"url":     strProp("text the URL contains (case-insensitive)"),
 				"grep":    strProp("regular expression searched in URL, headers and decoded bodies"),
+				"rule":    boolProp("only exchanges touched by a mock, fault, map or header rule"),
 				"limit":   intProp("most lines to return (default 200; the last ones)"),
 			}, "session"),
 			Annotations: ro,
 			call:        mcpQuery,
 		},
 		{
-			Name:        "get_exchange",
-			Description: "One exchange in full: request and response headers, decoded bodies (cut to max_body), error, gRPC status, WebSocket messages.",
+			Name: "diagnose_session",
+			Description: "One-call diagnosis of a session: hard failures (DNS, TLS, client CA rejections), HTTP-200 protocol soft errors " +
+				"(SSE mid-stream errors, GraphQL errors, JSON-RPC, gRPC), HTTP 4xx/5xx, causal anomalies (redirect dropping Authorization, " +
+				"expired JWT, CORS mismatch, retries, unpooled TLS connections, N+1 bursts), and the slowest exchanges with phase timings.",
+			InputSchema: schema(map[string]any{
+				"session": sessionProp,
+			}, "session"),
+			Annotations: ro,
+			call:        mcpDiagnose,
+		},
+		{
+			Name: "get_exchange",
+			Description: "One exchange in full: phase timings (DNS/TCP/TLS/TTFB/receive), connection reuse and TLS/cert details, " +
+				"auth/CORS/GraphQL metadata, headers, decoded bodies (SSE/NDJSON streams, multipart parts, JSON, gRPC), error, WebSocket messages.",
 			InputSchema: schema(map[string]any{
 				"session":  sessionProp,
 				"id":       intProp("exchange id"),
@@ -251,19 +361,20 @@ func mcpTools(allowMutations bool) []mcpTool {
 		{
 			Name: "wait_for_exchange",
 			Description: "Wait until an exchange matching the filters happens in a session, and return it in full. By default only exchanges " +
-				"after the call count; after_id also accepts earlier ones above that id. Use it after triggering an action (a click, a test) " +
-				"instead of polling query_exchanges.",
+				"after the call count; after_id also accepts earlier ones above that id. Non-blocking for other MCP calls; honours notifications/cancelled.",
 			InputSchema: schema(map[string]any{
 				"session":     sessionProp,
-				"status":      strProp("statuses: classes (5xx), codes (404), error, comma-separated"),
+				"status":      strProp("statuses: classes (5xx), codes (404), error, app_error, comma-separated"),
 				"method":      strProp("HTTP method"),
 				"url":         strProp("text the URL contains (case-insensitive)"),
 				"grep":        strProp("regular expression searched in URL, headers and decoded bodies"),
+				"rule":        boolProp("only exchanges touched by a rule"),
 				"after_id":    intProp("also accept exchanges already recorded with an id above this"),
 				"timeout_sec": intProp("how long to wait, at most 60 (default 30)"),
 			}, "session"),
 			Annotations: ro,
-			call:        mcpWait,
+			blocking:    true,
+			callCtx:     mcpWait,
 		},
 		{
 			Name:        "export_curl",
@@ -278,6 +389,7 @@ func mcpTools(allowMutations bool) []mcpTool {
 			InputSchema: schema(map[string]any{
 				"before": strProp("the earlier session"),
 				"after":  strProp("the later session"),
+				"ignore": strProp("JSON paths not to compare, comma-separated (e.g. .updated_at,.request_id); adds to config ignore"),
 			}, "before", "after"),
 			Annotations: ro,
 			call:        mcpDiff,
@@ -290,7 +402,7 @@ func mcpTools(allowMutations bool) []mcpTool {
 				Description: "Add a rule to a running session. mock: '[METHOD] PATTERN => STATUS [BODY]'; " +
 					"fault: '[METHOD] PATTERN => delay 2s | reset | reset after 1KB | timeout [N%]'; map: 'HOST[:PORT] => [SCHEME://]HOST[:PORT]'; " +
 					"header: '[METHOD] PATTERN => request|response set NAME: VALUE | remove NAME'. " +
-					"PATTERN is host/path with * wildcards; mock, fault and header rules may add conditions: [header NAME] or [header NAME: VALUE*].",
+					"PATTERN is host/path[?query] with * wildcards; mock, fault and header rules may add conditions: [header NAME] or [header NAME: VALUE*].",
 				InputSchema: schema(map[string]any{
 					"session": sessionProp,
 					"kind":    map[string]any{"type": "string", "enum": []string{"mock", "fault", "map", "header"}},
@@ -346,27 +458,35 @@ func mcpListSessions(map[string]any) (string, error) {
 	return b.String(), nil
 }
 
-func mcpQuery(a map[string]any) (string, error) {
-	st, err := openStore(argString(a, "session"))
-	if err != nil {
-		return "", err
-	}
-	defer st.Close()
+func parseMCPFilter(a map[string]any) (queryFilter, error) {
 	var q queryFilter
-	q.method, q.url = argString(a, "method"), argString(a, "url")
+	q.method, q.url, q.rule = argString(a, "method"), argString(a, "url"), argBool(a, "rule")
 	if s := argString(a, "status"); s != "" {
 		f, err := exchange.ParseFailOn(s)
 		if err != nil {
-			return "", err
+			return q, err
 		}
 		q.status = f
 	}
 	if g := argString(a, "grep"); g != "" {
 		re, err := regexp.Compile(g)
 		if err != nil {
-			return "", err
+			return q, err
 		}
 		q.grep = re
+	}
+	return q, nil
+}
+
+func mcpQuery(a map[string]any) (string, error) {
+	st, err := openStore(argString(a, "session"))
+	if err != nil {
+		return "", err
+	}
+	defer st.Close()
+	q, err := parseMCPFilter(a)
+	if err != nil {
+		return "", err
 	}
 	limit := argInt(a, "limit", 200)
 	var lines []string
@@ -377,7 +497,7 @@ func mcpQuery(a map[string]any) (string, error) {
 	}
 	err = eachMatching(st, &q, q.grep == nil && !showSecrets, add, func(e *exchange.Exchange) bool {
 		if q.match(e) {
-			prepareForDisplay(e)
+			prepareForDisplayWith(e, 4000, showSecrets)
 			add(e.SummaryLine(), e)
 		}
 		return true
@@ -397,8 +517,26 @@ func mcpQuery(a map[string]any) (string, error) {
 	for _, l := range lines {
 		b.WriteString(l + "\n")
 	}
-	b.WriteString(textsafe.Line(d.String()) + "\n")
+	b.WriteString(sanitizeLines(d.String()) + "\n")
 	return b.String(), nil
+}
+
+func mcpDiagnose(a map[string]any) (string, error) {
+	st, err := openStore(argString(a, "session"))
+	if err != nil {
+		return "", err
+	}
+	defer st.Close()
+	var list []*exchange.Exchange
+	if err := st.Each(func(e *exchange.Exchange) bool {
+		prepareForDisplayWith(e, 2000, showSecrets)
+		list = append(list, e)
+		return true
+	}); err != nil {
+		return "", err
+	}
+	diag := exchange.Diagnose(list)
+	return sanitizeLines(diag.String()), nil
 }
 
 // findExchange reads one exchange through the session's index.
@@ -427,8 +565,7 @@ func mcpGetExchange(a map[string]any) (string, error) {
 	if maxBody <= 0 {
 		return "", errors.New("max_body must be greater than 0")
 	}
-	displayMaxBody = maxBody
-	prepareForDisplay(e)
+	prepareForDisplayWith(e, maxBody, showSecrets)
 	s := renderExchangeText(e)
 	if e.Rule != "" {
 		s += "\nRule: " + textsafe.Line(e.Rule) + "\n"
@@ -445,17 +582,17 @@ func mcpGetBody(a map[string]any) (string, error) {
 	if which != "request" && which != "response" {
 		return "", errors.New("which must be request or response")
 	}
+	max := argInt(a, "max_bytes", 100000)
+	if max <= 0 {
+		return "", errors.New("max_bytes must be greater than 0")
+	}
 	var sb strings.Builder
 	if writeBody(&sb, e, which) != 0 {
 		return "", fmt.Errorf("exchange #%d has no %s body", e.ID, which)
 	}
 	s := textsafe.Terminal(sb.String())
-	max := argInt(a, "max_bytes", 100000)
-	if max <= 0 {
-		return "", errors.New("max_bytes must be greater than 0")
-	}
-	if len(s) > max {
-		s = s[:max] + truncationMarker
+	if clipped, cut := textsafe.ClipUTF8(s, max); cut {
+		s = clipped + truncationMarker
 	}
 	return s, nil
 }
@@ -468,7 +605,7 @@ func mcpInFlight(a map[string]any) (string, error) {
 	var m session.Meta
 	_ = session.ReadJSON(dir, session.MetaFile, &m)
 	var l session.Live
-	if !m.Running() || session.ReadJSON(dir, session.LiveFile, &l) != nil {
+	if !m.RunningIn(dir) || session.ReadJSON(dir, session.LiveFile, &l) != nil {
 		return "session not running; nothing in flight", nil
 	}
 	var b strings.Builder
@@ -481,12 +618,22 @@ func mcpInFlight(a map[string]any) (string, error) {
 }
 
 func mcpDiff(a map[string]any) (string, error) {
+	var ignore []string
+	if cfg, err := config.Load(); err == nil {
+		ignore = append(ignore, cfg.Ignore...)
+	}
+	for _, p := range strings.Split(argString(a, "ignore"), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			ignore = append(ignore, p)
+		}
+	}
 	before, after, load, closeAll, err := readForDiff(argString(a, "before"), argString(a, "after"))
 	if err != nil {
 		return "", err
 	}
 	defer closeAll()
 	opt := exchange.DefaultDiffOptions
+	opt.Ignore = ignore
 	opt.Load = load
 	changes, counts := exchange.Diff(before, after, opt)
 	var b strings.Builder
@@ -504,7 +651,7 @@ func runningSessionDir(name string) (string, error) {
 		return "", err
 	}
 	var m session.Meta
-	if err := session.ReadJSON(dir, session.MetaFile, &m); err != nil || !m.Running() {
+	if err := session.ReadJSON(dir, session.MetaFile, &m); err != nil || !m.RunningIn(dir) {
 		return "", fmt.Errorf("session %q is not running; rules apply to a running session", name)
 	}
 	return dir, nil
@@ -548,35 +695,34 @@ func mcpClearRules(a map[string]any) (string, error) {
 	return "cleared the rules added at run time; rules given on the command line stay", nil
 }
 
-func mcpWait(a map[string]any) (string, error) {
+func mcpWait(ctx context.Context, a map[string]any) (string, error) {
 	st, err := openStore(argString(a, "session"))
 	if err != nil {
 		return "", err
 	}
 	defer st.Close()
-	var q queryFilter
-	q.method, q.url = argString(a, "method"), argString(a, "url")
-	if s := argString(a, "status"); s != "" {
-		f, err := exchange.ParseFailOn(s)
-		if err != nil {
-			return "", err
-		}
-		q.status = f
-	}
-	if g := argString(a, "grep"); g != "" {
-		re, err := regexp.Compile(g)
-		if err != nil {
-			return "", err
-		}
-		q.grep = re
+	q, err := parseMCPFilter(a)
+	if err != nil {
+		return "", err
 	}
 	q.after = argInt(a, "after_id", -1)
 	if q.after < 0 {
 		q.after = st.MaxID()
 	}
 	timeout := time.Duration(min(max(argInt(a, "timeout_sec", 30), 1), 60)) * time.Second
+	stop := make(chan os.Signal)
+	doneWatch := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			close(stop)
+		case <-doneWatch:
+		}
+	}()
+	defer close(doneWatch)
+
 	var found *exchange.Exchange
-	timedOut, err := waitFor(st, &q, timeout, nil, func(e *exchange.Exchange) bool {
+	timedOut, err := waitFor(st, &q, timeout, stop, func(e *exchange.Exchange) bool {
 		if !q.match(e) {
 			return true
 		}
@@ -586,13 +732,16 @@ func mcpWait(a map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if ctx.Err() != nil {
+		return "", errors.New("wait cancelled")
+	}
 	if timedOut || found == nil {
 		return "", fmt.Errorf("no matching exchange within %s (latest id was %d)", timeout, q.after)
 	}
 	if found.Status >= 400 && found.Response != nil {
 		found.Hint = store.HintOf(found.Response)
 	}
-	prepareForDisplay(found)
+	prepareForDisplayWith(found, 4000, showSecrets)
 	return textsafe.Line(found.SummaryLine()) + "\n" + renderExchangeText(found), nil
 }
 
@@ -609,13 +758,7 @@ func mcpReplay(a map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// replayExchange also writes a report; it must not reach stdout, which
-	// carries the protocol.
-	saved := swapTextOut(io.Discard)
-	savedJSON := jsonMode
-	jsonMode = false
-	defer func() { swapTextOut(saved); jsonMode = savedJSON }()
-	res := replayExchange(newUpstreamClient(insecureUpstream), e, argString(a, "target"))
+	res := replayExchangeQuiet(newUpstreamClient(insecureUpstream), e, argString(a, "target"))
 	b, _ := json.MarshalIndent(res, "", "  ")
 	return textsafe.Terminal(string(b)), nil
 }

@@ -145,3 +145,27 @@ func TestSet_Probability(t *testing.T) {
 		t.Errorf("50%% fault fired %d of 2000 times", hits)
 	}
 }
+
+func TestSet_QueryMatching(t *testing.T) {
+	s, err := NewSet(
+		[]string{"GET api.example.com/v1/items?page=2 => 500", "GET */search?*debug=1* => 418", "POST api.example.com/v1/orders => 201"},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := s.Decide("GET", "api.example.com", "/v1/items?page=2"); d.Mock == nil || d.Mock.Status != 500 {
+		t.Errorf("?page=2 did not match: %+v", d.Mock)
+	}
+	if d := s.Decide("GET", "api.example.com", "/v1/items?page=1"); d.Mock != nil {
+		t.Errorf("?page=1 should not match ?page=2 rule: %+v", d.Mock)
+	}
+	if d := s.Decide("GET", "any.host", "/search?q=hi&debug=1&sort=asc"); d.Mock == nil || d.Mock.Status != 418 {
+		t.Errorf("wildcard query did not match: %+v", d.Mock)
+	}
+	// A rule without ? still matches requests that carry query parameters.
+	if d := s.Decide("POST", "api.example.com", "/v1/orders?dry_run=true"); d.Mock == nil || d.Mock.Status != 201 {
+		t.Errorf("path-only rule did not match request with query: %+v", d.Mock)
+	}
+}

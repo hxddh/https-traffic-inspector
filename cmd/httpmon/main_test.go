@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
 )
 
 // ---- generateCert ----
@@ -448,7 +448,7 @@ func TestJSONOutput_OneObjectPerExchange(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &e); err != nil {
 		t.Fatal(err)
 	}
-	if e.V != 3 || e.Method != "POST" || e.Status != 201 || !strings.Contains(e.URL, "foo=bar") {
+	if e.V != exchange.Version || e.Method != "POST" || e.Status != 201 || !strings.Contains(e.URL, "foo=bar") {
 		t.Errorf("exchange = %+v", e)
 	}
 	if m, _ := e.Response.Body.JSON.(map[string]any); m["id"] == nil {
@@ -577,8 +577,8 @@ func TestRecord_WriteAndRead(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(data), &ex); err != nil {
 		t.Fatalf("invalid NDJSON: %v\nraw: %s", err, data)
 	}
-	if ex.V != 3 || ex.Session == "" {
-		t.Errorf("v = %d, session = %q; want a v3 record with a session", ex.V, ex.Session)
+	if ex.V != exchange.Version || ex.Session == "" {
+		t.Errorf("v = %d, session = %q; want a v%d record with a session", ex.V, ex.Session, exchange.Version)
 	}
 	if ex.Status != http.StatusOK {
 		t.Errorf("recorded status = %d, want 200", ex.Status)

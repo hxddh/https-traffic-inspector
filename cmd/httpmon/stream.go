@@ -6,9 +6,10 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
 )
 
 // bodySampler wraps a body so its content can be logged without holding up
@@ -23,37 +24,52 @@ import (
 // once the buffer is full or the stream ends, so a body that trickles — an SSE
 // feed, a chunked upload, a slow download — was withheld in full until the far
 // end closed. Sampling alongside the copy keeps delivery immediate.
-type bodySampler struct {
-	rc     io.ReadCloser
-	limit  int
-	expect int64 // declared length, or -1 when unknown
-	onDone func(raw []byte, incomplete bool, total int64)
+const streamTailMax = 16 << 10
 
-	mu       sync.Mutex
-	buf      bytes.Buffer
-	total    int64
-	overflow bool
-	fired    bool
+type bodySampler struct {
+	rc       io.ReadCloser
+	limit    int
+	expect   int64 // declared length, or -1 when unknown
+	keepTail bool  // retain a rolling tail past limit for uncompressed event streams
+	onDone   func(raw, tail []byte, tailCut, incomplete bool, total int64, firstByte time.Time)
+
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	tail      []byte
+	tailCut   bool
+	total     int64
+	firstByte time.Time
+	overflow  bool
+	fired     bool
 }
 
-func newBodySampler(rc io.ReadCloser, limit int, expect int64, onDone func(raw []byte, incomplete bool, total int64)) *bodySampler {
-	return &bodySampler{rc: rc, limit: limit, expect: expect, onDone: onDone}
+func newBodySampler(rc io.ReadCloser, limit int, expect int64, keepTail bool, onDone func(raw, tail []byte, tailCut, incomplete bool, total int64, firstByte time.Time)) *bodySampler {
+	return &bodySampler{rc: rc, limit: limit, expect: expect, keepTail: keepTail, onDone: onDone}
 }
 
 func (s *bodySampler) Read(p []byte) (int, error) {
 	n, err := s.rc.Read(p)
 	if n > 0 {
 		s.mu.Lock()
+		if s.total == 0 {
+			s.firstByte = time.Now()
+		}
 		s.total += int64(n)
+		var over []byte
 		if room := s.limit - s.buf.Len(); room > 0 {
 			if n <= room {
 				s.buf.Write(p[:n])
 			} else {
 				s.buf.Write(p[:room])
+				over = p[room:n]
 				s.overflow = true
 			}
 		} else {
+			over = p[:n]
 			s.overflow = true
+		}
+		if len(over) > 0 && s.keepTail {
+			s.appendTail(over)
 		}
 		s.mu.Unlock()
 	}
@@ -61,6 +77,20 @@ func (s *bodySampler) Read(p []byte) (int, error) {
 		s.fire(err == io.EOF)
 	}
 	return n, err
+}
+
+func (s *bodySampler) appendTail(p []byte) {
+	if len(p) >= streamTailMax {
+		s.tail = append(s.tail[:0], p[len(p)-streamTailMax:]...)
+		s.tailCut = true
+		return
+	}
+	if drop := len(s.tail) + len(p) - streamTailMax; drop > 0 {
+		copy(s.tail, s.tail[drop:])
+		s.tail = s.tail[:len(s.tail)-drop]
+		s.tailCut = true
+	}
+	s.tail = append(s.tail, p...)
 }
 
 func (s *bodySampler) Close() error {
@@ -79,16 +109,23 @@ func (s *bodySampler) fire(reachedEOF bool) {
 	s.fired = true
 	raw := make([]byte, s.buf.Len())
 	copy(raw, s.buf.Bytes())
+	var tail []byte
+	if len(s.tail) > 0 {
+		tail = make([]byte, len(s.tail))
+		copy(tail, s.tail)
+	}
+	tailCut := s.tailCut
 	// A body that delivered its whole declared length is complete even if
 	// its consumer stopped before reading EOF.
 	whole := reachedEOF || (s.expect >= 0 && s.total == s.expect)
 	incomplete := s.overflow || !whole
 	total := s.total
+	first := s.firstByte
 	cb := s.onDone
 	s.mu.Unlock()
 
 	if cb != nil {
-		cb(raw, incomplete, total)
+		cb(raw, tail, tailCut, incomplete, total, first)
 	}
 }
 
@@ -117,11 +154,77 @@ func sampleBodyFor(bodyp *io.ReadCloser, h http.Header, length int64, limit int,
 		onDone(bodyView{})
 		return
 	}
-	*bodyp = newBodySampler(*bodyp, limit, length, func(raw []byte, incomplete bool, total int64) {
-		v := decodeBody(h, raw, incomplete)
-		v.Raw, v.RawTruncated, v.Size = raw, incomplete, total
+	ct := h.Get("Content-Type")
+	uncompressedStream := len(body.SplitEncodings(h.Get("Content-Encoding"))) == 0 &&
+		(body.IsSSE(ct) || body.IsNDJSON(ct)) && limit > 0
+	*bodyp = newBodySampler(*bodyp, limit, length, uncompressedStream, func(raw, tail []byte, tailCut, incomplete bool, total int64, firstByte time.Time) {
+		var stitched []byte
+		if len(tail) > 0 && uncompressedStream {
+			stitched = stitchStreamSample(ct, raw, tail, tailCut)
+		}
+		v := decodeBody(h, raw, stitched, incomplete)
+		v.Raw, v.StreamSample, v.RawTruncated, v.Size, v.FirstByteAt = raw, stitched, incomplete, total, firstByte
 		onDone(v)
 	})
+}
+
+func stitchStreamSample(ct string, raw, tail []byte, tailCut bool) []byte {
+	if !tailCut {
+		out := make([]byte, 0, len(raw)+len(tail))
+		out = append(out, raw...)
+		out = append(out, tail...)
+		return out
+	}
+	if body.IsSSE(ct) {
+		head := raw
+		if i := lastSSEBoundary(head); i > 0 {
+			head = head[:i]
+		}
+		rest := tail
+		if j := firstSSEBoundaryEnd(rest); j > 0 && j < len(rest) {
+			rest = rest[j:]
+		} else if nl := bytes.IndexByte(rest, '\n'); nl >= 0 && nl+1 < len(rest) {
+			rest = rest[nl+1:]
+		}
+		out := make([]byte, 0, len(head)+2+len(rest))
+		out = append(out, head...)
+		out = append(out, '\n', '\n')
+		out = append(out, rest...)
+		return out
+	}
+	head := raw
+	if i := bytes.LastIndexByte(head, '\n'); i > 0 {
+		head = head[:i]
+	}
+	rest := tail
+	if nl := bytes.IndexByte(rest, '\n'); nl >= 0 && nl+1 < len(rest) {
+		rest = rest[nl+1:]
+	}
+	out := make([]byte, 0, len(head)+1+len(rest))
+	out = append(out, head...)
+	out = append(out, '\n')
+	out = append(out, rest...)
+	return out
+}
+
+func lastSSEBoundary(b []byte) int {
+	if i := bytes.LastIndex(b, []byte("\n\n")); i >= 0 {
+		return i
+	}
+	return bytes.LastIndex(b, []byte("\r\n\r\n"))
+}
+
+func firstSSEBoundaryEnd(b []byte) int {
+	iNN := bytes.Index(b, []byte("\n\n"))
+	iRN := bytes.Index(b, []byte("\r\n\r\n"))
+	switch {
+	case iNN >= 0 && (iRN < 0 || iNN < iRN):
+		return iNN + 2
+	case iRN >= 0:
+		return iRN + 4
+	default:
+		return -1
+	}
 }
 
 // captureLimitFor reports how many bytes of a body to keep, which depends on
@@ -133,7 +236,8 @@ func sampleBodyFor(bodyp *io.ReadCloser, h http.Header, length int64, limit int,
 //   - sessions store the bytes: up to --max-capture.
 //   - Text and the TUI show a prefix: --max-body, or --max-capture for a
 //     compressed body, which must be decoded from its start.
-//   - The summary only reads an error response's JSON for its code.
+//   - The summary only reads an error response's JSON for its code, or event
+//     streams / --fail-on app_error responses for soft errors.
 //   - JSON parses JSON and gRPC bodies, shows a prefix of text, and gives
 //     only the size of anything else.
 func captureLimitFor(h http.Header, status int, isRequest bool) int {
@@ -142,15 +246,22 @@ func captureLimitFor(h http.Header, status int, isRequest bool) int {
 	}
 	ct := h.Get("Content-Type")
 	encoded := len(body.SplitEncodings(h.Get("Content-Encoding"))) > 0
+	_, isMulti := body.MultipartBoundary(ct)
 	switch {
 	case summaryMode && !tuiMode:
+		if !isRequest && (body.IsSSE(ct) || body.IsNDJSON(ct)) {
+			return captureMaxBody
+		}
+		if !isRequest && runStats != nil && runStats.failOn.MatchAppError() && (ct == "" || body.LooksLikeJSONType(ct)) {
+			return captureMaxBody
+		}
 		if !isRequest && status >= 400 && (ct == "" || body.LooksLikeJSONType(ct)) {
 			return captureMaxBody
 		}
 		return 0
 	case jsonMode && !tuiMode:
 		switch {
-		case ct == "" || body.LooksLikeJSONType(ct) || body.IsGRPC(ct):
+		case ct == "" || body.LooksLikeJSONType(ct) || body.IsGRPC(ct) || body.IsSSE(ct) || body.IsNDJSON(ct) || isMulti:
 			return captureMaxBody
 		case body.PrintableType(ct):
 			if encoded {
@@ -160,7 +271,7 @@ func captureLimitFor(h http.Header, status int, isRequest bool) int {
 		}
 		return 0
 	}
-	if encoded {
+	if encoded || body.IsSSE(ct) || body.IsNDJSON(ct) || isMulti {
 		return captureMaxBody
 	}
 	return displayMaxBody
@@ -169,12 +280,13 @@ func captureLimitFor(h http.Header, status int, isRequest bool) int {
 // decodeBody turns captured bytes into a printable view, decoding
 // Content-Encoding when possible. incomplete reports that raw is only a prefix
 // of the body.
-func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
+func decodeBody(h http.Header, raw, streamSample []byte, incomplete bool) bodyView {
 	if len(raw) == 0 {
 		return bodyView{}
 	}
 
-	if body.IsGRPC(h.Get("Content-Type")) {
+	ct := h.Get("Content-Type")
+	if body.IsGRPC(ct) {
 		return bodyView{Text: body.GRPCSummary(raw, incomplete), Truncated: incomplete}
 	}
 
@@ -182,16 +294,36 @@ func decodeBody(h http.Header, raw []byte, incomplete bool) bodyView {
 	compressed := len(body.SplitEncodings(enc)) > 0
 
 	if !compressed {
-		if looksLikeText(h.Get("Content-Type"), raw, incomplete) {
+		if body.IsSSE(ct) {
+			src := raw
+			if len(streamSample) > 0 {
+				src = streamSample
+			}
+			st := body.DecodeSSE(src, displayMaxBody)
+			return bodyView{Text: body.FormatStreamText(st), Truncated: incomplete || st.Omitted > 0}
+		}
+		if boundary, ok := body.MultipartBoundary(ct); ok {
+			if parts, trunc := body.DecodeMultipart(raw, boundary, displayMaxBody); len(parts) > 0 {
+				return bodyView{Text: body.FormatPartsText(parts), Truncated: incomplete || trunc}
+			}
+		}
+		if looksLikeText(ct, raw, incomplete) {
 			return bodyView{Text: string(raw), Truncated: incomplete}
 		}
 		return bodyView{Text: binaryPlaceholder(raw)}
 	}
 
+	if body.IsSSE(ct) {
+		if res, err := body.Decompress(enc, raw); err == nil {
+			st := body.DecodeSSE(res.Data, displayMaxBody)
+			return bodyView{Text: body.FormatStreamText(st), Truncated: res.Truncated || incomplete || st.Omitted > 0}
+		}
+	}
+
 	// This view is only shown, never stored, so decoding stops just past what
 	// can be shown: the rest would be thrown away.
 	res, err := body.DecompressLimit(enc, raw, displayMaxBody+utf8.UTFMax)
-	if err == nil && isPrintableContentType(h.Get("Content-Type")) {
+	if err == nil && isPrintableContentType(ct) {
 		return bodyView{Text: string(res.Data), Truncated: res.Truncated || incomplete}
 	}
 	return bodyView{Text: encodedPlaceholder(enc, raw)}

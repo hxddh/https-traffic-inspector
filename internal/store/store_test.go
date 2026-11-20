@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
 )
 
 func ex(id int, path string, status int, b string) *exchange.Exchange {

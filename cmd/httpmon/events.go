@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"net/http"
 	"sort"
 	"strings"
@@ -8,8 +9,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
 )
 
 // ---- exchange events ----
@@ -130,8 +131,10 @@ type responseFacts struct {
 
 	// duration is the time to the response head; total, once the body has
 	// ended, the time to its last byte.
-	start time.Time
-	total time.Duration
+	start    time.Time
+	total    time.Duration
+	trace    *upstreamTrace
+	tlsState *tls.ConnectionState
 }
 
 // totalDuration is the whole exchange's duration, as far as it is known.
@@ -152,8 +155,10 @@ type bodyView struct {
 	Truncated bool // Text is only a prefix of the body
 
 	Raw          []byte
-	RawTruncated bool  // Raw is only a prefix of the body
-	Size         int64 // bytes seen on the wire
+	StreamSample []byte    // head+tail sample when an uncompressed stream overflowed Raw
+	RawTruncated bool      // Raw is only a prefix of the body
+	Size         int64     // bytes seen on the wire
+	FirstByteAt  time.Time // when the first body chunk arrived
 }
 
 // logRequestFacts reports a request and returns its ID, with the facts a
@@ -231,6 +236,10 @@ func requestDuration(reqID int) time.Duration {
 
 // logResponse reports a response head and samples its body as it is relayed.
 func logResponse(resp *http.Response, reqID int) {
+	logResponseTraced(resp, reqID, nil)
+}
+
+func logResponseTraced(resp *http.Response, reqID int, tr *upstreamTrace) {
 	f := &responseFacts{
 		status:        resp.StatusCode,
 		statusText:    resp.Status,
@@ -239,6 +248,8 @@ func logResponse(resp *http.Response, reqID int) {
 		contentLength: resp.ContentLength,
 		duration:      requestDuration(reqID),
 		upgraded:      resp.StatusCode == http.StatusSwitchingProtocols,
+		trace:         tr,
+		tlsState:      resp.TLS,
 	}
 	f.start = time.Now().Add(-f.duration)
 	markResponding(reqID, f.status)

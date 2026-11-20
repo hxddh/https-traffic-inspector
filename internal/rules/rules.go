@@ -46,15 +46,17 @@ const (
 
 // Rule is one parsed rule.
 type Rule struct {
-	Kind   string
-	Source string // as written
-	method string // "" matches any
-	match  *regexp.Regexp
+	Kind     string
+	Source   string // as written
+	method   string // "" matches any
+	match    *regexp.Regexp
+	hasQuery bool // pattern includes ?query
 
 	// mock
 	Status      int
 	Body        []byte
 	ContentType string
+	BodyFile    string // resolved @FILE path, if any
 
 	// fault
 	Action string
@@ -88,6 +90,12 @@ func (r *Rule) Label() string { return r.Kind + ": " + r.Source }
 
 // Parse parses one rule of the given kind.
 func Parse(kind, text string) (*Rule, error) {
+	return ParseInDir(kind, text, "")
+}
+
+// ParseInDir parses one rule, confining any @FILE mock body to rootDir when
+// rootDir is non-empty (as required for untrusted project .httpmon.toml files).
+func ParseInDir(kind, text, rootDir string) (*Rule, error) {
 	text = strings.TrimSpace(text)
 	lhs, rhs, ok := strings.Cut(text, "=>")
 	if !ok {
@@ -108,7 +116,7 @@ func Parse(kind, text string) (*Rule, error) {
 		}
 		switch kind {
 		case KindMock:
-			err = r.parseMock(rhs)
+			err = r.parseMock(rhs, rootDir)
 		case KindFault:
 			err = r.parseFault(rhs)
 		default:
@@ -200,8 +208,13 @@ func (r *Rule) parseMatch(lhs string) error {
 	if i := strings.Index(pat, "://"); i >= 0 {
 		pat = pat[i+3:]
 	}
+	r.hasQuery = strings.Contains(pat, "?")
 	if !strings.Contains(pat, "/") {
-		pat += "/*"
+		if h, q, ok := strings.Cut(pat, "?"); ok {
+			pat = h + "/*?" + q
+		} else {
+			pat += "/*"
+		}
 	}
 	host, path, _ := strings.Cut(pat, "/")
 	re := "^" + glob(strings.ToLower(host)) + "/" + glob(path) + "$"
@@ -222,7 +235,7 @@ func glob(s string) string {
 	return strings.Join(parts, ".*")
 }
 
-func (r *Rule) parseMock(rhs string) error {
+func (r *Rule) parseMock(rhs, rootDir string) error {
 	code, rest, _ := strings.Cut(rhs, " ")
 	status, err := strconv.Atoi(code)
 	if err != nil || status < 100 || status > 599 {
@@ -232,12 +245,21 @@ func (r *Rule) parseMock(rhs string) error {
 	rest = strings.TrimSpace(rest)
 	switch {
 	case strings.HasPrefix(rest, "@"):
-		b, err := os.ReadFile(rest[1:])
+		filePath := rest[1:]
+		if rootDir != "" {
+			resolved, err := confinePath(rootDir, filePath)
+			if err != nil {
+				return err
+			}
+			filePath = resolved
+		}
+		b, err := os.ReadFile(filePath)
 		if err != nil {
 			return err
 		}
 		r.Body = b
-		r.ContentType = mime.TypeByExtension(filepath.Ext(rest[1:]))
+		r.BodyFile = filePath
+		r.ContentType = mime.TypeByExtension(filepath.Ext(filePath))
 	case rest != "":
 		r.Body = []byte(rest)
 	}
@@ -248,6 +270,31 @@ func (r *Rule) parseMock(rhs string) error {
 		}
 	}
 	return nil
+}
+
+// confinePath resolves p against rootDir and rejects any path (or symlink)
+// outside rootDir.
+func confinePath(rootDir, p string) (string, error) {
+	if p == "" {
+		return "", errors.New("empty @FILE path")
+	}
+	if filepath.IsAbs(p) {
+		return "", fmt.Errorf("@%s: a project file may only reference relative paths inside the project", p)
+	}
+	rootReal, err := filepath.EvalSymlinks(rootDir)
+	if err != nil {
+		return "", err
+	}
+	joined := filepath.Join(rootReal, p)
+	targetReal, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootReal, targetReal)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("@%s: a project file may not read files outside %s", p, rootDir)
+	}
+	return targetReal, nil
 }
 
 func (r *Rule) parseFault(rhs string) error {
@@ -322,10 +369,13 @@ func (r *Rule) parseMap(lhs, rhs string) error {
 }
 
 // matches reports whether the rule's method, pattern and conditions match a
-// request. host has no default port; target is host + path.
+// request. host has no default port; target is host + path (optionally + ?query).
 func (r *Rule) matches(method, target string, h http.Header) bool {
 	if r.method != "" && r.method != method {
 		return false
+	}
+	if !r.hasQuery {
+		target, _, _ = strings.Cut(target, "?")
 	}
 	if !r.match.MatchString(target) {
 		return false

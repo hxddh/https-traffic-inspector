@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/body"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/body"
 )
 
 // HAR (HTTP Archive 1.2) conversion, for "httpmon query --format har": a
@@ -71,9 +72,11 @@ type HARResponse struct {
 	Trailers []HARNameValue `json:"_trailers,omitempty"`
 }
 
-// HARTimings are an entry's phases. Only the total is measured; it is
-// reported as wait.
+// HARTimings are an entry's phases in milliseconds.
 type HARTimings struct {
+	DNS     float64 `json:"dns,omitempty"`
+	Connect float64 `json:"connect,omitempty"`
+	SSL     float64 `json:"ssl,omitempty"`
 	Send    float64 `json:"send"`
 	Wait    float64 `json:"wait"`
 	Receive float64 `json:"receive"`
@@ -96,6 +99,8 @@ type HAREntry struct {
 	Response        HARResponse    `json:"response"`
 	Cache           struct{}       `json:"cache"`
 	Timings         HARTimings     `json:"timings"`
+	ServerIPAddress string         `json:"serverIPAddress,omitempty"`
+	Connection      string         `json:"connection,omitempty"`
 	ResourceType    string         `json:"_resourceType,omitempty"`
 	WSMessages      []HARWSMessage `json:"_webSocketMessages,omitempty"`
 }
@@ -143,7 +148,17 @@ func ToHAR(e *Exchange) HAREntry {
 			HeadersSize: -1,
 			BodySize:    -1,
 		},
-		Timings: HARTimings{Wait: e.DurationMs},
+		Timings: harTimings(e),
+	}
+	if e.Conn != nil {
+		if e.Conn.ID > 0 {
+			h.Connection = fmt.Sprint(e.Conn.ID)
+		}
+		if host, _, err := net.SplitHostPort(e.Conn.RemoteAddr); err == nil && host != "" {
+			h.ServerIPAddress = host
+		} else if ip := net.ParseIP(strings.Trim(e.Conn.RemoteAddr, "[]")); ip != nil {
+			h.ServerIPAddress = ip.String()
+		}
 	}
 	if b := e.Request.Body; b != nil {
 		h.Request.BodySize = b.Size
@@ -220,6 +235,20 @@ func protoOr(p string) string {
 		return "HTTP/1.1"
 	}
 	return p
+}
+
+func harTimings(e *Exchange) HARTimings {
+	if t := e.Timings; t != nil {
+		return HARTimings{
+			DNS:     t.DNSMs,
+			Connect: t.TCPMs,
+			SSL:     t.TLSMs,
+			Send:    t.SendMs,
+			Wait:    t.WaitMs,
+			Receive: t.RecvMs,
+		}
+	}
+	return HARTimings{Wait: e.DurationMs}
 }
 
 // harBody is a body's decoded bytes as HAR text: verbatim when valid UTF-8,

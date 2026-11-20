@@ -19,12 +19,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hxddh/https-traffic-inspector/v4/internal/config"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/exchange"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/rules"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/session"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/store"
-	"github.com/hxddh/https-traffic-inspector/v4/internal/textsafe"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/config"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/exchange"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/rules"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/session"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/store"
+	"github.com/hxddh/https-traffic-inspector/v5/internal/textsafe"
 )
 
 // listFlag collects a repeatable flag.
@@ -73,7 +73,7 @@ func (o *captureOptions) register(fs *flag.FlagSet, cfg config.Config, proxyMode
 	fs.StringVar(&o.listen, "listen", "127.0.0.1", "address the proxy listens on; anything other than loopback exposes it to the network")
 	fs.StringVar(&o.filter, "filter", "", "only log requests whose URL or host contains this string (case-insensitive)")
 	fs.StringVar(&o.format, "format", config.String(cfg.Format, os.Getenv("HTTPMON_FORMAT")), "output format: text | summary | json (default: text on a terminal, summary otherwise)")
-	fs.StringVar(&o.failOn, "fail-on", config.String(cfg.FailOn, os.Getenv("HTTPMON_FAIL_ON")), "exit 3 if any exchange matches: status classes (5xx), codes (404), error or incomplete, comma-separated")
+	fs.StringVar(&o.failOn, "fail-on", config.String(cfg.FailOn, os.Getenv("HTTPMON_FAIL_ON")), "exit 3 if any exchange matches: status classes (5xx), codes (404), error, app_error or incomplete, comma-separated")
 	fs.DurationVar(&o.certTTL, "cert-ttl", time.Hour, "how long to cache per-host TLS certificates; 0 disables caching")
 	fs.StringVar(&o.session, "session", defSession, "save exchanges to this named session (read them with: httpmon query NAME)")
 	fs.StringVar(&o.sessionDir, "session-dir", "", "save exchanges to a session in this directory")
@@ -195,7 +195,7 @@ func (o *captureOptions) openSession(name string) error {
 	// Check before Create, which replaces the exchanges: a session another
 	// process is writing must not lose them to a run that is then refused.
 	var m session.Meta
-	if session.ReadJSON(dir, session.MetaFile, &m) == nil && m.Running() && m.PID != os.Getpid() {
+	if session.ReadJSON(dir, session.MetaFile, &m) == nil && m.RunningIn(dir) && m.PID != os.Getpid() {
 		return fmt.Errorf("session %s is in use by process %d; choose another with --session", dir, m.PID)
 	}
 	// Everything that can reject the run is checked before Create discards
@@ -492,7 +492,7 @@ func cmdWrap(args []string) int {
 // ---- proxy ----
 
 func cmdProxy(args []string) int {
-	cfg, err := config.Load()
+	cfg, err := config.LoadUser()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "httpmon proxy: %v\n", err)
 		return 1
@@ -620,7 +620,7 @@ Options:
 		fmt.Fprintf(os.Stderr, "httpmon env: session %q has no metadata: %v\n", *name, err)
 		return 1
 	}
-	if !m.Running() {
+	if !m.RunningIn(dir) {
 		fmt.Fprintf(os.Stderr, "httpmon env: session %q is not running; start it with: httpmon proxy --session %s\n", *name, *name)
 		return 1
 	}

@@ -20,6 +20,8 @@ type Rendered struct {
 	JSON   any           `json:"json,omitempty"`
 	Text   *string       `json:"text,omitempty"`
 	GRPC   []GRPCMessage `json:"grpc,omitempty"`
+	Stream *StreamInfo   `json:"stream,omitempty"`
+	Parts  []Part        `json:"parts,omitempty"`
 	Binary bool          `json:"binary,omitempty"`
 
 	// Truncated means the rendering is shortened -- by the output budget, or
@@ -31,6 +33,12 @@ type Rendered struct {
 	// Digest identifies the content of a body reduced to it for comparison
 	// (exchange.Slim). It is never written.
 	Digest string `json:"-"`
+
+	// Derived protocol annotations used when building an Exchange; not written
+	// inside Body itself.
+	SoftErrorKind string `json:"-"`
+	SoftErrorHint string `json:"-"`
+	GraphQLOp     string `json:"-"`
 }
 
 // Raw is a body's wire bytes: UTF-8 text verbatim, anything else base64.
@@ -166,13 +174,47 @@ func Render(h http.Header, raw []byte, rawTruncated bool, size int64, budget int
 		}
 		return r, ""
 
+	case IsSSE(ct):
+		st := DecodeSSE(data, budget)
+		r.Stream = st
+		r.Truncated = truncated || st.Omitted > 0
+		if st.Error != "" {
+			r.SoftErrorKind, r.SoftErrorHint = "sse", st.Error
+		}
+		return r, st.Error
+
+	case IsNDJSON(ct):
+		if st := DecodeNDJSON(data, budget); st != nil {
+			r.Stream = st
+			r.Truncated = truncated || st.Omitted > 0
+			if st.Error != "" {
+				r.SoftErrorKind, r.SoftErrorHint = "ndjson", st.Error
+			}
+			return r, st.Error
+		}
+
 	case !truncated && (LooksLikeJSONType(ct) || (ct == "" && looksLikeJSONData(data))):
 		if v, err := ParseJSON(data); err == nil {
 			hint := ErrorHint(v)
+			r.SoftErrorKind, r.SoftErrorHint = SoftErrorHint(v)
+			r.GraphQLOp = GraphQLOperation(v)
 			v, cut := TruncateJSON(v, budget)
 			r.JSON, r.Truncated = v, cut
 			return r, hint
 		}
+	}
+
+	if boundary, ok := MultipartBoundary(ct); ok {
+		if parts, partTrunc := DecodeMultipart(data, boundary, budget); len(parts) > 0 {
+			r.Parts = parts
+			r.Truncated = truncated || partTrunc
+			return r, ""
+		}
+	}
+
+	hint := ""
+	if truncated && (LooksLikeJSONType(ct) || (ct == "" && looksLikeJSONData(data))) {
+		hint = TolerantErrorHint(data)
 	}
 
 	if PrintableType(ct) && (ct != "" || utf8.Valid(trimPartialRune(data, truncated))) {
@@ -188,11 +230,11 @@ func Render(h http.Header, raw []byte, rawTruncated bool, size int64, budget int
 			s, truncated = s[:cut], true
 		}
 		r.Text, r.Truncated = &s, truncated
-		return r, ""
+		return r, hint
 	}
 	r.Binary = true
 	r.Truncated = truncated
-	return r, ""
+	return r, hint
 }
 
 func looksLikeJSONData(b []byte) bool {
