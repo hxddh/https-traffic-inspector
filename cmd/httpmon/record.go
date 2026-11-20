@@ -136,7 +136,11 @@ func statusText(s string) string {
 
 // renderBody renders a captured body; a record also keeps the raw bytes.
 func renderBody(h http.Header, v bodyView, forRecord bool) (*body.Rendered, string) {
-	r, hint := body.Render(h, v.Raw, v.RawTruncated, v.Size, displayMaxBody)
+	sample := v.Raw
+	if len(v.StreamSample) > 0 {
+		sample = v.StreamSample
+	}
+	r, hint := body.Render(h, sample, v.RawTruncated, v.Size, displayMaxBody)
 	if r != nil && forRecord {
 		r.Raw = body.NewRaw(v.Raw, v.RawTruncated)
 	}

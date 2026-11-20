@@ -196,3 +196,27 @@ func mustTime(s string) time.Time {
 	tm, _ := parseTime(s)
 	return tm
 }
+
+func TestToHAR_ServerIPAddressIPv6(t *testing.T) {
+	for _, tc := range []struct {
+		remote string
+		want   string
+	}{
+		{"127.0.0.1:443", "127.0.0.1"},
+		{"[::1]:443", "::1"},
+		{"[2001:db8::1]:8443", "2001:db8::1"},
+		{"2001:db8::2", "2001:db8::2"},
+	} {
+		h := ToHAR(&Exchange{
+			Kind:       "http",
+			Method:     "GET",
+			URL:        "https://api.example.com/",
+			Status:     200,
+			DurationMs: 10,
+			Conn:       &ConnInfo{ID: 7, RemoteAddr: tc.remote},
+		})
+		if h.ServerIPAddress != tc.want {
+			t.Errorf("RemoteAddr %q -> ServerIPAddress = %q, want %q", tc.remote, h.ServerIPAddress, tc.want)
+		}
+	}
+}

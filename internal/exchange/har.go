@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -153,8 +154,10 @@ func ToHAR(e *Exchange) HAREntry {
 		if e.Conn.ID > 0 {
 			h.Connection = fmt.Sprint(e.Conn.ID)
 		}
-		if host, _, ok := strings.Cut(e.Conn.RemoteAddr, ":"); ok && host != "" {
-			h.ServerIPAddress = strings.Trim(host, "[]")
+		if host, _, err := net.SplitHostPort(e.Conn.RemoteAddr); err == nil && host != "" {
+			h.ServerIPAddress = host
+		} else if ip := net.ParseIP(strings.Trim(e.Conn.RemoteAddr, "[]")); ip != nil {
+			h.ServerIPAddress = ip.String()
 		}
 	}
 	if b := e.Request.Body; b != nil {

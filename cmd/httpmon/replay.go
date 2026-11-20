@@ -248,7 +248,7 @@ func replayExchangeOpt(client *http.Client, e *exchange.Exchange, targetBase str
 	}
 
 	if emit {
-		emitReplayResult(res, decodeBody(resp.Header, raw, overflow).Text)
+		emitReplayResult(res, decodeBody(resp.Header, raw, nil, overflow).Text)
 	}
 	return res
 }

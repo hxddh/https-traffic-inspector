@@ -335,3 +335,42 @@ func TestV5_SchemaCoversEveryExchangeField(t *testing.T) {
 	checkStruct(reflect.TypeFor[exchange.CausalLink](), props["cause"].(map[string]any)["properties"].(map[string]any))
 	checkStruct(reflect.TypeFor[exchange.TunnelInfo](), props["tunnel"].(map[string]any)["properties"].(map[string]any))
 }
+
+func TestSummaryMode_LongSSEErrorBeyondCaptureLimit(t *testing.T) {
+	savedCap := captureMaxBody
+	captureMaxBody = 16 << 10
+	defer func() { captureMaxBody = savedCap }()
+
+	out := useSummary(t)
+	useStats(t, "app_error")
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		// Emit >100 KiB of normal deltas (well past both 16 KiB captureMaxBody and 64 KiB)
+		// followed by a trailing SSE error event with no standard "message" field.
+		io.WriteString(w, "event: message_start\ndata: {\"message\":{\"model\":\"claude-sonnet-4-6\"}}\n\n") //nolint:errcheck
+		chunk := "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"" + strings.Repeat("x", 512) + "\"}}\n\n"
+		for range 200 {
+			io.WriteString(w, chunk) //nolint:errcheck
+		}
+		io.WriteString(w, "event: error\ndata: {\"reason\":\"overloaded\"}\n\n") //nolint:errcheck
+	}))
+	defer up.Close()
+
+	c := proxyClient(t)
+	resp, err := c.Get(up.URL + "/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
+	resp.Body.Close()
+	drainInflight(2 * time.Second)
+
+	if code := finishRun(0); code != exitFailOn {
+		t.Fatalf("finishRun = %d, want %d on trailing SSE app_error; summary:\n%s", code, exitFailOn, out.String())
+	}
+	if !strings.Contains(out.String(), "overloaded") {
+		t.Errorf("summary output missing overloaded hint:\n%s", out.String())
+	}
+}

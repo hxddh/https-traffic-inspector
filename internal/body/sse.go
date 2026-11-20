@@ -159,20 +159,35 @@ func buildStreamInfo(format string, events []StreamEvent, budget int) *StreamInf
 			if typ := objStr(obj, "type"); typ == "error" {
 				isErr = true
 			}
-			if eVal, hasErr := obj.Get("error"); hasErr && eVal != nil {
+			if eVal, hasErr := obj.Get("error"); hasErr && eVal != nil && eVal != false {
 				isErr = true
 			}
 			if isErr && info.Error == "" {
 				if h := ErrorHint(obj); h != "" {
 					info.Error = h
+				} else if r := objStr(obj, "reason"); r != "" {
+					info.Error = clip(r)
+				} else if b, err := json.Marshal(obj); err == nil && len(b) > 0 && string(b) != "{}" {
+					info.Error = clip(string(b))
 				}
 			}
 		} else if isErr && info.Error == "" {
 			if s, ok := ev.Data.(string); ok && s != "" {
 				info.Error = clip(s)
+			} else if ev.Data != nil {
+				if b, err := json.Marshal(ev.Data); err == nil && len(b) > 0 {
+					info.Error = clip(string(b))
+				}
 			}
 		}
 		if isErr {
+			if info.Error == "" {
+				if ev.Event != "" {
+					info.Error = clip(ev.Event)
+				} else {
+					info.Error = "stream error"
+				}
+			}
 			errEvents = append(errEvents, ev)
 		}
 	}

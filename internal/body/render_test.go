@@ -263,4 +263,13 @@ func TestRender_MultipartAndSoftErrors(t *testing.T) {
 	if truncHint != "quota_exceeded" {
 		t.Errorf("truncated JSON error hint = %q, want quota_exceeded", truncHint)
 	}
+
+	sseFallback, _ := Render(http.Header{"Content-Type": {"text/event-stream"}}, []byte("event: error\ndata: {\"reason\":\"overloaded\"}\n\n"), false, 44, 1000)
+	if sseFallback.SoftErrorKind != "sse" || sseFallback.SoftErrorHint != "overloaded" {
+		t.Errorf("SSE fallback reason = %q %q, want sse/overloaded", sseFallback.SoftErrorKind, sseFallback.SoftErrorHint)
+	}
+	sseGeneric, _ := Render(http.Header{"Content-Type": {"text/event-stream"}}, []byte("event: error\ndata: {\"status\":529}\n\n"), false, 35, 1000)
+	if sseGeneric.SoftErrorKind != "sse" || sseGeneric.SoftErrorHint == "" {
+		t.Errorf("SSE fallback generic = %q %q, want non-empty sse error", sseGeneric.SoftErrorKind, sseGeneric.SoftErrorHint)
+	}
 }

@@ -155,6 +155,7 @@ type bodyView struct {
 	Truncated bool // Text is only a prefix of the body
 
 	Raw          []byte
+	StreamSample []byte    // head+tail sample when an uncompressed stream overflowed Raw
 	RawTruncated bool      // Raw is only a prefix of the body
 	Size         int64     // bytes seen on the wire
 	FirstByteAt  time.Time // when the first body chunk arrived
